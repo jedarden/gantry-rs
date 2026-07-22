@@ -11,9 +11,10 @@
 // `invocation_name` lives here because argv[0] is the dispatch key main.rs
 // matches on ('cargo' vs 'gantry' vs unknown). Real-binary resolution and the
 // passthrough exec join it here across the bf-614q chain: `shim_dir` is the
-// first piece (the self-recursion-guard basis), and resolve_real_binary
-// (bf-614q) composes it with the PATH lookup; the re-exec guard (bf-1m69) and
-// passthrough (bf-28dv) follow.
+// first piece (the self-recursion-guard basis), `resolve_real_binary`
+// (bf-614q) composes it with the PATH lookup, and `ensure_distinct_from_self`
+// (bf-1m69) layers the canonical re-exec guard on top of both resolution paths;
+// the passthrough exec (bf-28dv) follows.
 
 /// The sentinel dispatch key returned when argv[0] is absent or basename-less.
 ///
@@ -221,49 +222,123 @@ fn is_executable(candidate: &std::path::Path, _md: &std::fs::Metadata) -> bool {
     )
 }
 
+/// Refuse to hand off to a real binary whose canonical target is the gantry
+/// binary itself — the infinite re-exec guard (plan §1 "refuse to exec a path
+/// whose canonical target is the gantry binary").
+///
+/// Canonicalizes BOTH `resolved` and [`std::env::current_exe`] and compares the
+/// canonical forms, so a symlink or a relative/`.`-`..`-laden path that
+/// ultimately lands on the gantry binary is caught the same as a direct path:
+/// the comparison is on canonical forms, not on the literal strings. This is
+/// the defense-in-depth layer the PATH strip ([`strip_dir_from_path`]) cannot
+/// provide on its own — the strip keeps gantry's own *directory* off the search
+/// path, but an explicit override ([`crate::config::Config::real_binary`]) or a
+/// gantry-named symlink placed in a different dir would still resolve to self,
+/// so [`resolve_real_binary`] re-checks whichever path landed.
+///
+/// Returns [`Ok`] when the target is provably distinct, and a loud, specific
+/// [`Err`] when it is the gantry binary. A canonicalization failure — the
+/// resolved target missing or unresolvable, or (defensively) gantry's own
+/// binary path becoming uncanonicalizable — is itself an `Err`: the guard never
+/// falls back to a self-exec when it cannot prove the target is distinct (plan
+/// §1 "never a fallback-to-self"), and never panics — every fallible step maps
+/// to a human-readable `Err`.
+//
+// Held private by design (a resolve_real_binary-internal helper, like the
+// resolution helpers above it): only resolve_real_binary is meant to call it.
+fn ensure_distinct_from_self(resolved: &std::path::Path) -> Result<(), String> {
+    // current_exe() is the gantry binary's own path; canonicalize collapses any
+    // symlink indirection on it (e.g. the install-time shim symlink) so the
+    // comparison is against the real file the kernel would exec. A failure here
+    // is a degraded install the caller must hear about, never a silent pass.
+    let self_canon = std::env::current_exe()
+        .map_err(|e| format!("gantry cannot locate its own binary: {e}"))?
+        .canonicalize()
+        .map_err(|e| format!("gantry cannot canonicalize its own binary path: {e}"))?;
+    // canonicalize follows symlinks and resolves `.`/`..`, so a relative or
+    // symlinked override that points back at gantry collapses to self_canon.
+    // A missing/unresolvable target cannot be proven distinct, so it errors —
+    // never a fallback-to-self.
+    let target_canon = resolved.canonicalize().map_err(|e| {
+        format!(
+            "gantry cannot resolve the real binary ({}): {e}",
+            resolved.display()
+        )
+    })?;
+    if target_canon == self_canon {
+        return Err(
+            "gantry would re-exec itself: the resolved cargo is the gantry binary; refusing"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Resolve the real `cargo` binary the shim should hand off to (plan §1
 /// "Real-binary resolution", Components §1 "Shim & dispatcher").
 ///
-/// Composes the three private helpers into the top-level resolution path the
-/// dispatcher consults before any pipeline stage runs:
+/// Composes the private resolution helpers with the re-exec guard into the
+/// top-level path the dispatcher consults before any pipeline stage runs:
 ///
 /// 1. **Override short-circuit** — when
-///    [`crate::config::Config::real_binary`] is `Some`, return that path
-///    verbatim with *no* PATH search. The explicit override is trusted as-is
-///    (it need not exist on disk; exec-check is a later stage's concern), so a
-///    pinned toolchain is honored without touching the environment.
+///    [`crate::config::Config::real_binary`] is `Some`, take that path with *no*
+///    PATH search, so a pinned toolchain is honored without touching the
+///    environment.
 /// 2. **PATH lookup** — otherwise, derive gantry's own binary dir ([`shim_dir`]),
 ///    strip it from `PATH` ([`strip_dir_from_path`]) so the walk cannot
-///    re-resolve `cargo` to the gantry shim itself (the self-recursion guard,
-///    enforced here at the resolution layer), then walk the survivors
-///    left-to-right for `cargo` ([`find_in_path`]).
+///    re-resolve `cargo` to the gantry shim's own directory, then walk the
+///    survivors left-to-right for `cargo` ([`find_in_path`]).
+/// 3. **Self-recursion guard** — whichever path landed, canonicalize it and
+///    [`std::env::current_exe`] and refuse if they are the same file
+///    ([`ensure_distinct_from_self`]). The PATH strip in step 2 is a
+///    directory-level filter; this canonical comparison is the file-level backstop
+///    that catches an override — or a gantry-named symlink in a surviving PATH
+///    dir — that resolves to the gantry binary itself (plan §1 "refuse to exec a
+///    path whose canonical target is the gantry binary").
 ///
-/// Never silently falls through to the gantry binary or to `None`: a missing
-/// `cargo` on the stripped PATH propagates [`find_in_path`]'s `Err` verbatim, so
-/// a broken install surfaces as a diagnostic instead of an infinite re-exec.
-/// Never panics — every fallible step maps to a human-readable `Err`. Spawns no
-/// process and consults no other gantry pipeline module (gate/refs/backend/
-/// local/runlog): this is decision-only resolution.
+/// A resolved path that passes the guard is returned *unchanged* (verbatim for
+/// an override, the PATH-walk hit otherwise): canonicalization is for the
+/// comparison only, never a rewrite of the returned path. Never silently falls
+/// through to the gantry binary or to `None`: a missing `cargo` on the stripped
+/// PATH propagates [`find_in_path`]'s `Err` verbatim, a target that cannot be
+/// canonicalized (missing/unresolvable) propagates the guard's `Err`, and a
+/// target that *is* the gantry binary is refused with a loud diagnostic — so a
+/// broken or misconfigured install surfaces as a message, never an infinite
+/// re-exec. Never panics — every fallible step maps to a human-readable `Err`.
+/// Spawns no process and consults no other gantry pipeline module (gate/refs/
+/// backend/local/runlog): this is decision-only resolution.
 ///
 /// This is the integration seam the bf-614q chain lands. [`shim_dir`],
 /// [`strip_dir_from_path`], and [`find_in_path`] each shipped standalone in
 /// earlier children; `resolve_real_binary` is their first and only caller, which
-/// is why their provisional `#[allow(dead_code)]` attributes retired at this
-/// commit.
+/// is why their provisional `#[allow(dead_code)]` attributes retired at that
+/// commit. [`ensure_distinct_from_self`] (bf-1m69) layers on top here as the
+/// re-exec guard's file-level backstop.
 pub fn resolve_real_binary(cfg: &crate::config::Config) -> Result<std::path::PathBuf, String> {
-    // 1. Explicit override: trust it verbatim and skip the PATH search entirely.
-    if let Some(path) = &cfg.real_binary {
-        return Ok(path.clone());
-    }
+    // 1. Explicit override: take it verbatim and skip the PATH search entirely.
+    //    2. Otherwise: exclude gantry's own binary dir so the lookup cannot
+    //       re-resolve `cargo` to the gantry shim's directory, then walk the
+    //       surviving PATH entries left-to-right for `cargo`.
+    let resolved = match &cfg.real_binary {
+        Some(path) => path.clone(),
+        None => {
+            let shim = shim_dir()?;
+            let path_var = std::env::var("PATH")
+                .map_err(|e| format!("gantry cannot read the PATH environment variable: {e}"))?;
+            let stripped = strip_dir_from_path(&path_var, &shim);
+            find_in_path("cargo", &stripped)?
+        }
+    };
 
-    // 2. Exclude gantry's own binary dir so the lookup cannot re-resolve
-    //    `cargo` to the gantry shim (self-recursion guard), then walk the
-    //    surviving PATH entries left-to-right for `cargo`.
-    let shim = shim_dir()?;
-    let path_var = std::env::var("PATH")
-        .map_err(|e| format!("gantry cannot read the PATH environment variable: {e}"))?;
-    let stripped = strip_dir_from_path(&path_var, &shim);
-    find_in_path("cargo", &stripped)
+    // 3. Self-recursion guard (plan §1): refuse to hand off to a path whose
+    //    canonical target is the gantry binary itself. The override bypasses the
+    //    PATH strip, and a gantry-named symlink in a surviving PATH dir evades
+    //    it, so the canonical comparison re-checks whichever path landed — and
+    //    an uncanonicalizable target errors rather than risking a fallback-to-self.
+    ensure_distinct_from_self(&resolved)?;
+
+    // The guard is a comparison only; the resolved path is returned unchanged.
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -472,26 +547,22 @@ mod tests {
         assert_eq!(strip_dir_from_path(&path, std::path::Path::new("/b")), path,);
     }
 
-    // --- find_in_path fixtures ----------------------------------------------
+    // --- filesystem fixtures ------------------------------------------------
     //
-    // The executable-bit semantics under test are Unix-specific, so these
-    // fixtures and the find_in_path tests are `#[cfg(unix)]`. shim.rs stays
-    // std-only (no `tempfile` dev-dependency): TempDir is a minimal stand-in,
-    // a uniquely-named subdir of std::env::temp_dir() removed wholesale on drop.
-    // The dir name mixes the test-binary PID with a per-test suffix so parallel
-    // tests in one process never collide.
+    // shim.rs stays std-only (no `tempfile` dev-dependency): TempDir is a minimal
+    // stand-in, a uniquely-named subdir of std::env::temp_dir() removed wholesale
+    // on drop. It is pure std, so it is cross-platform — shared by the
+    // Unix-gated executable-bit helpers below and the cross-platform override /
+    // re-exec-guard tests. The dir name mixes the test-binary PID with a per-test
+    // suffix so parallel tests in one process never collide.
 
     /// A throwaway directory under the system temp, removed on drop.
-    #[cfg(unix)]
     struct TempDir(std::path::PathBuf);
 
-    #[cfg(unix)]
     impl TempDir {
         fn new(suffix: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "gantry-find_in_path-{}-{suffix}",
-                std::process::id(),
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("gantry-test-{}-{suffix}", std::process::id(),));
             std::fs::create_dir_all(&dir).expect("create temp dir");
             Self(dir)
         }
@@ -501,7 +572,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     impl Drop for TempDir {
         fn drop(&mut self) {
             // Best-effort: a failed cleanup (the dir already gone) must not
@@ -509,6 +579,13 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+
+    // The executable-bit semantics under test are Unix-specific (the mode bits
+    // consulted by `find_in_path`'s `is_executable`), so these helpers and the
+    // find_in_path tests are `#[cfg(unix)]`. The re-exec-guard tests that need a
+    // symlink are Unix-gated for the same reason (symlink creation differs by
+    // platform); the override-verbatim and missing-target tests stay
+    // cross-platform because canonicalization is.
 
     /// Write `<dir>/<name>` as a regular file with the executable bit set.
     #[cfg(unix)]
@@ -665,17 +742,111 @@ mod tests {
 
     #[test]
     fn resolve_real_binary_returns_override_verbatim_with_empty_path() {
-        // The override short-circuit (plan §1): an explicit real_binary is
-        // trusted as-is and returned verbatim, with no PATH search at all. Run
-        // under an empty PATH to prove the override wins independent of the
-        // environment — a pinned toolchain is honored without consulting PATH.
+        // The override short-circuit (plan §1): an explicit real_binary is taken
+        // as-is and returned verbatim, with no PATH search at all. Run under an
+        // empty PATH to prove the override wins independent of the environment.
+        // The re-exec guard still runs (it canonicalizes the override), so the
+        // target must be a real, distinct file on disk: a temp file exists and is
+        // not the gantry binary, the guard passes, and the verbatim override
+        // survives unchanged — canonicalization is for the comparison only, never
+        // a rewrite of the returned path. (The file need not carry an executable
+        // bit: exec-check is a later stage's concern, and canonicalize does not
+        // consult mode bits — so this stays cross-platform.)
+        let dir = TempDir::new("override-distinct");
+        let target = dir.path().join("cargo");
+        std::fs::write(&target, b"#!/bin/sh\nexit 0\n").expect("write distinct fixture");
         let mut cfg = Config::hardcoded();
-        cfg.real_binary = Some(std::path::PathBuf::from("/usr/bin/cargo"));
+        cfg.real_binary = Some(target.clone());
         let resolved = with_path("", || resolve_real_binary(&cfg));
         assert_eq!(
             resolved,
-            Ok(std::path::PathBuf::from("/usr/bin/cargo")),
+            Ok(target),
             "explicit override must win verbatim even with an empty PATH",
+        );
+    }
+
+    #[test]
+    fn resolve_real_binary_rejects_override_pointing_at_the_gantry_binary() {
+        // The re-exec guard (plan §1 "refuse to exec a path whose canonical
+        // target is the gantry binary"): an explicit override pinned directly at
+        // the gantry binary must be refused — the override bypasses the PATH
+        // strip, so this canonical comparison is the only thing standing between
+        // a misconfigured pin and an infinite re-exec. current_exe() under cargo
+        // test is the test binary; pointing the override at it canonicalizes to
+        // self, so the guard fires. Cross-platform: no symlink is needed.
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary =
+            Some(std::env::current_exe().expect("current_exe resolves under cargo test"));
+        let err = resolve_real_binary(&cfg)
+            .expect_err("an override equal to the gantry binary must be refused");
+        assert!(
+            err.contains("gantry") && err.contains("refus"),
+            "error must loudly name the self-recursion refusal: {err}",
+        );
+    }
+
+    #[test]
+    fn resolve_real_binary_errors_when_the_override_target_is_missing() {
+        // A canonicalization failure is itself an error, never a fallback-to-self
+        // (plan §1): an override pointing at a path that does not exist cannot be
+        // proven distinct from the gantry binary, so the guard refuses rather
+        // than hand back an uncanonicalizable path a later exec might resolve to
+        // self. Cross-platform: canonicalize of a missing path fails everywhere.
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary = Some(std::path::PathBuf::from(
+            "/nonexistent/gantry-missing-real-cargo",
+        ));
+        let err = resolve_real_binary(&cfg)
+            .expect_err("an override target that does not exist must error, not pass");
+        assert!(
+            err.contains("gantry"),
+            "error must come from the guard and name gantry: {err}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_real_binary_rejects_override_that_symlinks_to_the_gantry_binary() {
+        // Symlink/relative-path indirection that ultimately resolves to the
+        // gantry binary is STILL detected (plan §1, canonical comparison): an
+        // override whose literal path is a symlink to gantry collapses to
+        // current_exe's canonical form, so the guard fires the same as a direct
+        // path — defeating any install that aliases the shim as the real cargo.
+        let dir = TempDir::new("override-self-symlink");
+        let link = dir.path().join("cargo");
+        let exe = std::env::current_exe().expect("current_exe resolves under cargo test");
+        std::os::unix::fs::symlink(&exe, &link).expect("create symlink fixture");
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary = Some(link);
+        let err = resolve_real_binary(&cfg)
+            .expect_err("an override that symlinks to the gantry binary must be refused");
+        assert!(
+            err.contains("gantry") && err.contains("refus"),
+            "error must loudly name the self-recursion refusal: {err}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_real_binary_rejects_path_lookup_that_resolves_to_the_gantry_binary() {
+        // The PATH strip keeps gantry's own *directory* off the search path, but
+        // a symlink of the gantry binary named `cargo`, placed in a different dir
+        // still on PATH, is found by the walk — so the canonical guard must catch
+        // it on the PATH-lookup branch too. find_in_path follows the symlink to
+        // the executable test binary and returns the symlink path; the guard then
+        // canonicalizes that symlink to current_exe and refuses.
+        let dir = TempDir::new("self-on-path");
+        let link = dir.path().join("cargo");
+        let exe = std::env::current_exe().expect("current_exe resolves under cargo test");
+        std::os::unix::fs::symlink(&exe, &link).expect("create symlink fixture");
+        let cfg = Config::hardcoded(); // real_binary == None → PATH-lookup branch
+        let path = path_string(&[dir.path()]);
+        let err = with_path(&path, || resolve_real_binary(&cfg)).expect_err(
+            "a PATH lookup resolving to the gantry binary must be refused, not handed back",
+        );
+        assert!(
+            err.contains("gantry") && err.contains("refus"),
+            "error must loudly name the self-recursion refusal: {err}",
         );
     }
 
