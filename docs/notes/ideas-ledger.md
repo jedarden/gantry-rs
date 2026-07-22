@@ -8,6 +8,8 @@ Anchored to the post-adoption plan (finalists 1–9 of run 1 integrated; Q-2/Q-3
 
 Stats: 104 generated (8 lenses × 13) → ~100 canonical after merges → 30 triage survivors + 3 hybrids → 15 advancers (pairwise, max 2/cluster) → 1 killed → gap check (new-capability territory left benched, accepted) → **10 finalists**.
 
+**Adoption (2026-07-22):** finalists 1, 2, 4, 5, 6, 7, 9, 10 ADOPTED into plan.md. Finalist 3 (mirror-leak guard) SKIPPED by owner — remains on the bench. Finalist 8 (drop native Argo client) DECLINED — owner: "Argo should be supported. That's my present usage pattern." — the native Argo client stays first-class in v1.
+
 ### Finalists
 
 1. **Tier-0: zero-config cap-only mode** (hybrid: zero-config default + `gantry quickcheck`) — with no backend configured, gantry is still a product: every cargo invocation gets the cgroup cap, `quickcheck` proves the install in 30s with no cluster, and one config line upgrades to remote later. Cluster: adoption/simplicity.
