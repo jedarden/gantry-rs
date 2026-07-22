@@ -90,6 +90,7 @@ Backend (trait RemoteBackend)
 Verdict
    ├─ Pass ──────────────► exit 0
    ├─ TestFailure ───────► exit code (no local retry — DD-4)
+   ├─ GateFailure ───────► exit non-zero, attributed to `[gantry] gate:` (no retry)
    └─ InfraFailure ──────► LocalExecutor (capped) → real cargo
                                    │
                           RunLog (~/.local/state/gantry/runs.jsonl)
@@ -118,7 +119,7 @@ Cross-cutting: `RunLog` records every decision; `Locks/JoinTable` (v1.x) dedups 
 - `git push <ci_remote> <sha>:refs/gantry/<epoch>-<sha>` (`ci_remote` defaults to `origin`); the epoch prefix is the GC lever (see below).
 - Push failure = InfraFailure → local fallback.
 - Optional `push_mode = "branch"` legacy escape hatch (explicit opt-in; prints a warning naming the risk).
-- GC (resolves Q-3 via leases): refs are named `refs/gantry/<epoch>-<sha>`; each run records a client-side lease (ref, run-id, expiry) in the state dir, and every successful push opportunistically sweeps remote refs whose epoch has expired and whose runs are terminal — no cron, no daemon, and a sweep can never delete a ref an in-flight run still holds a lease on. Phase 2 design note must settle the epoch-vs-content-addressing tension (the same sha pushed twice yields two refs).
+- GC (resolves Q-3 via leases): refs are named `refs/gantry/<epoch>-<sha>`; each run records a client-side lease (ref, run-id, expiry) in the state dir, and every successful push opportunistically sweeps remote refs whose epoch has expired and whose runs are terminal — no cron, no daemon, and a sweep can never delete a ref an in-flight run still holds a lease on. Each box sweeps only refs it created — lease records are local (see EC-09). The epoch-vs-content-addressing tension (the same sha pushed twice yields two refs) is settled by the design note required at Phase 1a entry.
 
 ### 5. RemoteBackend trait + implementations
 
@@ -281,6 +282,7 @@ gantry quickcheck           # 30s no-backend sanity: shim resolves, cap works, g
 gantry report <run-id>      # print/package the flight-recorder bundle for an InfraFailure
 gantry install-shims | uninstall
 gantry config [--show-origin]
+gantry version
 ```
 
 Diagnostics are agent-first: `why`, `explain`, and `status` take `--json` with a stable schema, so a fleet agent that hits a degradation can explore and self-diagnose (why did this run locally? is the remote down for everyone?) without a human reading stderr.
@@ -289,14 +291,14 @@ Diagnostics are agent-first: `why`, `explain`, and `status` take `--json` with a
 
 | Failure | Class | Behavior |
 |---|---|---|
-| not a git repo / no remote / dirty / untracked files | gate | local capped run, reason printed |
+| not a git repo / no remote / dirty / untracked files | eligibility (GitGate) | local capped run, reason printed |
 | ref push rejected (auth, network) | infra | local capped run |
 | submit error (kubectl/exec fails) | infra | local capped run |
 | pod never scheduled by deadline | infra | **local capped run** (predecessor wrongly exited 1) |
 | log stream lost mid-run | infra (recoverable) | keep waiting on status; fetch output param at end |
 | client deadline (`deadline_minutes`) exceeded | infra | print handle URL, local capped run |
 | remote suite fails | test | exit non-zero, stop |
-| enabled quality gate fails (tests pass) | gate_failure | exit non-zero, attributed to the named gate; no local retry |
+| enabled quality gate fails (tests pass) | quality-gate | exit non-zero, verdict `gate_failure` attributed to the named gate; no local retry |
 | remote pod OOMKilled / workflow `activeDeadlineSeconds` exceeded | infra | `verdict.json` classifies as InfraFailure → capped local run — never reported as a test failure |
 | gantry process killed mid-run | self | orphaned OPEN intent in runs.jsonl; `gantry doctor` reports it as a lost run |
 | remote outage → mass fallback | env | admission semaphore caps concurrent local runs (default 3), loud queue-position lines |
@@ -417,6 +419,7 @@ Multi-tool profiles (`pytest`, `go test`) behind the same config schema; nextest
 - **Q-4 `builder-image` selection.** A repo-chosen image is remote code execution with the CI pod's credentials (sccache keys, clone tokens) — an arbitrary image named in `.gantry.toml` would gut S-2. Leading candidate: repo config may only select images matching a trusted-config allowlist (registry/digest prefixes); a non-matching image is ignored with a loud `[gantry]` line and the default is used. Settle before Phase 2 template work.
 - **Q-5 macOS local cap.** No systemd; `ulimit`/`taskpolicy` are weak substitutes. Ship uncapped-with-warning, or refuse to `cap_passthrough` on macOS?
 - **Q-6 output-param size limits.** Argo output parameters have size caps (~256KB default); huge test logs will truncate. Artifact-based log capture (S3) as the durable channel?
+
 ## Resolved questions (2026-07-21 ideation run — full record in docs/notes/ideas-ledger.md)
 
 - **Q-2 → faithful-argv.** The remote executes exactly the argv the caller typed; check/clippy are opt-in gates from trusted user config, reported as separately-labeled `[gantry] gate:` results. The in-house config keeps the gates on.
