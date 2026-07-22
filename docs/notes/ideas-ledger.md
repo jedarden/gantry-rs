@@ -6,6 +6,8 @@ Every ideation run against `docs/plan/plan.md` records ALL considered ideas here
 
 Stats: 104 generated (8 lenses × 13) → 68 canonical after duplicate-merge → 30 triage survivors + 2 hybrids → 15 advancers (pairwise ranking, max 2/cluster) → 1 killed → gap round resurrected 1 (verdict-security territory) → **10 finalists**. Generation ran as blind 8-lens fan-out; all narrowing done inline single-context.
 
+**Adoption (2026-07-21):** finalists 1–9 ADOPTED into plan.md (Q-2/Q-3/Q-7 resolved; components, failure modes, CLI surface, and phases updated; owner directive on #5: onboarding must be smooth and automatic, with agent-explorable CLI diagnostics). Finalist 10 (`gantry demo` = exit-code oracle) DECLINED by owner. Benched items not adopted.
+
 ### Finalists
 
 1. **Faithful-argv remote (resolves Q-2)** — remote executes exactly the argv the caller typed; check/clippy gates are trusted-config opt-in, reported as separately-labeled `[gantry] gate:` results, never conflated with the test verdict. Cluster: strictness. *(merged 5: test-only default / remote-mirrors-local / strictness ladder / advisory extras / faithful-argv)*
