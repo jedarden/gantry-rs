@@ -2,20 +2,18 @@
 
 Surveyed 2026-07-21. The gap gantry fills: **no existing tool transparently intercepts the vanilla command and applies policy about where it runs.** Everything below either requires the caller to invoke something different, or solves an adjacent problem (caching, hermetic builds, safety).
 
-## dcg — Destructive Command Guard (packaging model)
+## Agent command guards (packaging model)
 
-[Dicklesworthstone/destructive_command_guard](https://github.com/Dicklesworthstone/destructive_command_guard)
+A category of tools has emerged that blocks dangerous git/shell commands issued by AI agents, sitting as a policy layer between agent intent and execution via each agent's hook system. Opposite polarity to gantry — a guard intercepts to **block**, gantry intercepts to **relocate** — but the closest philosophical relatives: the agent doesn't know the tool is there, and policy decides what actually happens.
 
-Blocks dangerous git/shell commands issued by AI agents. Opposite polarity to gantry — dcg intercepts to **block**, gantry intercepts to **relocate** — but the closest philosophical relative: the agent doesn't know it's there, and the tool is the policy layer between agent intent and execution.
-
-What gantry borrows:
+What gantry borrows from the pattern:
 - Single static binary + curl-pipe `install.sh` that auto-detects the platform and configures everything.
 - A `doctor`-style verification step so a broken install is diagnosed, not discovered in production.
-- Clear block/redirect messages that explain *why* and *what happens instead* (dcg explains blocked commands; gantry explains offload/fallback decisions in `[gantry]` stderr lines).
+- Clear decision messages that explain *why* and *what happens instead* (a guard explains blocked commands; gantry explains offload/fallback decisions in `[gantry]` stderr lines).
 - Docs that lead with the agent-fleet use case.
 
 What gantry deliberately does not borrow:
-- The per-agent integration matrix (Claude Code, Codex, Gemini CLI, Copilot, Cursor, OpenCode…). dcg must hook the agent because it needs to see every shell command; gantry only needs to own a few binary names, and PATH shimming covers every caller at once. See design-decisions DD-1.
+- The per-agent integration matrix (Claude Code, Codex, Gemini CLI, Copilot, Cursor, OpenCode…). A guard must hook the agent because it needs to see every shell command; gantry only needs to own a few binary names, and PATH shimming covers every caller at once. See design-decisions DD-1.
 
 ## sgeisler/cargo-remote (name-collides with the in-house script)
 
@@ -68,7 +66,7 @@ The in-house backend. Relevant properties for the client design: WorkflowTemplat
 | Tool | Transparent to caller | Remote test execution | Safe local fallback | Adoption cost |
 |---|---|---|---|---|
 | **gantry (planned)** | ✅ PATH shim | ✅ pluggable backend | ✅ cgroup-capped | drop-in |
-| dcg | ✅ (hooks) | — (safety guard) | n/a | installer |
+| agent command guards | ✅ (hooks) | — (safety layer) | n/a | installer |
 | sgeisler/cargo-remote | ❌ `cargo remote` | ✅ SSH+rsync | ❌ | build server |
 | sccache(-dist) | ✅ | ❌ compile only | n/a | low |
 | Bazel RBE | ❌ | ✅ | ❌ | total migration |

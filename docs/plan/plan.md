@@ -4,7 +4,7 @@
 
 `gantry` is a transparent offload shim for expensive developer commands, cargo-first. A shim binary named `cargo` sits ahead of the real toolchain in PATH; when an intercepted subcommand (default: `test`) is run inside a clean, pushable git repo, gantry ships the exact commit to a pluggable remote executor, streams logs back, and returns a faithful exit code. In every other case it runs the command locally under a cgroup resource cap. Callers — humans, scripts, AI agent fleets — never change what they type.
 
-Extraction and hardening of the in-house `~/.local/bin/cargo` + `cargo-remote` bash pair (see `docs/research/in-house-implementation.md`); packaging model inspired by dcg (see `docs/research/prior-art.md`).
+Extraction and hardening of the in-house `~/.local/bin/cargo` + `cargo-remote` bash pair (see `docs/research/in-house-implementation.md`); packaging follows the single-static-binary + installer + `doctor` pattern surveyed in `docs/research/prior-art.md`.
 
 ## Goals
 
@@ -222,7 +222,7 @@ Multi-tool profiles (`pytest`, `go test`) behind the same config schema; nextest
 
 ## Open questions
 
-- **Q-1 crates.io name.** Is bare `gantry` registered/squatted? Check at publish time; fallbacks `gantry-shim` / `cargo-gantry`. Repo name stays `gantry` regardless.
+- **Q-1 crates.io name.** Is bare `gantry` registered/squatted? Check at publish time; fallbacks `gantry-rs` (matches the repo) / `gantry-shim`. Repo name stays `gantry-rs` regardless; binary stays `gantry`.
 - **Q-2 remote strictness.** rust-verify runs check+clippy+test — stricter than local `cargo test`. Should the shipped template default to test-only (principle of least surprise for external users) with clippy opt-in? Leaning yes; the in-house config keeps clippy on.
 - **Q-3 ref cleanup.** Ship a `gantry gc-refs` helper (client-side `git push --delete` of old refs), document server-side cron, or rely on Forgejo/GitHub GC semantics? Decide during Phase 2.
 - **Q-4 `builder-image` selection.** Per-repo override belongs in `.gantry.toml` (it's not credential-adjacent) — confirm this doesn't violate S-2 in review.

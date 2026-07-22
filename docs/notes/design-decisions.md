@@ -2,7 +2,7 @@
 
 ## DD-1: PATH shim, not agent hooks
 
-dcg integrates with each agent's hook system (Claude Code PreToolUse, Codex, Gemini CLI, …) because its job requires seeing *every* shell command. Gantry's job only requires owning a handful of binary names (`cargo`, later maybe `pytest`, `go`). A shim directory early in PATH achieves that for every caller — interactive shells, agents, scripts, Makefiles — with zero per-agent configuration and no dependency on any agent's hook API. The in-house predecessor proved this: NEEDLE workers inherited offloading purely via PATH, with no NEEDLE changes.
+Safety-guard command interceptors integrate with each agent's hook system (Claude Code PreToolUse, Codex, Gemini CLI, …) because their job requires seeing *every* shell command. Gantry's job only requires owning a handful of binary names (`cargo`, later maybe `pytest`, `go`). A shim directory early in PATH achieves that for every caller — interactive shells, agents, scripts, Makefiles — with zero per-agent configuration and no dependency on any agent's hook API. The in-house predecessor proved this: NEEDLE workers inherited offloading purely via PATH, with no NEEDLE changes.
 
 Mechanism: symlinks named after the target tool pointing at the `gantry` binary; argv[0] dispatch selects the tool profile (the rustup/volta/asdf pattern).
 
