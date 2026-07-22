@@ -1,5 +1,7 @@
 # gantry — Application Plan
 
+*Last updated: 2026-07-22. Revision history lives in git; decision provenance in `docs/notes/ideas-ledger.md`.*
+
 ## Overview
 
 `gantry` is a transparent offload shim for expensive developer commands, cargo-first. A shim binary named `cargo` sits ahead of the real toolchain in PATH; when an intercepted subcommand (default: `test`) is run inside a clean, pushable git repo, gantry ships the exact commit to a pluggable remote executor, streams logs back, and returns a faithful exit code. In every other case it runs the command locally under a cgroup resource cap. Callers — humans, scripts, AI agent fleets — never change what they type.
@@ -28,13 +30,13 @@ caller (human / agent / script)
 [shim dir]/cargo ──symlink──► gantry binary
    │  argv[0]=cargo → tool profile "cargo"
    ├─ subcommand not intercepted ───────────────► LocalExecutor (capped) → real cargo
-   ├─ GANTRY_LOCAL=1 / disabled / no config ────► LocalExecutor (capped) → real cargo
+   ├─ GANTRY_LOCAL=1 / disabled / Tier-0 (no config) ──► LocalExecutor (capped) → real cargo
    ▼
 DecisionEngine
    ├─ GitGate: work tree? remote? clean (porcelain)? HEAD?
    │     └─ any "no" → LocalExecutor (reason printed)
    ▼
-RefPusher: git push <ci_remote> <sha>:refs/gantry/<sha>
+RefPusher: git push <ci_remote> <sha>:refs/gantry/<epoch>-<sha>  (+ lease, + GC sweep)
    ▼
 Backend (trait RemoteBackend)
    ├─ argo:    create Workflow(templateRef, params) → stream pod logs → poll status.phase
@@ -54,13 +56,13 @@ Cross-cutting: `RunLog` records every decision; `Locks/JoinTable` (v1.x) dedups 
 ## Components
 
 ### 1. Shim & dispatcher (`main.rs`)
-- Dispatch on `argv[0]`: `cargo` → cargo tool profile; `gantry` → management CLI (`doctor`, `on`/`off`, `run`, `config`, `version`, `install-shims`).
+- Dispatch on `argv[0]`: `cargo` → cargo tool profile; `gantry` → management CLI (full command set defined once in the “CLI surface” section below).
 - Real-binary resolution: config override `real_binary`, else PATH lookup with gantry's own shim dir stripped (self-recursion guard: refuse to exec a path whose canonical target is the gantry binary).
 - Passthrough path budget: no git/network/config-parse beyond a single mmap'd config read; target < 5 ms overhead.
 
 ### 2. DecisionEngine
 - Intercept set from config (`[tool.cargo] intercept = ["test"]`).
-- Tier-0 (zero-config): with no config file present or `backend = "none"`, gantry is a pure local cap-wrapper — interception still applies the cgroup cap and full RunLog, nothing goes remote, and a `[gantry]` line notes the tier once per session. Install→value with zero setup; remote offload is an upgrade, not a prerequisite.
+- Tier-0 (zero-config): with no config file present or `backend = "none"`, gantry is a pure local cap-wrapper — interception still applies the cgroup cap and full RunLog, nothing goes remote, and a `[gantry]` line notes the tier at most once per hour (state-file timestamp) so transcripts see it without per-run noise. Install→value with zero setup; remote offload is an upgrade, not a prerequisite.
 - Kill switches: `GANTRY_LOCAL=1`, `gantry off` (state file).
 - Config-failure policy (resolves Q-7 via last-known-good): on parse failure, serve the persisted last-good config snapshot from the state dir and print an escalating `[gantry] config broken since <ts>, N runs degraded` banner on every intercepted run until fixed; with no snapshot, fail open to plain passthrough with the same banner. Behavior is never derived from a half-parsed file — a broken gantry must never block builds, and must never rot silently either.
 
@@ -69,7 +71,7 @@ Cross-cutting: `RunLog` records every decision; `Locks/JoinTable` (v1.x) dedups 
 - All git interaction shells out to system `git` (no libgit2 — matches predecessor behavior, honors user's git config/credentials/hooks).
 
 ### 4. RefPusher
-- `git push <ci_remote> <sha>:refs/gantry/<sha>` (`ci_remote` defaults to `origin`).
+- `git push <ci_remote> <sha>:refs/gantry/<epoch>-<sha>` (`ci_remote` defaults to `origin`); the epoch prefix is the GC lever (see below).
 - Push failure = InfraFailure → local fallback.
 - Optional `push_mode = "branch"` legacy escape hatch (explicit opt-in; prints a warning naming the risk).
 - GC (resolves Q-3 via leases): refs are named `refs/gantry/<epoch>-<sha>`; each run records a client-side lease (ref, run-id, expiry) in the state dir, and every successful push opportunistically sweeps remote refs whose epoch has expired and whose runs are terminal — no cron, no daemon, and a sweep can never delete a ref an in-flight run still holds a lease on. Phase 2 design note must settle the epoch-vs-content-addressing tension (the same sha pushed twice yields two refs).
@@ -86,7 +88,7 @@ trait RemoteBackend {
 }
 ```
 
-- **`argo`** (v1): builds the Workflow manifest with serde (no string splicing), submits via `kubectl create -f -` (kubeconfig path from config; direct REST API is a later option), polls pods for streaming, polls `status.phase` for the verdict, falls back to reading `outputs.parameters.output` when podGC ate the logs. Ships `contrib/argo/gantry-verify-workflowtemplate.yml` — a genericized `rust-verify` (parameters: `repo`, `revision`, `args-json`, `builder-image`; sccache optional). Remote contract (resolves Q-2 as faithful-argv): the remote executes exactly the argv the caller typed; check/clippy run only as opt-in gates from trusted user config, reported as separately-labeled `[gantry] gate:` results, never conflated with the test verdict. The template also emits a structured `verdict.json` output parameter (phase, exit code, oom, deadline — derived from workflow node status): OOMKilled and deadline-exceeded classify as InfraFailure → fallback, never TestFailure. Backends without verdict.json (command templates) degrade gracefully to exit-code-only interpretation. verdict.json v2 additionally classifies failures (compile-error vs test-failure vs doctest vs harness-panic, derived from cargo's stable `--message-format json` stream) so agents branch on failure class without parsing logs. Parity preflight: builder images carry capability labels (`org.gantry.toolchain=…`); before submission gantry compares local rust-toolchain.toml, requested features, and the env allowlist against them — a mismatch is a loud local fallback (warn-only for unlabeled images), because a verdict from the wrong toolchain is a wrong answer delivered confidently.
+- **`argo`** (v1): builds the Workflow manifest with serde (no string splicing), submits via `kubectl create -f -` (kubeconfig path from config; direct REST API is a later option), polls pods for streaming, polls `status.phase` for the verdict, falls back to reading `outputs.parameters.output` when podGC ate the logs. Ships `contrib/argo/gantry-verify-workflowtemplate.yml` — a genericized `rust-verify` (parameters: `repo`, `revision`, `args-json`, `builder-image`; sccache optional). Remote contract (resolves Q-2 as faithful-argv): the remote executes exactly the argv the caller typed; check/clippy run only as opt-in quality gates from trusted user config, reported as separately-labeled `[gantry] gate:` results, never conflated with the test verdict. A failing enabled gate yields verdict `gate_failure`: overall exit is non-zero (agents must see red), output and records attribute it to the named gate, and — like TestFailure — it never triggers a local retry. The template also emits a structured `verdict.json` output parameter — one versioned schema (`schema_version`, phase, exit code, oom, deadline from workflow node status, plus an optional `failure_class`: compile-error vs test-failure vs doctest vs harness-panic, derived from cargo's stable `--message-format json` stream) — so OOMKilled and deadline-exceeded classify as InfraFailure → fallback, never TestFailure, and agents branch on failure class without parsing logs. Consumers ignore unknown fields; an absent verdict.json degrades gracefully to exit-code-only interpretation (command templates). Parity preflight: builder images carry capability labels (`org.gantry.toolchain=…`); before submission gantry compares local rust-toolchain.toml and requested features against them — a mismatch is a loud local fallback (warn-only for unlabeled images), because a verdict from the wrong toolchain is a wrong answer delivered confidently.
 - **`command`** (v1): three user-configured argv arrays (`submit`, `logs`, `wait`) with `{repo}` `{rev}` `{args_json}` `{handle}` placeholder substitution at the argv level; `submit`'s stdout is the handle; `wait`'s exit code is the verdict (0 pass, 1 test-failure, ≥2 infra-failure — documented contract).
 - **SSH-first onboarding** (v1, flagship): not a third backend implementation — a shipped command-template *preset* plus `contrib/gantry-exec.sh` (~150-line POSIX executor that clones `refs/gantry/*` and runs the command), which doubles as executable documentation of the remote contract. "Remote = any spare SSH box" is the documented quickstart path; Argo is the "advanced" backend. A native `ssh` backend remains possible later only if the preset proves limiting.
 
@@ -95,7 +97,7 @@ trait RemoteBackend {
 - Applies to: intercepted-command fallbacks always; all passthrough invocations when `cap_passthrough = true` (default, matching predecessor).
 - Fallback admission semaphore: capped local *fallback* runs additionally acquire a flock-based token file (default 3 concurrent per box) and queue with loud `[gantry] waiting for local slot (N ahead)` lines and a bounded wait — a remote outage under ~20 agents degrades as a serialized trickle, not a stampede that recreates the meltdown gantry exists to prevent. Kernel lock release means a SIGKILLed agent can never leak a slot.
 - Boxwide slice: every gantry-spawned local run lands in one systemd user slice (`gantry.slice`) carrying a box-level *sum* cap (configurable, e.g. 12 CPU / 32G) alongside the per-run caps — the semaphore bounds the count, the slice bounds the total; 20 × "200%/6G each" can no longer add up past the machine. Degrades cleanly where slices are unavailable.
-- Agent-priority queueing: `GANTRY_AGENT=1` (env convention — deliberately not TTY sniffing, since tmux-hosted agents have TTYs) orders the semaphore queue and submission slots humans-first, agents-behind, with a printed triage tag.
+- Agent-priority queueing: `GANTRY_AGENT=1` (env convention — deliberately not TTY sniffing, since tmux-hosted agents have TTYs) orders the fallback-semaphore queue humans-first, agents-behind, with a printed triage tag (any future submission gating inherits the same ordering).
 
 ### 7. RunLog & UX
 - stderr lines prefixed `[gantry]`: decision, workflow name/URL, fallback reason, verdict. Written for agent transcripts as much as humans.
@@ -105,7 +107,7 @@ trait RemoteBackend {
 
 ### 8. doctor / installer
 - `gantry doctor`: shim-before-real PATH ordering; real binary resolves and is not gantry; config parses; backend preflight (`kubectl` reachable / template exists, or command-backend binaries exist); systemd-run scope creation probe; git identity present; orphaned intent records reported as lost runs.
-- `gantry doctor --e2e`: canary run — pushes a tiny known-good fixture ref through the real RefPusher and backend and asserts the expected pass verdict round-trips. One command answers "is the pipeline actually working" on the operator's schedule, not at 9am when 20 agents degrade.
+- `gantry doctor --e2e`: canary run — pushes a tiny known-good fixture ref through the real RefPusher and backend and asserts the expected pass verdict round-trips. One command answers "is the pipeline actually working" on the operator's schedule, not at 9am when 20 agents degrade. Mechanism: pushes the current repo's HEAD as a normal gantry ref but overrides the argv with a trivial command (`cargo --version`), exercising push → clone → contract → verdict without running a real suite; `gantry init --ssh` runs it as its final step.
 - `gantry doctor --drill`: fault-injection fire drill — injects a synthetic InfraFailure through a drill-scoped hook (never honored outside a drill) and asserts the entire loud-degrade chain fires: banner, intent/verdict records, semaphore-gated capped local run, correct exit code. The fallback path is gantry's core safety promise and otherwise only executes when things are already on fire.
 - `install.sh`: detect platform → fetch release binary → install to `~/.local/bin/gantry` → create shim symlink(s) in a configured shim dir → verify PATH ordering (instruct if wrong) → write starter config → run `doctor`. `gantry uninstall` reverses it.
 - Onboarding must be smooth and automatic: `gantry init --ssh user@host` performs the whole SSH-first setup — verifies git+cargo on the target, writes the command-template preset config, and finishes with `doctor --e2e`. Install to first remote run in ~10 minutes, no Kubernetes required.
@@ -116,7 +118,7 @@ trait RemoteBackend {
 ### 10. Ledger intelligence (v1.x)
 One verdict-history module over runs.jsonl powering three features:
 - **Memoization (opt-in, never default):** an identical `(tree-hash, args, toolchain, image digest)` with a terminal PASS verdict returns the recorded verdict instantly with a `[gantry] cached` line and a `--fresh` escape. Keyed on tree hash, not commit sha, so rebases/amends with identical trees still hit. Failures are never memoized.
-- **Supersede-on-new-commit:** a newer sha submitted for the same (repo, args) cancels the older still-running sibling with an explicit `Superseded` terminal record — recorded, never silent — reclaiming cluster minutes from fast-iterating agents.
+- **Supersede-on-new-commit:** a newer sha submitted for the same (repo, args) cancels the older still-running sibling with an explicit `superseded` terminal record — recorded, never silent — reclaiming cluster minutes from fast-iterating agents. Supersede never yanks a watched run: it applies only when the older run has zero live attachments (originator gone, no JoinTable waiters); otherwise the newer sha simply runs alongside.
 - **Flake flagging:** the same tree + args with flipping verdicts marks runs `flaky-suspect` in runs.jsonl and the stderr summary.
 
 ## Data models
@@ -140,7 +142,7 @@ push_mode  = "ref"           # ref | branch (legacy, warns)
 deadline_minutes = 40
 
 [remote.argo]
-kubeconfig = "~/.kube/iad-ci.kubeconfig"
+kubeconfig = "~/.kube/config"
 namespace  = "argo-workflows"
 template   = "gantry-verify"
 generate_name = "gantry-"
@@ -158,13 +160,21 @@ Repo-level `.gantry.toml` may narrow behavior (add intercepts, set `backend = "n
 ```rust
 struct RunSpec { tool: String, subcommand: String, args: Vec<String>,
                  repo_url: String, sha: String, cwd_rel: PathBuf }
+```
 
-// runs.jsonl — one per invocation
-{ "ts": …, "tool": "cargo", "args": ["test","--","--nocapture"],
-  "repo": "…", "sha": "…", "decision": "remote|local",
-  "reason": "clean|dirty|no_remote|disabled|env|infra_fallback:…",
-  "backend": "argo", "handle": "gantry-x7k2p", "verdict": "pass|test_failure|infra_failure",
-  "exit_code": 0, "durations_ms": { "gate": 40, "push": 900, "queue": 12000, "run": 341000 } }
+`cwd_rel` is the caller's directory relative to the repo root; remote executors `cd` into it before running the argv, so workspace-member invocations behave identically remote and local.
+
+```rust
+// runs.jsonl — write-ahead: one OPEN intent + one terminal record per invocation
+{ "rec": "intent", "schema_version": 1, "run_id": "01J…", "ts": …,
+  "tool": "cargo", "args": ["test","--","--nocapture"], "repo": "…", "sha": "…", "cwd_rel": ".",
+  "gate": { "worktree": true, "head": true, "remote": true, "clean": true },
+  "decision": "remote|local", "reason": "clean|dirty|no_remote|tier0|disabled|env",
+  "backend": "argo|command|none" }
+{ "rec": "verdict", "schema_version": 1, "run_id": "01J…", "ts": …,
+  "verdict": "pass|test_failure|gate_failure|infra_failure|superseded|cancelled",
+  "ran": "remote|local|local_after_infra", "exit_code": 0, "handle": "gantry-x7k2p",
+  "durations_ms": { "gate": 40, "push": 900, "queue": 12000, "run": 341000 } }
 ```
 
 ### Verdict semantics (the load-bearing enum)
@@ -176,6 +186,8 @@ struct RunSpec { tool: String, subcommand: String, args: Vec<String>,
 | `InfraFailure` | no verdict produced (push/submit/schedule/stream/deadline) | capped local run; its exit code wins |
 
 OOMKilled pods and deadline-exceeded workflows are `InfraFailure` by definition (via the remote contract's `verdict.json`): an infrastructure cap firing says nothing about the code, and reporting it as a test failure would fake a result.
+
+Terminal-record values extend the ladder: `gate_failure` (an enabled quality gate failed while tests passed — exit non-zero, attribution to the named gate, no local retry), `cancelled` (user Ctrl-C), and `superseded` (v1.x, see Ledger intelligence). `verdict` applies to local runs too (`ran: "local"`); an infra fallback records the final local outcome as `ran: "local_after_infra"`.
 
 ## CLI surface
 
@@ -204,10 +216,11 @@ Diagnostics are agent-first: `why`, `explain`, and `status` take `--json` with a
 | ref push rejected (auth, network) | infra | local capped run |
 | submit error (kubectl/exec fails) | infra | local capped run |
 | pod never scheduled by deadline | infra | **local capped run** (predecessor wrongly exited 1) |
-| log stream lost mid-run | benign | keep waiting on status; fetch output param at end |
-| remote deadline exceeded | infra | print handle URL, local capped run |
+| log stream lost mid-run | infra (recoverable) | keep waiting on status; fetch output param at end |
+| client deadline (`deadline_minutes`) exceeded | infra | print handle URL, local capped run |
 | remote suite fails | test | exit non-zero, stop |
-| remote pod OOMKilled / deadline-exceeded | infra | `verdict.json` classifies as InfraFailure → capped local run — never reported as a test failure |
+| enabled quality gate fails (tests pass) | gate_failure | exit non-zero, attributed to the named gate; no local retry |
+| remote pod OOMKilled / workflow `activeDeadlineSeconds` exceeded | infra | `verdict.json` classifies as InfraFailure → capped local run — never reported as a test failure |
 | gantry process killed mid-run | self | orphaned OPEN intent in runs.jsonl; `gantry doctor` reports it as a lost run |
 | remote outage → mass fallback | env | admission semaphore caps concurrent local runs (default 3), loud queue-position lines |
 | Ctrl-C during remote run | user | propagate `cancel()`, exit 130 |
@@ -253,7 +266,7 @@ Multi-tool profiles (`pytest`, `go test`) behind the same config schema; nextest
 ## Open questions
 
 - **Q-1 crates.io name.** Is bare `gantry` registered/squatted? Check at publish time; fallbacks `gantry-rs` (matches the repo) / `gantry-shim`. Repo name stays `gantry-rs` regardless; binary stays `gantry`.
-- **Q-4 `builder-image` selection.** Per-repo override belongs in `.gantry.toml` (it's not credential-adjacent) — confirm this doesn't violate S-2 in review.
+- **Q-4 `builder-image` selection.** A repo-chosen image is remote code execution with the CI pod's credentials (sccache keys, clone tokens) — an arbitrary image named in `.gantry.toml` would gut S-2. Leading candidate: repo config may only select images matching a trusted-config allowlist (registry/digest prefixes); a non-matching image is ignored with a loud `[gantry]` line and the default is used. Settle before Phase 2 template work.
 - **Q-5 macOS local cap.** No systemd; `ulimit`/`taskpolicy` are weak substitutes. Ship uncapped-with-warning, or refuse to `cap_passthrough` on macOS?
 - **Q-6 output-param size limits.** Argo output parameters have size caps (~256KB default); huge test logs will truncate. Artifact-based log capture (S3) as the durable channel?
 ## Resolved questions (2026-07-21 ideation run — full record in docs/notes/ideas-ledger.md)
