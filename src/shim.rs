@@ -341,6 +341,94 @@ pub fn resolve_real_binary(cfg: &crate::config::Config) -> Result<std::path::Pat
     Ok(resolved)
 }
 
+/// Map a child's [`std::process::ExitStatus`] to an [`std::process::ExitCode`]
+/// faithfully — exit-code fidelity (INV-3, plan §1):
+///
+/// - a success status yields [`ExitCode::SUCCESS`];
+/// - a normal exit with code `N` yields `ExitCode::from(N as u8)`;
+/// - on Unix, termination by signal `S` yields `ExitCode::from((128 + S) as u8)`,
+///   matching the shell's `$?` convention so a process killed by `SIGTERM`
+///   (15) surfaces as 143 exactly as it would from a direct `cargo` call.
+///
+/// [`ExitCode`] carries a single `u8`, so a code above 255 truncates to its low
+/// byte — the same lossy mapping the platform's own process-exit ABI imposes, so
+/// this is as faithful as an `ExitCode` can be. Never panics: every status shape
+/// (success, normal exit, or Unix signal death) routes to a constructed
+/// [`ExitCode`]; a platform that withholds a code defaults to `1` (`FAILURE`).
+//
+// Held private by design (a passthrough-internal helper): only passthrough is
+// meant to call it, which is why it carries no `#[allow(dead_code)]`.
+fn status_to_exit_code(status: std::process::ExitStatus) -> std::process::ExitCode {
+    // `success()` holds iff the child exited 0 (the one success status), so it
+    // is mapped to SUCCESS before the non-zero paths are even considered.
+    if status.success() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        // Unix signal death is invisible to `code()` (it returns None), so it is
+        // probed first and folded to the shell's 128 + signo before falling back
+        // to the normal-exit code below. The cfg gate keeps this Unix-only:
+        // Windows carries no signal notion, and the file targets Unix/Windows.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                return std::process::ExitCode::from((128 + signal) as u8);
+            }
+        }
+        // A normal non-zero exit (or, off-Unix, any non-success): take the code
+        // the child reported, defaulting to FAILURE when the platform withholds
+        // one so the result is never a silent SUCCESS on a failed spawn.
+        std::process::ExitCode::from(status.code().unwrap_or(1) as u8)
+    }
+}
+
+/// Run the real binary locally, forwarding the caller's argv untouched — the
+/// passthrough fast path (plan §1, Components §1 "Shim & dispatcher"; INV-4
+/// passthrough budget). `argv[0]` is the invocation name and is not forwarded;
+/// every argument after it is.
+///
+/// Resolves the real binary via [`resolve_real_binary`] — the re-exec guard runs
+/// inside it — then spawns it with exactly `argv[1..]` forwarded through
+/// [`std::process::Command::args`] and waits for it to finish. This path does no
+/// git, no network, and no config parsing beyond the single resolution: the
+/// <5 ms budget (INV-4) lives here, and argv travels as an array end to end —
+/// never shell-interpolated (S-4, INV-5) — so pathological argv (newlines,
+/// quotes, 100 KB args) round-trips byte-exact.
+///
+/// Errors never fall back to self (plan §1 "never a fallback-to-self"): a
+/// resolution failure or a self-recursion-guard refusal prints a loud
+/// `[gantry]`-prefixed line to stderr and returns a non-zero [`ExitCode`]
+/// without spawning anything; a spawn failure does the same. The child's own
+/// outcome is mapped faithfully to an [`ExitCode`] (INV-3) via
+/// [`status_to_exit_code`]. Never panics — every fallible step maps to a message
+/// and an [`ExitCode`] rather than an `unwrap`.
+pub fn passthrough(cfg: &crate::config::Config, argv: &[String]) -> std::process::ExitCode {
+    let real = match resolve_real_binary(cfg) {
+        Ok(path) => path,
+        Err(why) => {
+            // Resolution failure OR the self-recursion guard's refusal: never
+            // exec, never fall back to self (plan §1). Surface a loud message and
+            // a non-zero exit so a broken or misconfigured install is heard.
+            eprintln!("[gantry] {why}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    // argv[1..] forwarded byte-exact through Command::args — an array, never a
+    // shell string — so no interpolation can alter it (S-4, INV-5). Dispatch
+    // guarantees argv[0] (the invocation name) is present before this is reached.
+    match std::process::Command::new(&real).args(&argv[1..]).status() {
+        Ok(status) => status_to_exit_code(status),
+        Err(why) => {
+            // The binary resolved but would not run (missing exec bit, permission
+            // denied, exec format error): same loud-and-non-zero contract as a
+            // resolution failure — never silent, never a panic.
+            eprintln!("[gantry] failed to run `{}`: {why}", real.display());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +983,35 @@ mod tests {
         assert_eq!(
             name, expected,
             "resolved binary basename must be the cargo executable for the platform",
+        );
+    }
+
+    // --- passthrough: the spawn-and-forward fast path ------------------------
+    //
+    // passthrough's body composes resolve_real_binary with a real child spawn.
+    // The fixture must be genuinely executable (the spawn actually runs it), so
+    // these tests reuse the Unix-gated touch_executable helper and stay
+    // #[cfg(unix)] for the same reason find_in_path's executable-bit tests do.
+
+    #[cfg(unix)]
+    #[test]
+    fn passthrough_runs_the_resolved_binary_and_returns_success() {
+        // The happy path (plan §1 fast path, INV-4 budget): with a real_binary
+        // override pointing at a tiny exit-0 fixture — distinct from the gantry
+        // binary, so the self-recursion guard passes — passthrough resolves it,
+        // spawns it with argv[1..] forwarded byte-exact, and maps the child's
+        // success to ExitCode::SUCCESS (INV-3 exit-code fidelity). argv carries
+        // only the invocation name here, so argv[1..] is empty; the fixture exits
+        // 0 regardless, exercising the spawn + status->SUCCESS mapping cleanly.
+        let dir = TempDir::new("passthrough-ok");
+        let script = touch_executable(dir.path(), "cargo");
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary = Some(script);
+        let argv = vec!["cargo".to_string()];
+        assert_eq!(
+            passthrough(&cfg, &argv),
+            std::process::ExitCode::SUCCESS,
+            "a child that exits 0 must surface as ExitCode::SUCCESS",
         );
     }
 }
