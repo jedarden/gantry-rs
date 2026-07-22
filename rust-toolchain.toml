@@ -1,0 +1,12 @@
+# Toolchain pin for gantry.
+#
+# Phase 0.5 establishes the file (plan "Quality gates": rust-toolchain.toml is
+# pinned at the repo root from the first commit of Phase 0.5). We pin the
+# `stable` channel with rustfmt + clippy so the quality gates
+# (`cargo fmt --check`, `cargo clippy -D warnings`) resolve without a network
+# fetch. A concrete stable-version pin is a later-phase hardening (see plan
+# "Versioning & compatibility"); the channel pin here is the reproducibility
+# floor for the walking skeleton.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
