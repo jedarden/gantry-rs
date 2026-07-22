@@ -678,4 +678,25 @@ mod tests {
             "explicit override must win verbatim even with an empty PATH",
         );
     }
+
+    #[test]
+    fn resolve_real_binary_self_recursion_guard_yields_err_when_path_is_only_shim_dir() {
+        // The self-recursion guard (plan §1): with PATH reduced to ONLY gantry's
+        // own shim dir and no override (real_binary == None), resolve_real_binary
+        // strips that dir (it excludes current_exe's dir) and the search path
+        // collapses to nothing, so the cargo walk finds no binary and the resolver
+        // returns Err — it never re-resolves `cargo` to the gantry binary itself.
+        let cfg = Config::hardcoded(); // real_binary == None → the PATH-lookup branch
+        let shim_dir = shim_dir().expect("current_exe resolves under cargo test");
+        let shim_dir_str = shim_dir
+            .to_str()
+            .expect("shim_dir is a utf-8 path under cargo test");
+        let err = with_path(shim_dir_str, || resolve_real_binary(&cfg)).expect_err(
+            "a PATH containing only the shim dir must yield Err, never the gantry binary",
+        );
+        assert!(
+            err.contains("cargo"),
+            "error must name the binary so the diagnostic stays actionable: {err}",
+        );
+    }
 }
