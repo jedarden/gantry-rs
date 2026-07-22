@@ -10,8 +10,9 @@
 //
 // `invocation_name` lives here because argv[0] is the dispatch key main.rs
 // matches on ('cargo' vs 'gantry' vs unknown). Real-binary resolution and the
-// passthrough exec join it here in later stages of the bf-6d4 split (bf-614q,
-// bf-1m69, bf-28dv); this stage adds only the name extraction.
+// passthrough exec join it here across the bf-614q chain: `shim_dir` is the
+// first piece (the self-recursion-guard basis), with resolve_real_binary
+// (bf-614q), the re-exec guard (bf-1m69), and passthrough (bf-28dv) to follow.
 
 /// The sentinel dispatch key returned when argv[0] is absent or basename-less.
 ///
@@ -56,6 +57,42 @@ pub fn invocation_name(argv: &[String]) -> String {
         // the sentinel so dispatch stays deterministic and panic-free.
         _ => SENTINEL.to_string(),
     }
+}
+
+/// The directory gantry must strip from PATH before resolving the real cargo —
+/// namely the directory that holds the gantry binary itself.
+///
+/// Returns the *parent* of `std::env::current_exe()`: a PATH entry pointing
+/// here would re-resolve `cargo` to the gantry shim, so this strip is the
+/// self-recursion guard's basis (plan §1 "Real-binary resolution"). Pure path
+/// logic — no PATH split, no cargo lookup, no filesystem stat beyond
+/// `current_exe()`, and no reference to Config; the future resolve_real_binary
+/// (bf-614q) consumes this to build the stripped search path.
+///
+/// Never panics. `current_exe()` can fail (platform path-resolution limits, a
+/// binary deleted mid-run, `/proc` unavailable on Linux); the failure surfaces
+/// as a human-readable `Err` rather than a panic or `unwrap`. On success the
+/// parent directory is returned — a directory path, never the binary file.
+//
+// Held private by design (the bead scope says "private helper"): only the
+// in-module resolve_real_binary (bf-614q) is meant to call it, and that
+// consumer lands in the next child of the chain — so shim_dir has no caller at
+// this commit. `#[allow(dead_code)]` keeps `-D warnings` green for the
+// incremental build; remove it once bf-614q gives the helper a caller.
+#[allow(dead_code)]
+fn shim_dir() -> Result<std::path::PathBuf, String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("gantry cannot locate its own binary: {e}"))?;
+    // `parent()` is None only for a path with no directory component (a bare
+    // filename). `current_exe()` always carries a directory on supported
+    // platforms, so this is a defensive fallback surfaced as an error rather
+    // than an unwrap that could panic on an exotic shape.
+    exe.parent().map(std::path::PathBuf::from).ok_or_else(|| {
+        format!(
+            "gantry binary path has no parent directory: {}",
+            exe.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -133,5 +170,31 @@ mod tests {
         // constant across every degenerate input so dispatch is deterministic.
         assert_eq!(invocation_name(&[]), invocation_name(&["".to_string()]));
         assert_eq!(invocation_name(&[".".to_string()]), SENTINEL);
+    }
+
+    #[test]
+    fn shim_dir_returns_the_parent_not_the_binary() {
+        // The self-recursion-guard basis: shim_dir is the directory that holds
+        // the gantry binary, never the binary itself — a PATH entry pointing
+        // here is exactly what must be stripped before resolving real cargo.
+        let dir = shim_dir().expect("current_exe resolves under cargo test");
+        let exe = std::env::current_exe().expect("current_exe resolves under cargo test");
+        assert_ne!(dir, exe, "shim_dir must be the parent, not the binary");
+        assert_eq!(
+            dir,
+            exe.parent().expect("the test binary has a parent dir"),
+            "shim_dir must be exactly the parent of current_exe",
+        );
+    }
+
+    #[test]
+    fn shim_dir_has_a_nonempty_name() {
+        // Smoke: the returned directory carries a real, non-empty final
+        // component (the dir name a PATH entry would match against).
+        let dir = shim_dir().expect("current_exe resolves under cargo test");
+        let name = dir
+            .file_name()
+            .expect("shim_dir has a file_name under cargo test");
+        assert!(!name.is_empty(), "shim_dir file_name must be non-empty");
     }
 }
