@@ -21,6 +21,50 @@ Extraction and hardening of the in-house `~/.local/bin/cargo` + `cargo-remote` b
 
 Compilation caching (compose with sccache), hermetic/Bazel-style execution, dirty-tree syncing, per-agent hook integrations, Windows, nextest interception (v1). See `docs/notes/features.md` for rationale.
 
+## Terms & conventions
+
+**Normative language:** MUST / MUST NOT are binding — violating them fails this spec. SHOULD means deviation requires a documented reason. MAY is truly optional.
+
+**Glossary** (two uses of "gate" exist; they are different things):
+- **shim** — the binary installed under the name `cargo`, ahead of the real toolchain in PATH.
+- **intercepted / passthrough** — an invocation gantry may offload vs. one it forwards untouched (under the cap when `cap_passthrough`).
+- **GitGate** — the *eligibility* checks (work tree, HEAD, remote, clean) deciding remote vs. local. Never called just "gate" in output.
+- **quality gate** — an opt-in remote check beyond the caller's argv (clippy, fmt), always labeled `[gantry] gate:` and carrying verdict `gate_failure` when failed.
+- **verdict** — the terminal classification of a run (`pass` / `test_failure` / `gate_failure` / `infra_failure` / `cancelled` / `superseded`). The exit code is derived from it, never vice versa.
+- **Tier-0** — zero-config mode: cap-only, nothing goes remote.
+- **backend / preset** — a `RemoteBackend` implementation vs. a shipped configuration of one (SSH is a preset of `command`).
+- **fallback / degradation** — the loud, recorded switch to a capped local run after an infra failure or gate ineligibility.
+- **epoch ref / lease** — `refs/gantry/<epoch>-<sha>` plus the client-side record that protects it from GC while a run is live.
+- **attachment / waiter** — a process streaming/waiting on a run (originator or JoinTable joiner).
+
+**Scope lock:** v1 scope is frozen as of 2026-07-22 (17 adopted mechanisms; see Resolved questions). New scope enters only via the ideation ledger → plan amendment → commit, *before* implementation of that item begins. In-flight scope additions are forbidden — this plan doubled in mechanism count across two productive ideation days precisely because the pipeline works; the freeze is what makes Phase 1 finishable.
+
+## Acceptance scenarios
+
+Named scenarios define "done." Each is independently verifiable; phase acceptance lists reference them.
+
+**AS-1 Happy path (human).** A developer in a clean, pushed-up repo runs `cargo test`. → gantry pushes the epoch ref, submits, streams logs live, prints the verdict trailer. → Exit 0 on pass.
+*Pass:* zero caller-side changes; logs stream within 30s of submit or a queue explanation prints; exit code equals what local `cargo test` would have produced.
+*Fail:* any branch ref moved on the remote; silence >60s with no `[gantry]` line; exit code differs from the suite's true result.
+
+**AS-2 Agent machine-mode (primary audience).** A NEEDLE worker (`GANTRY_AGENT=1`) runs `cargo test` on a wip branch; the suite has one failing test. → Remote runs, verdict `test_failure` with `failure_class: test-failure`. → The worker runs `gantry why --json` and branches on the failure class without parsing logs.
+*Pass:* transcript contains the decision line, verdict trailer, and handle; `why --json` parses with a stable schema and names the failure class; the worker never needed a human.
+*Fail:* worker must regex the log stream to learn what happened; JSON schema drifts between invocations; a gate failure is indistinguishable from a test failure.
+
+**AS-3 Cluster outage under fleet load.** 20 agents run `cargo test` while the backend is unreachable. → Every run prints the infra reason, acquires a fallback slot (max 3 concurrent), and runs capped locally; the rest queue loudly.
+*Pass:* box load stays bounded (slice cap holds); every run ends in a real verdict; runs.jsonl shows 20 intent+verdict pairs with `ran: local_after_infra`.
+*Fail:* simultaneous uncapped local builds (the meltdown gantry exists to prevent); any run exits with neither verdict nor orphan record.
+
+**AS-4 Dirty tree.** A developer with an uncommitted new test file runs `cargo test`. → GitGate blocks remote (untracked file detected), prints the reason and the exact two-command path to eligibility, runs capped locally.
+*Pass:* the untracked file's tests actually ran (locally); reason `dirty` recorded; no ref pushed.
+*Fail:* remote runs against code missing the new file (the predecessor's silent-gap bug); user must read docs to learn why it ran locally.
+
+**AS-5 Gate failure attribution.** Gates enabled (fleet config); tests pass but clippy fails. → Exit non-zero with verdict `gate_failure`, output attributing the failure to `[gantry] gate: clippy`, tests reported green.
+*Pass:* an agent reading `why --json` sees tests-passed-gate-failed and fixes lints, not tests.
+*Fail:* gate failure presented as a test failure (misdirected agent work), or gates-off runs affected in any way.
+
+**Success metrics:** *Performance* — passthrough <5ms p99; submit overhead (gate+push+submit, excluding queue) ≤5s p50. *Functionality* — AS-1..AS-5 pass. *Adoption* — one week of NEEDLE traffic with zero silent skips and ≥90% of eligible runs offloaded; bash pair deleted.
+
 ## Architecture
 
 ```
@@ -121,6 +165,28 @@ One verdict-history module over runs.jsonl powering three features:
 - **Supersede-on-new-commit:** a newer sha submitted for the same (repo, args) cancels the older still-running sibling with an explicit `superseded` terminal record — recorded, never silent — reclaiming cluster minutes from fast-iterating agents. Supersede never yanks a watched run: it applies only when the older run has zero live attachments (originator gone, no JoinTable waiters); otherwise the newer sha simply runs alongside.
 - **Flake flagging:** the same tree + args with flipping verdicts marks runs `flaky-suspect` in runs.jsonl and the stderr summary.
 
+### Proposed module layout
+
+```
+src/main.rs            argv[0] dispatch only
+src/shim.rs            passthrough fast path (<5ms budget lives here)
+src/decision.rs        intercept set, Tier-0, kill switches
+src/gate.rs            GitGate
+src/refs.rs            RefPusher: epoch refs, leases, GC sweep
+src/backend/mod.rs     RemoteBackend trait + verdict.json parsing
+src/backend/argo.rs    kubectl-based Argo backend
+src/backend/command.rs command-template backend (SSH preset = config + contrib script)
+src/local.rs           LocalExecutor: scope, slice, semaphore, priority
+src/runlog.rs          write-ahead ledger, flight recorder
+src/config.rs          layering, last-known-good, trust boundary
+src/cli/               doctor, why, explain, init, quickcheck, report, status…
+contrib/argo/          reference WorkflowTemplate
+contrib/gantry-exec.sh shell reference executor
+tests/properties/      argv round-trip, ref-name fuzzing
+tests/stampede/        20-way concurrency harness
+tests/e2e/             drill + canary fixtures
+```
+
 ## Data models
 
 ### Config — `~/.config/gantry/config.toml` (layered: /etc/gantry → user → repo `.gantry.toml`)
@@ -189,6 +255,17 @@ OOMKilled pods and deadline-exceeded workflows are `InfraFailure` by definition 
 
 Terminal-record values extend the ladder: `gate_failure` (an enabled quality gate failed while tests passed — exit non-zero, attribution to the named gate, no local retry), `cancelled` (user Ctrl-C), and `superseded` (v1.x, see Ledger intelligence). `verdict` applies to local runs too (`ran: "local"`); an infra fallback records the final local outcome as `ran: "local_after_infra"`.
 
+### Versioning & compatibility
+
+Every machine-consumed surface carries an explicit version; unknown fields are always ignored (additive evolution is free, removal/retyping is a major bump):
+
+- **runs.jsonl** — `schema_version` on every record. Readers MUST tolerate newer minor records; `gantry doctor` flags a ledger written by a newer major.
+- **verdict.json** — `schema_version`; absent file = exit-code-only contract. Optional fields (`failure_class`) are exactly that.
+- **`--json` CLI output** (`why`/`explain`/`status`) — top-level `schema_version`; the JSON surface is the primary interface, human text is a rendering of it.
+- **Remote contract** — the client sends `contract_version` as a workflow parameter; the template echoes it in verdict.json. A mismatch the client can't interpret = InfraFailure with an explicit "contract drift" message, never a misread verdict. Template upgrades are blue-green: `gantry-verify` versions coexist and the client config pins one.
+- **Config** — unknown keys warn (never error); renamed keys keep a one-major deprecation alias; the last-known-good snapshot stores the schema version it parsed under.
+- **Backward-compat stance for the predecessor:** cap values and nextest non-interception match the bash pair exactly; behavioral differences (porcelain gate, epoch refs, OOM classification) are deliberate fixes, listed in the migration notes — there is no bug-for-bug mode.
+
 ## CLI surface
 
 ```
@@ -228,6 +305,36 @@ Diagnostics are agent-first: `why`, `explain`, and `status` take `--json` with a
 | systemd-run unavailable | env | plain exec (documented: containers self-limit) |
 | gantry binary deleted but shim remains | self | shim *is* the binary (symlink) — impossible state; doctor checks dangling links |
 
+## Edge case catalog
+
+**EC-01 Linked git worktrees (load-bearing: NEEDLE workers share worktrees).** All GitGate checks and pushes operate on the *worktree's* HEAD and index. JoinTable and memoization keys use the common git dir (`git rev-parse --git-common-dir`) + sha, so two worktrees of one repo dedup correctly. A stampede-test variant MUST run from two worktrees of the same repo.
+
+**EC-02 Detached HEAD.** Eligible — a sha is a sha. The decision line notes `(detached)`; nothing else differs.
+
+**EC-03 Submodules.** If `.gitmodules` exists, v1 falls back locally with reason `submodules` (the remote clone contract doesn't recurse yet). Loud, honest, and cheap; recursion is a template upgrade later.
+
+**EC-04 Shallow local clone.** Push of the epoch ref may fail against a shallow history → ordinary push InfraFailure → capped local run. No special handling; the reason line names the likely cause.
+
+**EC-05 Huge repo / slow status.** `git status --porcelain` on a monorepo can take seconds. Gate duration is recorded (`durations_ms.gate`) and a `[gantry] slow gate (Ns) — consider .gitignore hygiene` hint prints past 2s. The gate is never skipped for speed.
+
+**EC-06 Pathological argv.** NULs are impossible in argv; newlines/quotes/100KB args MUST round-trip byte-exact (property test, tests/properties/). Args are never shell-interpolated anywhere (S-4).
+
+**EC-07 Cargo aliases and bare `cargo`.** Interception matches argv[1] exactly against the intercept set. Aliases expanding to `test` inside real cargo are NOT intercepted (documented limitation — gantry never parses cargo config to chase aliases).
+
+**EC-08 State dir unwritable / disk full.** Never blocks the build: run proceeds with in-memory records, one warning line, and `doctor` reports the unwritable state dir. A full disk MUST NOT turn into a missing verdict or a crash.
+
+**EC-09 Same sha pushed by two boxes in the same epoch window.** Ref name collision is benign (same content); the push is verify-then-skip. Cross-box lease files don't exist — each box GCs only refs it created (lease records are local).
+
+## Invariants (CI-enforced, not prose)
+
+- **INV-1 No silent skip:** every invocation ends in a terminal record or a detectable orphaned intent. (SIGKILL test in Phase 1 acceptance.)
+- **INV-2 No branch mutation:** gantry never moves a branch ref; asserted via `git ls-remote` diff in e2e tests.
+- **INV-3 Exit-code fidelity:** the caller's exit code always reflects the verdict; verdicts derive from status APIs, never from parsing log text.
+- **INV-4 Passthrough budget:** <5ms p99 (hyperfine in CI; regression = build failure).
+- **INV-5 Argv round-trip:** byte-exact through shim → JSON → remote argv (property test).
+- **INV-6 Network confinement:** no connections except the configured backend and git remote (S-7 test).
+- **INV-7 No local retry of real failures:** `test_failure` and `gate_failure` never trigger a local rerun.
+
 ## Security considerations
 
 - **S-1 no implicit branch pushes** (DD-2) — the predecessor's worst incident class.
@@ -238,27 +345,68 @@ Diagnostics are agent-first: `why`, `explain`, and `status` take `--json` with a
 - **S-6 published threat model**: `docs/notes/threat-model.md` states what gantry can and cannot touch — ref-leak surface, untrusted repo config, credential posture — and ships alongside the public README.
 - **S-7 no-phone-home, as a test**: an integration test asserts the binary opens no network connections except the configured backend and the git remote; the pledge is CI-enforced, not prose.
 
+## Risk register
+
+| # | Risk | Likelihood | Impact | Mitigation |
+|---|------|-----------|--------|------------|
+| R1 | Phase 1 scope exceeds estimate (17 adopted mechanisms) | High | High | Walking skeleton + 1a/1b split below; scope lock; 1b is the cut list if 1a slips |
+| R2 | Epoch-ref naming vs content-addressing tension surfaces late | Medium | High | Design note is a Phase 1a *entry* deliverable, settled before RefPusher is built |
+| R3 | Cold remote builds slower than local (sccache cold/absent) → adoption stalls | Medium | High | `doctor --e2e` measures round-trip; expectations documented; Tier-0 keeps the tool valuable regardless |
+| R4 | kubectl dependency/version skew breaks argo backend | Medium | Medium | doctor preflight pins minimum kubectl; REST client remains the stretch escape |
+| R5 | No systemd on target (containers, macOS) weakens caps | Medium | Medium | Documented degrade to plain exec; Q-5 open; doctor reports active cap tier |
+| R6 | Argo output-param cap truncates failure tails | Medium | Medium | Q-6 open; watermarked truncation; artifact channel benched in ledger |
+| R7 | Shared-worktree fleet semantics diverge from single-checkout assumptions | Medium | High | EC-01 + two-worktree stampede variant + Phase 3 fleet-cycle audit |
+| R8 | `refs/gantry/*` propagate through server-side push mirrors to public GitHub | Medium | High | Interim: docs recommend a dedicated `ci_remote` for mirrored repos; mirror-leak guard benched (owner-skipped) |
+| R9 | flock semantics unreliable on network filesystems | Low | Medium | State dir MUST be local disk; doctor verifies |
+
+## Quality gates (definition of done)
+
+`rust-toolchain.toml` is pinned at the repo root from the first commit of Phase 0.5. No phase completes — and no release ships — unless all of the following pass **on the same commit**:
+
+1. `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
+2. `cargo test` (unit + property + stampede suites relevant to the phase)
+3. hyperfine passthrough budget (INV-4) within target
+4. The phase's acceptance list green
+5. From Phase 3 on: no-phone-home test (INV-6) green in CI
+
+A regression in any gate is a build failure, not an advisory. Gantry's own CI dogfoods the remote contract as soon as Phase 2 lands.
+
 ## Implementation phases
 
-### Phase 0 — Repo, docs, contract ✅ (this commit)
+Each phase names its entry criteria (the prior phase's quality gates) and a rough size estimate — honesty devices, not commitments.
+
+### Phase 0 — Repo, docs, contract ✅
 Scaffold, research, features, decisions, plan.
 
-### Phase 1 — MVP binary (parity + footgun fixes)
-Rust workspace, single `gantry` crate. Shim dispatch, config (with last-known-good snapshot + escalating broken-config banner), GitGate (porcelain), RefPusher (epoch refs + leases), `argo` + `command` backends, LocalExecutor (with fallback admission semaphore, boxwide `gantry.slice` sum cap, and `GANTRY_AGENT` priority queueing), Tier-0 zero-config mode + `gantry quickcheck`, flight-recorder bundles + `gantry report`, Verdict ladder, write-ahead RunLog (intent + verdict records, gate inputs captured), `gantry why`/`explain`, `GANTRY_LOCAL`/`on`/`off`, `doctor` (core checks).
-**Acceptance:** on a clean repo, `cargo test` runs remotely with streamed logs and correct exit codes for pass/fail; dirty repo falls back with reason; pod-never-scheduled falls back locally (not exit 1); `cargo test -- "weird: [args]"` round-trips intact; passthrough overhead < 5 ms (hyperfine); no branch ref moves on the remote (assert via `git ls-remote`); SIGKILLing gantry mid-run leaves an orphaned intent that `doctor` reports; 20 simultaneous fallback invocations serialize through the semaphore (stampede test); a corrupted config file produces last-known-good behavior + banner, never silence; a fresh install with zero config caps a local `cargo test` and passes `quickcheck` with no backend; combined resource use of N concurrent capped runs stays inside the slice cap; a `GANTRY_AGENT=1` run queues behind an interactive one; an InfraFailure leaves a readable `gantry report` bundle.
+### Phase 0.5 — Walking skeleton (~800 LOC)
+**Goal:** prove the wiring end-to-end; everything may be crude, panics allowed. Shim dispatch on argv[0] → GitGate happy path → epoch-ref push → `command` backend running a bash executor on the same box → verdict → correct exit code. One hardcoded config; no semaphore, no doctor.
+**Exit criterion:** one real `cargo test` round-trips through the shim to a local "remote" and back with the right exit code, for both a passing and a failing suite.
 
-### Phase 2 — Remote contract & template
-`contrib/argo/gantry-verify-workflowtemplate.yml` (genericized rust-verify: `args-json` param, ref-fetch clone of `refs/gantry/*`, optional sccache, faithful-argv default with opt-in labeled gates, `verdict.json` output), `contrib/gantry-exec.sh` shell reference executor, output-param log recovery, deadline config, Ctrl-C cancel, refs GC sweep, `doctor --e2e`/`--drill`, verdict.json v2 failure taxonomy (`--message-format json`), image capability labels + parity preflight, epoch-vs-content-addressing design note.
+### Phase 1a — Core loop, hardened (~2,500 LOC)
+**Entry:** skeleton exit criterion met; epoch-vs-content-addressing design note written and settled.
+Config layering + last-known-good + trust boundary, full GitGate with reasons, RefPusher with leases + GC sweep, `argo` backend, complete verdict ladder (incl. `gate_failure`), write-ahead RunLog with gate-input capture, `GANTRY_LOCAL`/`on`/`off`, `doctor` core checks.
+**Acceptance (AS-1, AS-4):** on a clean repo, `cargo test` runs remotely with streamed logs and correct exit codes for pass/fail; dirty repo falls back with reason; pod-never-scheduled falls back locally (not exit 1); `cargo test -- "weird: [args]"` round-trips intact (property suite, INV-5); passthrough overhead < 5 ms (hyperfine, INV-4); no branch ref moves on the remote (`git ls-remote` assert, INV-2); SIGKILLing gantry mid-run leaves an orphaned intent that `doctor` reports (INV-1); a corrupted config file produces last-known-good behavior + banner, never silence.
+
+### Phase 1b — Safety rails & explainability (~2,000 LOC)
+**Entry:** Phase 1a quality gates green.
+Fallback admission semaphore, boxwide `gantry.slice` sum cap, `GANTRY_AGENT` priority queueing, Tier-0 zero-config mode + `gantry quickcheck`, flight-recorder bundles + `gantry report`, `gantry why`/`explain` (+ `--json`).
+**Acceptance (AS-2, AS-3):** 20 simultaneous fallback invocations serialize through the semaphore (stampede test, including the two-worktree variant per EC-01); combined resource use of N concurrent capped runs stays inside the slice cap; a `GANTRY_AGENT=1` run queues behind an interactive one; a fresh install with zero config caps a local `cargo test` and passes `quickcheck` with no backend; an InfraFailure leaves a readable `gantry report` bundle; `why --json` validates against its published schema.
+
+### Phase 2 — Remote contract & template (~1,200 LOC + YAML/shell)
+**Entry:** Phase 1b quality gates green.
+`contrib/argo/gantry-verify-workflowtemplate.yml` (genericized rust-verify: `args-json` param, ref-fetch clone of `refs/gantry/*`, optional sccache, faithful-argv default with opt-in labeled gates, versioned `verdict.json` output incl. failure taxonomy via `--message-format json`), `contrib/gantry-exec.sh` shell reference executor, output-param log recovery, deadline config, Ctrl-C cancel, refs GC sweep, `doctor --e2e`/`--drill`, image capability labels + parity preflight, contract-version handshake.
 **Acceptance:** template applied on iad-ci; end-to-end run against a real repo; killing the client mid-run cancels the workflow; podGC'd fast run still prints full log from output param; an OOM-fixture suite classifies as InfraFailure and falls back (never "tests failed"); clippy findings appear as `[gantry] gate:` lines without failing a plain `cargo test`; stale refs reach zero at steady state; `doctor --drill` proves the full degrade chain end-to-end; compile-error and test-failure fixtures produce distinct verdict classes agents can branch on; a toolchain-mismatched image is refused with a loud local fallback (warn-only when unlabeled).
 
-### Phase 3 — Onboarding, packaging & migration
+### Phase 3 — Onboarding, packaging & migration (mostly packaging/docs; ~600 LOC)
+**Entry:** Phase 2 quality gates green, template live on the reference cluster.
 musl static build; CI via Argo (`gantry-ci` WorkflowTemplate → tagged release, following the forge-ci/needle-ci pattern); `install.sh` + `gantry uninstall`; **SSH-first onboarding as the flagship quickstart** — `gantry init --ssh user@host` performs the whole setup automatically (verify target, write preset config, finish with `doctor --e2e`) and the README leads with it, documenting Argo as the advanced backend; agent-first `--json` diagnostics (`why`/`explain`/`status`) ship here so both humans and fleet agents can self-serve when something degrades; `docs/notes/threat-model.md` published with the README rewrite and the no-phone-home integration test lands in CI; README rewritten for external users, leading with Tier-0 (works with zero config) → SSH (10 minutes) → Argo (advanced).
 **Migration:** replace `~/.local/bin/cargo` + `cargo-remote` on ex44 and lab with gantry shims; config reproduces current behavior (argo backend → `rust-verify` initially); NEEDLE fleet inherits via PATH with zero changes; keep bash scripts as `.bak` for one week; watch `runs.jsonl` across a fleet cycle.
-**Acceptance:** one week of NEEDLE production traffic with no silently-skipped runs (audit runs.jsonl vs worker transcripts) and no branch pushes originating from gantry.
+**Acceptance:** one week of NEEDLE production traffic with no silently-skipped runs (audit runs.jsonl vs worker transcripts) and no branch pushes originating from gantry; curl-pipe install on a fresh box reaches a passing `quickcheck` with zero config; `gantry init --ssh` against a clean host ends with `doctor --e2e` green; the no-phone-home test is green in CI.
 
 ### Phase 4 — Fleet features (v1.x)
+**Entry:** Phase 3 migration acceptance met (fleet is on gantry).
 JoinTable dedup, ledger intelligence (opt-in memoization, supersede-on-new-commit, flake flagging), `gantry run`, `gantry status`, crates.io publish (name pending — open question Q-1). Native `ssh` backend dropped from this phase — superseded by the Phase 3 SSH-first preset; revisit only if the preset proves limiting.
-**Acceptance:** two concurrent identical `cargo test` invocations produce one workflow, both callers get the verdict.
+**Acceptance:** two concurrent identical `cargo test` invocations produce one workflow, both callers get the verdict; a memoized re-run returns the cached verdict in <1s with the `[gantry] cached` line and `--fresh` forces execution; superseding cancels an unattached older run with a `superseded` terminal record; a verdict flip at identical tree is flagged `flaky-suspect`.
 
 ### Phase 5 — Stretch
 Multi-tool profiles (`pytest`, `go test`) behind the same config schema; nextest interception + `--partition` sharding across pods; backend REST mode for Argo (drop kubectl dependency).
