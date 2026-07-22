@@ -11,8 +11,9 @@
 // `invocation_name` lives here because argv[0] is the dispatch key main.rs
 // matches on ('cargo' vs 'gantry' vs unknown). Real-binary resolution and the
 // passthrough exec join it here across the bf-614q chain: `shim_dir` is the
-// first piece (the self-recursion-guard basis), with resolve_real_binary
-// (bf-614q), the re-exec guard (bf-1m69), and passthrough (bf-28dv) to follow.
+// first piece (the self-recursion-guard basis), and resolve_real_binary
+// (bf-614q) composes it with the PATH lookup; the re-exec guard (bf-1m69) and
+// passthrough (bf-28dv) follow.
 
 /// The sentinel dispatch key returned when argv[0] is absent or basename-less.
 ///
@@ -74,12 +75,8 @@ pub fn invocation_name(argv: &[String]) -> String {
 /// as a human-readable `Err` rather than a panic or `unwrap`. On success the
 /// parent directory is returned — a directory path, never the binary file.
 //
-// Held private by design (the bead scope says "private helper"): only the
-// in-module resolve_real_binary (bf-614q) is meant to call it, and that
-// consumer lands in the next child of the chain — so shim_dir has no caller at
-// this commit. `#[allow(dead_code)]` keeps `-D warnings` green for the
-// incremental build; remove it once bf-614q gives the helper a caller.
-#[allow(dead_code)]
+// Held private by design (the bead scope says "private helper"): only
+// resolve_real_binary is meant to call it.
 fn shim_dir() -> Result<std::path::PathBuf, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("gantry cannot locate its own binary: {e}"))?;
@@ -131,12 +128,7 @@ compile_error!("gantry targets Unix and Windows; define a PATH separator for thi
 /// `dir`, so it survives untouched.
 //
 // Held private by design (a resolve_real_binary-internal helper, like
-// shim_dir): only the in-module resolve_real_binary (bf-614q) is meant to call
-// it, and that consumer lands in the next child of the chain — so
-// strip_dir_from_path has no caller at this commit. `#[allow(dead_code)]`
-// keeps `-D warnings` green for the incremental build; remove it once bf-614q
-// gives the helper a caller.
-#[allow(dead_code)]
+// shim_dir): only resolve_real_binary is meant to call it.
 fn strip_dir_from_path(path_var: &str, dir: &std::path::Path) -> String {
     // `split` on a single separator yields one substring per PATH entry, with
     // empty entries (leading/double/trailing separators) preserved as "" —
@@ -173,12 +165,8 @@ fn strip_dir_from_path(path_var: &str, dir: &std::path::Path) -> String {
 /// walk continues, because one bad PATH slot must not abort the whole lookup.
 //
 // Held private by design (a resolve_real_binary-internal helper, like
-// shim_dir and strip_dir_from_path): only the in-module resolve_real_binary
-// (bf-614q) is meant to call it, and that consumer lands in the next child of
-// the chain — so find_in_path has no caller at this commit.
-// `#[allow(dead_code)]` keeps `-D warnings` green for the incremental build;
-// remove it once bf-614q gives the helper a caller.
-#[allow(dead_code)]
+// shim_dir and strip_dir_from_path): only resolve_real_binary is meant to
+// call it.
 fn find_in_path(name: &str, path: &str) -> Result<std::path::PathBuf, String> {
     for entry in path.split(PATH_SEP) {
         let candidate = std::path::Path::new(entry).join(name);
@@ -231,6 +219,51 @@ fn is_executable(candidate: &std::path::Path, _md: &std::fs::Metadata) -> bool {
         candidate.extension().and_then(|e| e.to_str()),
         Some("exe") | Some("bat") | Some("cmd") | Some("com")
     )
+}
+
+/// Resolve the real `cargo` binary the shim should hand off to (plan §1
+/// "Real-binary resolution", Components §1 "Shim & dispatcher").
+///
+/// Composes the three private helpers into the top-level resolution path the
+/// dispatcher consults before any pipeline stage runs:
+///
+/// 1. **Override short-circuit** — when
+///    [`crate::config::Config::real_binary`] is `Some`, return that path
+///    verbatim with *no* PATH search. The explicit override is trusted as-is
+///    (it need not exist on disk; exec-check is a later stage's concern), so a
+///    pinned toolchain is honored without touching the environment.
+/// 2. **PATH lookup** — otherwise, derive gantry's own binary dir ([`shim_dir`]),
+///    strip it from `PATH` ([`strip_dir_from_path`]) so the walk cannot
+///    re-resolve `cargo` to the gantry shim itself (the self-recursion guard,
+///    enforced here at the resolution layer), then walk the survivors
+///    left-to-right for `cargo` ([`find_in_path`]).
+///
+/// Never silently falls through to the gantry binary or to `None`: a missing
+/// `cargo` on the stripped PATH propagates [`find_in_path`]'s `Err` verbatim, so
+/// a broken install surfaces as a diagnostic instead of an infinite re-exec.
+/// Never panics — every fallible step maps to a human-readable `Err`. Spawns no
+/// process and consults no other gantry pipeline module (gate/refs/backend/
+/// local/runlog): this is decision-only resolution.
+///
+/// This is the integration seam the bf-614q chain lands. [`shim_dir`],
+/// [`strip_dir_from_path`], and [`find_in_path`] each shipped standalone in
+/// earlier children; `resolve_real_binary` is their first and only caller, which
+/// is why their provisional `#[allow(dead_code)]` attributes retired at this
+/// commit.
+pub fn resolve_real_binary(cfg: &crate::config::Config) -> Result<std::path::PathBuf, String> {
+    // 1. Explicit override: trust it verbatim and skip the PATH search entirely.
+    if let Some(path) = &cfg.real_binary {
+        return Ok(path.clone());
+    }
+
+    // 2. Exclude gantry's own binary dir so the lookup cannot re-resolve
+    //    `cargo` to the gantry shim (self-recursion guard), then walk the
+    //    surviving PATH entries left-to-right for `cargo`.
+    let shim = shim_dir()?;
+    let path_var = std::env::var("PATH")
+        .map_err(|e| format!("gantry cannot read the PATH environment variable: {e}"))?;
+    let stripped = strip_dir_from_path(&path_var, &shim);
+    find_in_path("cargo", &stripped)
 }
 
 #[cfg(test)]
