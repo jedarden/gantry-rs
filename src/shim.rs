@@ -699,4 +699,31 @@ mod tests {
             "error must name the binary so the diagnostic stays actionable: {err}",
         );
     }
+
+    #[test]
+    fn resolve_real_binary_finds_real_cargo_on_inherited_path() {
+        // The happy path (plan §1 "Real-binary resolution"): with no override
+        // (real_binary == None) and the inherited real PATH, the resolver walks
+        // the shim-stripped PATH and returns the genuine cargo. ENV_LOCK is held
+        // for the read even though PATH is not mutated here, so no sibling
+        // PATH-mutating test (the override short-circuit or the self-recursion-
+        // guard case) can be mid-mutation when this test samples the inherited
+        // PATH — without the lock, a concurrent `with_path` could momentarily
+        // blank PATH and make this resolution spuriously fail.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cfg = Config::hardcoded(); // real_binary == None → the PATH-lookup branch
+        let resolved = resolve_real_binary(&cfg)
+            .expect("the inherited PATH must resolve to a real cargo under cargo test");
+        let name = resolved
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("the resolved cargo path carries a file_name");
+        let expected = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+        assert_eq!(
+            name, expected,
+            "resolved binary basename must be the cargo executable for the platform",
+        );
+    }
 }
