@@ -269,6 +269,8 @@ pub fn resolve_real_binary(cfg: &crate::config::Config) -> Result<std::path::Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use std::sync::Mutex;
 
     #[test]
     fn strips_directory_to_basename() {
@@ -599,5 +601,81 @@ mod tests {
             real.path(),
         ]);
         assert_eq!(find_in_path("cargo", &path), Ok(cargo));
+    }
+
+    // --- resolve_real_binary: PATH-mutating integration tests ----------------
+    //
+    // resolve_real_binary reads the process-global PATH, and cargo runs unit
+    // tests across parallel threads that all share that one environment. The
+    // harness below serializes every PATH mutation behind ENV_LOCK and restores
+    // the original value on drop (Drop runs even if the closure panics, while
+    // the lock is still held), so the override short-circuit test can run
+    // against a controlled empty PATH without leaking that mutation to a
+    // sibling test.
+
+    /// Serializes every test that mutates the process-global PATH.
+    ///
+    /// Tests run in parallel threads sharing one environment; holding this lock
+    /// for the whole `with_path` body guarantees only one test touches PATH at a
+    /// time, and the restore-on-drop completes before the next waiter acquires
+    /// it. Recovered from poison on acquire so a panicking prior test does not
+    /// wedge the rest of the suite.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores PATH to its saved value on drop.
+    ///
+    /// `None` means PATH was unset before the test ran, so drop `remove_var`s
+    /// it rather than reinstating an empty string — the original absent state is
+    /// what must survive. Drop runs even on panic (the whole point: a failing
+    /// assertion must not leak a mutated PATH into a sibling test).
+    struct RestorePath(Option<std::ffi::OsString>);
+
+    impl Drop for RestorePath {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(saved) => std::env::set_var("PATH", saved),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// Run `f` with PATH temporarily set to `new_path`, restoring it after.
+    ///
+    /// Acquires `ENV_LOCK` for the duration (poison-recovered by unwrapping the
+    /// `PoisonError` via `into_inner`, so a panicking prior test does not wedge
+    /// the suite), snapshots the original PATH (present-or-absent), installs
+    /// `new_path`, runs `f`, and restores the snapshot when `RestorePath` drops
+    /// — including on panic, the load-bearing guarantee: a test that
+    /// asserts-then-panics still hands back a clean environment. The lock is
+    /// released only after the restore (declared first, dropped last), so the
+    /// mutation is never visible to a concurrently-running waiter.
+    fn with_path<R>(new_path: &str, f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = RestorePath(std::env::var_os("PATH"));
+        std::env::set_var("PATH", new_path);
+        f()
+        // `_restore` drops here, then `_guard`: PATH is reinstated while the
+        // lock is still held, including when `f` panicked. The leading
+        // underscore silences the "unused binding" lint — the value is never
+        // read, only its Drop — while still living to end-of-scope (unlike a
+        // bare `_`, which would drop it immediately and defeat the guard).
+    }
+
+    #[test]
+    fn resolve_real_binary_returns_override_verbatim_with_empty_path() {
+        // The override short-circuit (plan §1): an explicit real_binary is
+        // trusted as-is and returned verbatim, with no PATH search at all. Run
+        // under an empty PATH to prove the override wins independent of the
+        // environment — a pinned toolchain is honored without consulting PATH.
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary = Some(std::path::PathBuf::from("/usr/bin/cargo"));
+        let resolved = with_path("", || resolve_real_binary(&cfg));
+        assert_eq!(
+            resolved,
+            Ok(std::path::PathBuf::from("/usr/bin/cargo")),
+            "explicit override must win verbatim even with an empty PATH",
+        );
     }
 }
