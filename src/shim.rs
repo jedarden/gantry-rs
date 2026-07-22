@@ -150,6 +150,89 @@ fn strip_dir_from_path(path_var: &str, dir: &std::path::Path) -> String {
         .join(PATH_SEP)
 }
 
+/// Find an executable named `name` by walking `path` left to right.
+///
+/// Splits `path` on the OS PATH separator ([`PATH_SEP`]) and, for each entry in
+/// order, checks whether `<entry>/<name>` is an existing executable regular
+/// file. Returns [`Ok`] with the first matching path — PATH order respected —
+/// or [`Err`] naming `name` if no entry matches. A pure lookup over a
+/// caller-supplied PATH string: no environment read of its own and no
+/// `current_exe`. The caller is responsible for stripping gantry's own shim dir
+/// ([`shim_dir`] via [`strip_dir_from_path`]) first, so the lookup cannot
+/// re-resolve `cargo` to the gantry shim itself (plan §1 "Real-binary
+/// resolution").
+///
+/// Non-existent entries, directories, and non-executable or non-regular files
+/// are skipped silently: a stale or misconfigured PATH slot is a skip, not a
+/// failure. Only the total absence of a match is an error, and the message
+/// always names `name` so a missing-real-cargo diagnostic is actionable — this
+/// helper never silently falls back to a default binary.
+///
+/// Never panics. A filesystem error on a given candidate (the directory gone,
+/// a permission-denied stat) surfaces as "not a match" for that entry and the
+/// walk continues, because one bad PATH slot must not abort the whole lookup.
+//
+// Held private by design (a resolve_real_binary-internal helper, like
+// shim_dir and strip_dir_from_path): only the in-module resolve_real_binary
+// (bf-614q) is meant to call it, and that consumer lands in the next child of
+// the chain — so find_in_path has no caller at this commit.
+// `#[allow(dead_code)]` keeps `-D warnings` green for the incremental build;
+// remove it once bf-614q gives the helper a caller.
+#[allow(dead_code)]
+fn find_in_path(name: &str, path: &str) -> Result<std::path::PathBuf, String> {
+    for entry in path.split(PATH_SEP) {
+        let candidate = std::path::Path::new(entry).join(name);
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "gantry could not find `{name}` on PATH; install the real binary or set `real_binary` in config"
+    ))
+}
+
+/// Whether `candidate` is an existing executable regular file.
+///
+/// `std::fs::metadata` (not `symlink_metadata`) follows a symlink to its
+/// target, so a PATH entry pointing at a symlinked binary resolves correctly;
+/// a broken symlink, a missing file, a directory, or any non-regular entry is a
+/// non-match rather than an error — a stat failure is a skip for [`find_in_path`].
+/// The platform-specific notion of "executable" is delegated to
+/// [`is_executable`].
+fn is_executable_file(candidate: &std::path::Path) -> bool {
+    let Ok(md) = std::fs::metadata(candidate) else {
+        return false;
+    };
+    md.is_file() && is_executable(candidate, &md)
+}
+
+/// Whether a regular file is executable.
+///
+/// Platform-specific because the notion differs: Unix consults the mode bits
+/// carried in [`std::fs::Metadata`]; Windows carries no execute bit and infers
+/// runnability from the file extension. Reads no environment (no `PATHEXT`) —
+/// the conventional executable extensions are fixed here so this helper honors
+/// the "no env reads of its own" contract shared with [`find_in_path`].
+#[cfg(unix)]
+fn is_executable(_candidate: &std::path::Path, md: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    // Any execute bit (user/group/other) qualifies — matching shell PATH
+    // lookup, which treats a file runnable by anyone as found.
+    md.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn is_executable(candidate: &std::path::Path, _md: &std::fs::Metadata) -> bool {
+    // No execute bit exists on Windows; runnability is conventionally a
+    // property of the extension. A PATHEXT env read would violate the helper's
+    // "no env reads of its own" contract, so the common executable extensions
+    // are matched directly.
+    matches!(
+        candidate.extension().and_then(|e| e.to_str()),
+        Some("exe") | Some("bat") | Some("cmd") | Some("com")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +435,136 @@ mod tests {
         // never silently drops the user's intended CWD either.
         let path = ["/a", "", "/c"].join(PATH_SEP);
         assert_eq!(strip_dir_from_path(&path, std::path::Path::new("/b")), path,);
+    }
+
+    // --- find_in_path fixtures ----------------------------------------------
+    //
+    // The executable-bit semantics under test are Unix-specific, so these
+    // fixtures and the find_in_path tests are `#[cfg(unix)]`. shim.rs stays
+    // std-only (no `tempfile` dev-dependency): TempDir is a minimal stand-in,
+    // a uniquely-named subdir of std::env::temp_dir() removed wholesale on drop.
+    // The dir name mixes the test-binary PID with a per-test suffix so parallel
+    // tests in one process never collide.
+
+    /// A throwaway directory under the system temp, removed on drop.
+    #[cfg(unix)]
+    struct TempDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl TempDir {
+        fn new(suffix: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "gantry-find_in_path-{}-{suffix}",
+                std::process::id(),
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // Best-effort: a failed cleanup (the dir already gone) must not
+            // fail the test or panic on drop.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Write `<dir>/<name>` as a regular file with the executable bit set.
+    #[cfg(unix)]
+    fn touch_executable(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fixture");
+        path
+    }
+
+    /// Write `<dir>/<name>` as a regular file with no executable bit.
+    #[cfg(unix)]
+    fn touch_plain(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, b"not executable\n").expect("write fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod fixture");
+        path
+    }
+
+    #[cfg(unix)]
+    fn path_string(dirs: &[&std::path::Path]) -> String {
+        dirs.iter()
+            .map(|d| d.to_str().expect("temp path is utf-8"))
+            .collect::<Vec<_>>()
+            .join(PATH_SEP)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_returns_the_executable_in_a_dir() {
+        // The load-bearing case: the stripped PATH points at the dir holding
+        // the real cargo, and that file is an executable — the lookup returns
+        // exactly that path.
+        let dir = TempDir::new("found");
+        let cargo = touch_executable(dir.path(), "cargo");
+        let path = path_string(&[dir.path()]);
+        assert_eq!(find_in_path("cargo", &path), Ok(cargo));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_errs_naming_the_binary_when_absent() {
+        // A PATH with no matching entry must Err — and the message must name
+        // the binary so a missing-real-cargo diagnostic stays actionable.
+        let dir = TempDir::new("absent");
+        let path = path_string(&[dir.path()]);
+        let err = find_in_path("cargo", &path).expect_err("no cargo in dir");
+        assert!(err.contains("cargo"), "error must name the binary: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_respects_path_order() {
+        // The first matching entry wins: two dirs each hold an executable
+        // cargo, and the leftmost (earlier in PATH) is returned.
+        let dir_a = TempDir::new("order-a");
+        let dir_b = TempDir::new("order-b");
+        let cargo_a = touch_executable(dir_a.path(), "cargo");
+        let _cargo_b = touch_executable(dir_b.path(), "cargo");
+        let path = path_string(&[dir_a.path(), dir_b.path()]);
+        assert_eq!(find_in_path("cargo", &path), Ok(cargo_a));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_skips_stale_nonexecutable_and_directory_entries() {
+        // A stale (now-missing) dir, a non-executable file, and a directory
+        // named like the binary are all skipped without erroring; the real
+        // executable in a later dir is what the lookup lands on.
+        let stale = TempDir::new("stale");
+        let plain = TempDir::new("plain");
+        let _ = touch_plain(plain.path(), "cargo"); // non-executable → skipped
+        let dir_named_cargo = TempDir::new("dircargo");
+        std::fs::create_dir(dir_named_cargo.path().join("cargo")).expect("mkdir fixture");
+        let real = TempDir::new("real");
+        let cargo = touch_executable(real.path(), "cargo");
+
+        // Remove `stale` so its PATH entry resolves to nothing on disk — a
+        // skip, not a failure. The stored path string is still valid afterwards.
+        std::fs::remove_dir_all(stale.path()).expect("remove stale dir");
+
+        let path = path_string(&[
+            stale.path(),
+            plain.path(),
+            dir_named_cargo.path(),
+            real.path(),
+        ]);
+        assert_eq!(find_in_path("cargo", &path), Ok(cargo));
     }
 }
