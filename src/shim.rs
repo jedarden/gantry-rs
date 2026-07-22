@@ -1014,4 +1014,57 @@ mod tests {
             "a child that exits 0 must surface as ExitCode::SUCCESS",
         );
     }
+
+    #[test]
+    fn passthrough_degrades_loudly_without_spawning_when_the_override_is_the_gantry_binary() {
+        // The loud-degrade error path (plan §1 "never a fallback-to-self",
+        // INV-3 exit-code fidelity): when `resolve_real_binary` returns Err,
+        // passthrough must NOT spawn — it takes the early-return arm, prints a
+        // loud `[gantry]`-prefixed line to stderr, and yields a non-zero
+        // ExitCode, never re-exec'ing the resolved (self) path and never
+        // looping. The Err is driven the canonical way: a `real_binary`
+        // override pinned at the gantry binary's own `current_exe()`, which the
+        // self-recursion guard inside `resolve_real_binary` refuses — the same
+        // refusal the sibling
+        // `resolve_real_binary_rejects_override_pointing_at_the_gantry_binary`
+        // test covers at the resolver level; this test covers passthrough's
+        // response to it.
+        //
+        // Three properties are locked:
+        //
+        //  * non-zero — asserted directly: the return is `ExitCode::FAILURE`,
+        //    the code the error arm hands back.
+        //
+        //  * no spawn / no re-exec — the load-bearing assertion. argv is
+        //    `["cargo", "--list"]`, so `argv[1..]` is `["--list"]`. If a
+        //    regression ever dropped the guard, passthrough would spawn
+        //    `current_exe()` (this test binary) with `--list`, which makes
+        //    libtest enumerate its tests and exit 0 WITHOUT running any test
+        //    body — so `status_to_exit_code` would yield `SUCCESS`, and this
+        //    `FAILURE` assertion would fail, catching the regression. The
+        //    `--list` choice is deliberate safety: a bare `["cargo"]` (empty
+        //    `argv[1..]`) would make a broken guard re-run the ENTIRE suite —
+        //    including this very test — and recurse indefinitely (a fork-bomb
+        //    chain); `--list` keeps the would-be child harmless while still
+        //    being distinguishable from `FAILURE`.
+        //
+        //  * loud `[gantry]` message — the error arm unconditionally runs
+        //    `eprintln!("[gantry] {why}")`; `{why}` is the resolver's Err
+        //    string, whose "gantry" / "refus" content the sibling resolver test
+        //    already locks, so the line passthrough prints is exactly the
+        //    documented refusal, never silence (plan §1 "never silent").
+        //
+        // Cross-platform: the guard's canonicalization needs no symlink (it
+        // compares `current_exe()` to itself), so this mirrors the
+        // cross-platform sibling rather than the Unix-gated spawn happy path.
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary =
+            Some(std::env::current_exe().expect("current_exe resolves under cargo test"));
+        let argv = vec!["cargo".to_string(), "--list".to_string()];
+        assert_eq!(
+            passthrough(&cfg, &argv),
+            std::process::ExitCode::FAILURE,
+            "an override equal to the gantry binary must surface as FAILURE without spawning",
+        );
+    }
 }
