@@ -95,6 +95,61 @@ fn shim_dir() -> Result<std::path::PathBuf, String> {
     })
 }
 
+/// The character that separates entries in a PATH-style environment variable.
+///
+/// `:` on Unix-family targets, `;` on Windows. There is no stable `std`
+/// constant for the *PATH-list* separator — `std::path::MAIN_SEPARATOR` is the
+/// path-component separator (`/` or `\`), a different thing — so the platform
+/// split is made explicit here. Pure constant logic; no environment access.
+#[cfg(unix)]
+const PATH_SEP: &str = ":";
+#[cfg(windows)]
+const PATH_SEP: &str = ";";
+#[cfg(not(any(unix, windows)))]
+compile_error!("gantry targets Unix and Windows; define a PATH separator for this platform");
+
+/// Strip a target directory from a PATH-style string.
+///
+/// Splits `path_var` on the OS PATH separator ([`PATH_SEP`]) and drops every
+/// entry whose [`std::path::Path`] equals `dir`, preserving the order of the
+/// survivors, then re-joins them with [`PATH_SEP`]. Pure string/path logic —
+/// no environment reads, no filesystem canonicalization, no `current_exe`.
+/// `dir` is a parameter (rather than derived from the process) so this is
+/// independently unit-testable with crafted PATH literals.
+///
+/// This is the self-recursion guard's filter: the future resolve_real_binary
+/// (bf-614q) strips the shim dir ([`shim_dir`]) from PATH so the real-cargo
+/// lookup cannot re-resolve `cargo` to the gantry shim itself (plan §1
+/// "Real-binary resolution"). `dir` is compared as a [`std::path::Path`], so
+/// trailing-slash and `.`-component variants of the same directory match.
+///
+/// Separator hygiene: the filter only *removes* entries, so re-joining the
+/// survivors can never introduce a spurious empty (CWD) entry — no leading,
+/// double, or trailing separator appears that was not already implied by the
+/// input. Existing empty entries already present in `path_var` are preserved
+/// (the "dir absent → effectively unchanged" guarantee): an empty entry is not
+/// `dir`, so it survives untouched.
+//
+// Held private by design (a resolve_real_binary-internal helper, like
+// shim_dir): only the in-module resolve_real_binary (bf-614q) is meant to call
+// it, and that consumer lands in the next child of the chain — so
+// strip_dir_from_path has no caller at this commit. `#[allow(dead_code)]`
+// keeps `-D warnings` green for the incremental build; remove it once bf-614q
+// gives the helper a caller.
+#[allow(dead_code)]
+fn strip_dir_from_path(path_var: &str, dir: &std::path::Path) -> String {
+    // `split` on a single separator yields one substring per PATH entry, with
+    // empty entries (leading/double/trailing separators) preserved as "" —
+    // which re-join back to the original separator shape. Comparing each entry
+    // as a Path (rather than a raw string) makes `/b` match a `/b/` or
+    // `/x/./b`-style entry without canonicalizing anything on disk.
+    path_var
+        .split(PATH_SEP)
+        .filter(|entry| std::path::Path::new(*entry) != dir)
+        .collect::<Vec<&str>>()
+        .join(PATH_SEP)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +251,106 @@ mod tests {
             .file_name()
             .expect("shim_dir has a file_name under cargo test");
         assert!(!name.is_empty(), "shim_dir file_name must be non-empty");
+    }
+
+    #[test]
+    fn strip_removes_a_middle_entry_preserving_order() {
+        // The load-bearing case: the shim dir sits among real toolchain dirs,
+        // and the survivors keep their relative order so resolve_real_binary
+        // searches them in the user's intended sequence.
+        let path = ["/a", "/b", "/c"].join(PATH_SEP);
+        assert_eq!(
+            strip_dir_from_path(&path, std::path::Path::new("/b")),
+            ["/a", "/c"].join(PATH_SEP),
+        );
+    }
+
+    #[test]
+    fn strip_absent_dir_returns_path_unchanged() {
+        // A dir not on PATH must round-trip exactly — no reordering, no
+        // canonicalization, no separator rewrites.
+        let path = ["/a", "/b", "/c"].join(PATH_SEP);
+        assert_eq!(strip_dir_from_path(&path, std::path::Path::new("/x")), path,);
+    }
+
+    #[test]
+    fn strip_removes_every_occurrence_of_a_duplicated_dir() {
+        // A misconfigured PATH may list the shim dir twice; both copies must
+        // go, not just the first.
+        let path = ["/a", "/b", "/b", "/c"].join(PATH_SEP);
+        assert_eq!(
+            strip_dir_from_path(&path, std::path::Path::new("/b")),
+            ["/a", "/c"].join(PATH_SEP),
+        );
+    }
+
+    #[test]
+    fn strip_leading_dir_introduces_no_leading_separator() {
+        // Stripping the first entry must not leave a stray leading separator,
+        // which a downstream lookup would read as a leading CWD entry.
+        let path = ["/b", "/a", "/c"].join(PATH_SEP);
+        assert_eq!(
+            strip_dir_from_path(&path, std::path::Path::new("/b")),
+            ["/a", "/c"].join(PATH_SEP),
+        );
+    }
+
+    #[test]
+    fn strip_trailing_dir_introduces_no_trailing_separator() {
+        // Stripping the last entry must not leave a stray trailing separator.
+        let path = ["/a", "/c", "/b"].join(PATH_SEP);
+        assert_eq!(
+            strip_dir_from_path(&path, std::path::Path::new("/b")),
+            ["/a", "/c"].join(PATH_SEP),
+        );
+    }
+
+    #[test]
+    fn strip_sole_matching_entry_yields_empty_not_a_separator() {
+        // Removing the only entry must yield an empty string, never a lone
+        // separator (which would decode to a single CWD entry).
+        let path = String::from("/b");
+        assert_eq!(
+            strip_dir_from_path(&path, std::path::Path::new("/b")),
+            String::new(),
+        );
+    }
+
+    #[test]
+    fn strip_sole_nonmatching_entry_survives() {
+        let path = String::from("/a");
+        assert_eq!(
+            strip_dir_from_path(&path, std::path::Path::new("/b")),
+            String::from("/a"),
+        );
+    }
+
+    #[test]
+    fn strip_empty_path_round_trips_to_empty() {
+        // No entries to filter — and no spurious entry manufactured either.
+        assert_eq!(
+            strip_dir_from_path("", std::path::Path::new("/b")),
+            String::new(),
+        );
+    }
+
+    #[test]
+    fn strip_matches_a_trailing_slash_variant_of_the_dir() {
+        // Path equality (not string equality) drives the match: `/b/` is the
+        // same directory as `/b`, so a slash-padded PATH entry is stripped too.
+        let path = ["/a", "/b/", "/c"].join(PATH_SEP);
+        assert_eq!(
+            strip_dir_from_path(&path, std::path::Path::new("/b")),
+            ["/a", "/c"].join(PATH_SEP),
+        );
+    }
+
+    #[test]
+    fn strip_preserves_an_unrelated_empty_cwd_entry() {
+        // An existing empty entry (a `::` CWD slot the user set) is not `dir`,
+        // so it is preserved verbatim — the filter never *introduces* one, and
+        // never silently drops the user's intended CWD either.
+        let path = ["/a", "", "/c"].join(PATH_SEP);
+        assert_eq!(strip_dir_from_path(&path, std::path::Path::new("/b")), path,);
     }
 }
