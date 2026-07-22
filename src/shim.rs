@@ -675,15 +675,28 @@ mod tests {
     // platform); the override-verbatim and missing-target tests stay
     // cross-platform because canonicalization is.
 
-    /// Write `<dir>/<name>` as a regular file with the executable bit set.
+    /// Write `<dir>/<name>` as an executable regular file with the given `body`.
+    ///
+    /// `touch_executable`'s custom-body sibling: the exit-code-fidelity tests
+    /// (bf-67ki) spawn fixtures that exit non-zero or die from a signal, so the
+    /// body can no longer be a hardcoded `exit 0`. Writes the file then sets the
+    /// exec bit; `body` is a `&[u8]` so a non-UTF-8 or NUL-laden payload is also
+    /// expressible, though every fixture here is an `#!/bin/sh` script.
+    /// Unix-gated like `touch_executable` (the exec-bit semantics are Unix-only).
     #[cfg(unix)]
-    fn touch_executable(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    fn touch_executable_body(dir: &std::path::Path, name: &str, body: &[u8]) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write fixture");
+        std::fs::write(&path, body).expect("write fixture");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fixture");
         path
+    }
+
+    /// Write `<dir>/<name>` as a regular file with the executable bit set.
+    #[cfg(unix)]
+    fn touch_executable(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        touch_executable_body(dir, name, b"#!/bin/sh\nexit 0\n")
     }
 
     /// Write `<dir>/<name>` as a regular file with no executable bit.
@@ -1012,6 +1025,77 @@ mod tests {
             passthrough(&cfg, &argv),
             std::process::ExitCode::SUCCESS,
             "a child that exits 0 must surface as ExitCode::SUCCESS",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passthrough_propagates_a_nonzero_exit_code_verbatim() {
+        // INV-3 exit-code fidelity (plan §1): the child's exit code must surface
+        // verbatim, not collapse to a generic non-zero. A fixture that exits 42
+        // must arrive as ExitCode::from(42) — the encoded low byte is exactly 42,
+        // so a caller that spawned the real cargo directly would see the same `$?`
+        // through this shim as from the unshimmed binary. ExitCode carries a
+        // single u8 and compares on that byte (std ExitCode: PartialEq), so
+        // asserting equality with ExitCode::from(42) is the faithful u8 check.
+        let dir = TempDir::new("passthrough-exit42");
+        let script = touch_executable_body(dir.path(), "cargo", b"#!/bin/sh\nexit 42\n");
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary = Some(script);
+        let argv = vec!["cargo".to_string()];
+        assert_eq!(
+            passthrough(&cfg, &argv),
+            std::process::ExitCode::from(42),
+            "a child that exits 42 must surface as ExitCode::from(42), not a generic non-zero",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passthrough_propagates_a_failure_exit_code_as_nonzero() {
+        // INV-3 (plan §1): the canonical failure code. A fixture exiting 1 must
+        // surface as non-zero — never SUCCESS — so a failing command is visible
+        // to scripts and agent fleets that branch on `$?`. Asserted as
+        // not-SUCCESS (rather than pinned to ExitCode::from(1)) to match the
+        // "non-zero" contract: the load-bearing property is that the shim never
+        // masks a failure as success, whatever the platform's failure encoding.
+        let dir = TempDir::new("passthrough-exit1");
+        let script = touch_executable_body(dir.path(), "cargo", b"#!/bin/sh\nexit 1\n");
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary = Some(script);
+        let argv = vec!["cargo".to_string()];
+        assert_ne!(
+            passthrough(&cfg, &argv),
+            std::process::ExitCode::SUCCESS,
+            "a child that exits 1 must surface as non-zero, never SUCCESS",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passthrough_propagates_signal_death_as_128_plus_signal() {
+        // INV-3 signal-death fidelity (plan §1): a child killed by a signal must
+        // surface as 128 + signo (the shell's `$?` convention), never SUCCESS. The
+        // fixture sends itself SIGTERM (`kill -TERM $$`); SIGTERM is 15, so the
+        // faithful code is 143 — exactly what a direct `cargo` killed the same way
+        // would yield. status_to_exit_code folds signal() into 128 + signo, and
+        // 143 != 0, so the run is never reported as success even though the child
+        // produced no exit code of its own (code() is None when a signal struck).
+        //
+        // The `kill -TERM $$` form produces genuine signal death here (verified:
+        // ExitStatus::signal() == Some(15), code() == None), not a shell that
+        // catches SIGTERM and exit(143)s cleanly — so the test exercises the
+        // signal() arm of status_to_exit_code rather than its code() fallback,
+        // the arm that a plain `assert exit_code == 143` could not distinguish.
+        let dir = TempDir::new("passthrough-sigterm");
+        let script = touch_executable_body(dir.path(), "cargo", b"#!/bin/sh\nkill -TERM $$\n");
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary = Some(script);
+        let argv = vec!["cargo".to_string()];
+        assert_eq!(
+            passthrough(&cfg, &argv),
+            std::process::ExitCode::from(143),
+            "a child killed by SIGTERM (15) must surface as 128+15 = 143, never SUCCESS",
         );
     }
 
