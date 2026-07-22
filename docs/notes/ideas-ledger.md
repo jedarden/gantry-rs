@@ -2,6 +2,46 @@
 
 Every ideation run against `docs/plan/plan.md` records ALL considered ideas here — winners and losers alike — so future runs dedupe against history and dead ideas stay dead unless their kill objection stops holding.
 
+## Run 2026-07-22 — pool 104, kept 10 (inline single-context, run 2)
+
+Anchored to the post-adoption plan (finalists 1–9 of run 1 integrated; Q-2/Q-3/Q-7 resolved). PRIOR = the entire run-1 section below; nothing from it re-proposed except two explicit resurrections whose loss reasons no longer hold (noted inline). Prior benched items B1–B5 re-entered the ranking as vetted contenders.
+
+Stats: 104 generated (8 lenses × 13) → ~100 canonical after merges → 30 triage survivors + 3 hybrids → 15 advancers (pairwise, max 2/cluster) → 1 killed → gap check (new-capability territory left benched, accepted) → **10 finalists**.
+
+### Finalists
+
+1. **Tier-0: zero-config cap-only mode** (hybrid: zero-config default + `gantry quickcheck`) — with no backend configured, gantry is still a product: every cargo invocation gets the cgroup cap, `quickcheck` proves the install in 30s with no cluster, and one config line upgrades to remote later. Cluster: adoption/simplicity.
+2. **Ledger-intelligence engine** (hybrid: opt-in verdict memoization on tree-hash+args+toolchain+image keys / supersede-on-new-commit / flaky-flagging from verdict history) — one verdict-history module: skip re-testing identical trees (opt-in), auto-cancel superseded runs as an explicit verdict, flag tests whose pass/fail flips at same tree. Cluster: ledger intelligence.
+3. **Mirror-leak guard** — before pushing refs, detect when `ci_remote` would propagate `refs/gantry/*` to a public mirror (Forgejo push-mirrors sync refs); warn or refuse per config, recommend a dedicated ci remote. Cluster: security.
+4. **Parity manifest** (hybrid: toolchain-mismatch refusal + image-deps derivation + remote env capture) — preflight compares local rust-toolchain.toml/features/env-allowlist against builder-image capability labels; mismatch = loud local fallback, because a verdict from the wrong toolchain is a fake result. Cluster: correctness.
+5. **Boxwide gantry slice** — all gantry-spawned local runs live under one systemd user slice with a box-level sum cap, so 20 individually-capped runs can't add up past the machine. Complements the run-1 admission semaphore (count) with a resource ceiling (sum). Cluster: fleet protection.
+6. **Agent-priority convention** — `GANTRY_AGENT=1` (env convention, not TTY sniffing — tmux agents have TTYs) lets the fallback semaphore and submission queue order humans first, agents behind, printed as a triage tag. Cluster: fleet fairness.
+7. **Rich failure taxonomy** — remote runs use `--message-format json` to classify compile-error vs test-failure vs doctest vs harness-panic into verdict.json v2 + runs.jsonl, so agents branch on failure class without parsing logs. Cluster: agent ergonomics.
+8. **Drop the native Argo client from v1** — scope cut: argo becomes a shipped kubectl-based command-template preset (the bash pair already proves it); the serde/REST client moves to stretch. v1 = shim + gate + refpush + command backend + caps. Cluster: scope.
+9. **Flight-recorder crash bundles** — every InfraFailure snapshots a redacted diagnostic bundle (config snapshot, git state, raw backend response, last stderr) to the state dir; `gantry report <id>` prints it. Infra flakes stop being archaeology. Cluster: reliability.
+10. **Threat-model doc + testable no-phone-home pledge** — docs/notes/threat-model.md (what gantry can touch, ref-leak surface, untrusted repo config) plus an integration test asserting the binary opens no sockets except the configured backend. Cluster: trust/publishable quality.
+
+### Killed at the kill pass
+
+- **Speculative pre-push** (push gantry ref at commit time via installed git hook so tests start instantly) — KILL: mutates user repos with hooks, litters refs for commits never tested, enlarges the mirror-leak surface — for a 1–3s win.
+
+### Survived, not selected (bench)
+
+- Matrix runs (MSRV/beta/stable in parallel pods, aggregated verdict table) — capability cluster's best; narrowly out.
+- Cross-target/miri offload (run what can't run locally: qemu targets, miri) — expands the value prop; niche v1 audience.
+- Read-back push verification (ls-remote confirm after push; merged 2 gens) — S-sized; fold into RefPusher acceptance anyway.
+- Deadline-from-history (activeDeadline = 3× p99 per repo) — S; data-driven timeouts.
+- `gantry bisect` (remote-run oracle, parallel pods) — L; killer occasional feature, wrong complexity for now.
+- Prior bench carried: B1 full-log artifact (Q-6), B2 orphan adoption, B3 passthrough bench gate, B5 SHA attestation (B2/B5 competed this run, lost slots to flight recorder / mirror guard — adjacent territory, lower breadth).
+
+### Lost the pairwise ranking
+
+Custom gate packs; kubeconfig-expiry precheck (S, solid — fold into doctor backlog); argv round-trip fuzzing (fold into Phase-1 test plan); cap-escape audit (cgroup.procs sweep at exit); config `set` CLI; SLO stats command; flaky-aware delta reporting (new/fixed failures vs parent sha); blue-green template version pins; error-message style guide (RESURRECTED from run 1 — its loss was a cluster-cap collision with `gantry why`, which is now adopted, not a competitor — then lost again on breadth); Actions second preset (RESURRECTED — flagship contest is over, SSH won; still lost to broader adoption plays); compose trial lab (flagged: adjacent in spirit to declined run-1 finalist 10); rerun --failed; run-compare forensics; per-repo quota shaping; repo cohorts; verdict webhooks; honest benchmarks page; comparison page; distribution matrix (binstall + flake); saved-CPU success line; VS Code recipes; roadmap/RFC process; remote-verified badge; defensive crates.io alias; ephemeral debug shell in pod; stacked-series batch; session-affinity warm target PVC; ledger rotation preserving intents; SIGTERM grace → CANCELLED intents; upgrade version stamps; API-response validation into crash bundle; ref collision suffix; clock-skew tolerant leases; zombie-workflow reaper; disk-full resilience spec; stream auto-resume; self-triage auto `--e2e`; load-historian textfile; remote-first benchmarking profile; heavy-subcommand profiles (clippy/doc); fleet provisioning `init --fleet`; demand-response routing; template quarantine; chain-of-custody `verify <run-id>`; annotate run records; moment-of-friction teaching; first-failure educational trailer; init dry-run+confirm; `gantry undo`; PATH fix snippets; asciinema CI docs; glossary/embedded contract docs (merged 2); bare-`gantry` narrative status; progressive config template; locale-stable child env; plain-words verdict naming (merged into style guide).
+
+### Cut at triage
+
+Nothing-flows-back doctrine test; never-parse-logs invariant test; porcelain stderr protocol (near-dup of adopted `--json` diagnostics); ODB-II diag blob (same); TCP slow-start ramp (shared-state family of run-1's killed circuit breaker); JSON-RPC serve daemon and watch mode (no-daemon philosophy); store-and-forward offline queue (parked runs = stale verdicts, violates result-immediacy); backend racing (2× cluster cost for latency); local pre-gate `cargo check` (adds latency to every remote run, duplicates remote work); SQLite query index (second source of truth); git-notes state (writes state into users' repo objects); single-state-file consolidation (design note, not feature); interim bash 2.0 (contradicts DD-6); 5-key config / why-v0 / 20-line contract / 3-state UX / publish-rust-verify-as-is (scope doctrines folded into finalist 8's spirit); dogfood CI (already implicit in Phase 3); system-git-always doctrine (already DD); client-side log tee + --grep (mostly planned RunLog); cross-machine git-bus state (clever, premature); image-deps derivation stands alone (folded into finalist 4).
+
 ## Run 2026-07-21 — pool 104, kept 10
 
 Stats: 104 generated (8 lenses × 13) → 68 canonical after duplicate-merge → 30 triage survivors + 2 hybrids → 15 advancers (pairwise ranking, max 2/cluster) → 1 killed → gap round resurrected 1 (verdict-security territory) → **10 finalists**. Generation ran as blind 8-lens fan-out; all narrowing done inline single-context.
