@@ -1099,6 +1099,103 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn passthrough_forwards_pathological_argv_byte_exact() {
+        // INV-5 argv round-trip (plan §1, EC-06, S-4): argv[1..] must reach the
+        // child byte-exact, with no shell interpolation anywhere. passthrough
+        // forwards argv through `Command::args` — an array, never a shell string —
+        // so a pathological argv (spaces, quotes, a newline, a ~100 KB arg) must
+        // round-trip unchanged. This test proves it by spawning a fixture that
+        // records its received argv verbatim, then asserting each arg survived.
+        //
+        // The fixture records each arg NUL-terminated to a file. argv cannot hold
+        // a NUL byte (EC-06: "NULs are impossible in argv"), so NUL is an
+        // unambiguous field separator — every other byte (newline, quote, space,
+        // control char) is preserved by `"$@"` (quoted, so no word splitting) and
+        // emitted literally by `printf %s`. A "one arg per line" recorder would
+        // NOT work here: an arg containing a newline would split across lines and
+        // break the field count, which is exactly why the delimiter must be a byte
+        // argv can never contain.
+        let dir = TempDir::new("passthrough-argv");
+        let out = dir.path().join("recorded.out");
+        // The recorder path is baked into the fixture (separate from the args
+        // under test) and double-quoted so a space in the temp path cannot break
+        // it; it carries no `$`/backtick, so quoting is safe.
+        let body = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n    printf '%s\\0' \"$arg\"\ndone > \"{out}\"\nexit 0\n",
+            out = out.to_str().expect("temp recorder path is utf-8 under cargo test"),
+        );
+        let script = touch_executable_body(dir.path(), "cargo", body.as_bytes());
+        let mut cfg = Config::hardcoded();
+        cfg.real_binary = Some(script); // override → re-exec guard passes (script ≠ gantry binary)
+
+        // Pathological argv[1..] (EC-06): a plain baseline, an arg with spaces,
+        // the plan's exact Phase-1a acceptance literal `weird: [args]`, a battery
+        // of shell metacharacters/quotes, an arg with an embedded newline, and a
+        // ~100 KB argument. Any shell interpolation would alter the bytes of one
+        // or more of these; the recorder comparison below catches that.
+        let big = "x".repeat(100_000); // ~100 KB — EC-06 large arg
+        let metachars =
+            r#"d"q'sq`bt$dol;semi|pipe&col>gt<lt(par){br}[bk]\bsh#hash*star?q~t!bang wS"#;
+        let with_newline = "line one\nline two".to_string(); // EC-06 embedded newline
+        let args: Vec<String> = vec![
+            "build".to_string(),
+            "two words".to_string(),
+            "weird: [args]".to_string(),
+            metachars.to_string(),
+            with_newline,
+            big,
+        ];
+        let argv: Vec<String> = std::iter::once("cargo".to_string()) // argv[0], the invocation name — not forwarded
+            .chain(args.iter().cloned())
+            .collect();
+
+        let code = passthrough(&cfg, &argv);
+        assert_eq!(
+            code,
+            std::process::ExitCode::SUCCESS,
+            "the recorder fixture must run and exit 0",
+        );
+
+        let recorded = std::fs::read(&out).expect("read the recorder output file");
+        // The fixture emitted `arg\0` per arg, so splitting on NUL yields exactly
+        // one field per arg plus a single trailing empty field (after the final
+        // NUL). No arg can contain NUL, so the split is unambiguous.
+        let fields: Vec<&[u8]> = recorded.split(|&b| b == 0).collect();
+        assert_eq!(
+            fields.len(),
+            args.len() + 1,
+            "expected one NUL-delimited field per arg plus a trailing empty field; got {}",
+            fields.len(),
+        );
+
+        // Each pathological arg must round-trip byte-exact. The length check runs
+        // first so a truncated/expanded arg (e.g. the 100 KB one) is caught
+        // WITHOUT dumping its full content into the failure message; the content
+        // check then nails the byte-exact invariant per field.
+        for (i, (want, got)) in args.iter().zip(fields.iter()).enumerate() {
+            let want_bytes = want.as_bytes();
+            assert_eq!(
+                got.len(),
+                want_bytes.len(),
+                "arg {i} ({} bytes sent) did not round-trip at full length (received {} bytes) \
+                 — argv was altered in transit (S-4 shell interpolation suspected)",
+                want_bytes.len(),
+                got.len(),
+            );
+            assert_eq!(
+                *got, want_bytes,
+                "arg {i} content did not round-trip byte-exact (INV-5 / EC-06)",
+            );
+        }
+        // The single field after the final NUL is empty by construction.
+        assert!(
+            fields[args.len()].is_empty(),
+            "the trailing field after the final NUL must be empty",
+        );
+    }
+
     #[test]
     fn passthrough_degrades_loudly_without_spawning_when_the_override_is_the_gantry_binary() {
         // The loud-degrade error path (plan §1 "never a fallback-to-self",
