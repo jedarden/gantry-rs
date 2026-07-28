@@ -1,0 +1,8 @@
+[package]
+name = "integration-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "integration_fixture"
+path = "src/lib.rs"
