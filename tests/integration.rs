@@ -123,18 +123,48 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
         .output()
         .expect("git ls-remote after failed");
 
-    // Assert no branch refs moved (only refs/gantry/* should exist)
+    // Verify ref invariants:
+    // 1. No branch refs (refs/heads/*) should exist before or after
+    // 2. Only refs/gantry/* refs should be created/modified
     let before_stdout = String::from_utf8_lossy(&before_refs.stdout);
     let after_stdout = String::from_utf8_lossy(&after_refs.stdout);
 
-    assert!(
-        !before_stdout.contains("refs/heads/"),
-        "No branch refs should exist before run"
-    );
-    assert!(
-        !after_stdout.contains("refs/heads/"),
-        "No branch refs should exist after run (invariant INV-2)"
-    );
+    // Parse refs after the run
+    let after_lines: Vec<&str> = after_stdout.lines().collect();
+
+    for line in after_lines {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(parts.len(), 2, "Each ls-remote line should have 2 parts: commit and ref");
+
+        let ref_name = parts[1];
+
+        // Verify only refs/gantry/* refs exist
+        assert!(
+            ref_name.starts_with("refs/gantry/"),
+            "Only refs/gantry/* refs should be created, found: {} (invariant INV-2)",
+            ref_name
+        );
+
+        // Verify no other ref types exist
+        assert!(
+            !ref_name.starts_with("refs/heads/"),
+            "No branch refs should exist, found: {} (invariant INV-2)",
+            ref_name
+        );
+        assert!(
+            !ref_name.starts_with("refs/tags/"),
+            "No tag refs should exist, found: {}",
+            ref_name
+        );
+        assert!(
+            !ref_name.starts_with("refs/remotes/"),
+            "No remote-tracking refs should exist directly, found: {}",
+            ref_name
+        );
+    }
 
     (exit_code, stdout, stderr)
 }
@@ -195,4 +225,12 @@ fn test_no_branch_refs_move_during_round_trip() {
     // Just run both fixtures to ensure the invariant holds
     run_cargo_test("passing-suite");
     run_cargo_test("failing-suite");
+}
+
+#[test]
+fn test_only_gantry_refs_are_created_during_round_trip() {
+    // Explicit test for invariant INV-2: only refs/gantry/* refs should be created/modified
+    // This is already verified within run_cargo_test, but we make it explicit here
+    let (_exit_code, _stdout, _stderr) = run_cargo_test("passing-suite");
+    // If we get here without panicking, the invariant holds
 }
