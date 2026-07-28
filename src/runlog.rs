@@ -354,7 +354,7 @@ pub struct GateInputs {
 }
 
 /// Decision: where the run will execute.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
     /// Run on remote backend.
@@ -736,5 +736,62 @@ mod tests {
         let orphans = runlog.find_orphans().unwrap();
 
         assert_eq!(orphans.len(), 0);
+    }
+
+    #[test]
+    fn sigkill_mid_run_leaves_orphaned_intent() {
+        // Acceptance test for Phase 1a: SIGKILL mid-run leaves an orphaned intent
+        // that doctor reports (INV-1). This is the core write-ahead guarantee.
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_path = temp_dir.path().join("runs.jsonl");
+
+        // Create a RunLog instance
+        let runlog = RunLog {
+            log_path: log_path.clone(),
+        };
+
+        // Simulate a real run starting: write an intent record
+        let intent = IntentRecord::new(
+            "cargo".to_string(),
+            vec![
+                "test".to_string(),
+                "--".to_string(),
+                "--nocapture".to_string(),
+            ],
+            "https://github.com/example/repo".to_string(),
+            "abc123def".to_string(),
+            PathBuf::from("."),
+            GateInputs {
+                worktree: true,
+                head: true,
+                remote: true,
+                clean: true,
+            },
+            Decision::Remote,
+            "clean".to_string(),
+            "argo".to_string(),
+        );
+
+        let run_id = intent.run_id.clone();
+
+        // Write the intent (this happens BEFORE dispatch in write-ahead logging)
+        runlog.open_intent(&intent).unwrap();
+
+        // Simulate SIGKILL mid-run: process dies before verdict is written
+        // (In a real scenario, the process is killed and no verdict record is written)
+
+        // Later, doctor queries for orphans
+        let orphans = runlog.find_orphans().unwrap();
+
+        // Verify that the orphaned intent is detected
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].run_id, run_id);
+        assert_eq!(orphans[0].intent.tool, "cargo");
+        assert_eq!(orphans[0].intent.decision, Decision::Remote);
+
+        // The orphan should have all the original intent data for replay
+        assert_eq!(orphans[0].intent.args.len(), 3);
+        assert_eq!(orphans[0].intent.args[0], "test");
     }
 }

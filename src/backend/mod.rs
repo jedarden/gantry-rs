@@ -1,54 +1,84 @@
 // gantry — RemoteBackend trait and Verdict enum (plan §"Phase 0.5", Components §5).
 //
-// Phase 0.5 walking skeleton, stage 4 of 5 (bf-2vr): builds on stages 1-3 (shim/config
-// + GitGate + RefPusher) and implements the minimal RemoteBackend trait with a
-// command-template backend that runs a bash executor on the same box.
+// Phase 1a: Full verdict ladder + verdict.json parsing (bf-23i).
 //
 // This module defines:
-// - Verdict: the exit-code ladder for this phase (0 = Pass, nonzero = TestFailure)
+// - Verdict: the full verdict ladder (Pass/TestFailure/GateFailure/InfraFailure/Cancelled/Superseded)
+// - FailureClass: detailed failure classification from verdict.json
+// - VerdictJson: versioned verdict.json parsing structure
 // - BackendError: minimal error type for backend operations
 // - RunHandle: opaque handle returned by submit() and consumed by wait()
 // - RemoteBackend trait: submit / stream_logs / wait / describe / cancel
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Verdict: the terminal classification of a run (plan §"Data models", "Verdict semantics").
 ///
-/// Phase 0.5 implements only the minimal ladder:
-/// - exit 0 -> Pass
-/// - nonzero -> TestFailure
-///
-/// InfraFailure / gate_failure / cancelled / superseded classification arrives in
-/// Phase 1a/2. Panics are allowed on unexpected backend output in the skeleton.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Phase 1a implements the full verdict ladder:
+/// - Pass: tests passed (exit 0)
+/// - TestFailure: tests failed (exit non-zero, no local retry per INV-7)
+/// - GateFailure: quality gate failed while tests passed (exit non-zero, no local retry)
+/// - InfraFailure: no verdict produced (push/submit/schedule/stream/deadline) → local fallback
+/// - Cancelled: user Ctrl-C (exit 130)
+/// - Superseded: newer sha canceled this run (v1.x, exit 0)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// The remote ran the suite and it passed.
     Pass,
     /// The remote ran the suite and it failed (tests, compilation, etc.).
     TestFailure,
+    /// An enabled quality gate failed while tests passed (clippy, fmt, etc.).
+    GateFailure,
+    /// No verdict was produced - infra failure (push, submit, schedule, stream, deadline).
+    /// Triggers capped local fallback. Never retried locally as test failure (INV-7).
+    InfraFailure,
+    /// User canceled the run (Ctrl-C).
+    Cancelled,
+    /// A newer sha superseded this run (v1.x).
+    Superseded,
 }
 
 impl Verdict {
-    /// Convert an exit code to a Verdict using the minimal ladder.
+    /// Convert an exit code to a Verdict using the full ladder.
     ///
-    /// Phase 0.5: 0 -> Pass, nonzero -> TestFailure.
-    /// Phase 1a will expand this to include InfraFailure classification.
+    /// Phase 1a: command contract is 0 -> Pass, 1 -> TestFailure, ≥2 -> InfraFailure.
+    /// Argo backend reads verdict.json for authoritative classification.
     pub fn from_exit_code(code: i32) -> Self {
         match code {
             0 => Verdict::Pass,
-            _ => Verdict::TestFailure,
+            1 => Verdict::TestFailure,
+            _ => Verdict::InfraFailure,
         }
     }
 
     /// Convert the verdict to an exit code for the caller.
     ///
-    /// Phase 0.5: Pass -> 0, TestFailure -> 1.
-    /// Phase 1a will expand this to carry the actual test failure exit code.
+    /// Phase 1a: Pass/Superseded -> 0, TestFailure/GateFailure -> 1,
+    /// InfraFailure -> 2 (signal for local fallback), Cancelled -> 130 (SIGINT).
     pub fn to_exit_code(self) -> i32 {
         match self {
             Verdict::Pass => 0,
             Verdict::TestFailure => 1,
+            Verdict::GateFailure => 1,
+            Verdict::InfraFailure => 2,
+            Verdict::Cancelled => 130,
+            Verdict::Superseded => 0,
         }
+    }
+
+    /// Check if this verdict should trigger a local fallback (InfraFailure only).
+    pub fn is_infra_failure(&self) -> bool {
+        matches!(self, Verdict::InfraFailure)
+    }
+
+    /// Check if this verdict means the tests actually ran (Pass, TestFailure, GateFailure).
+    pub fn has_test_result(&self) -> bool {
+        matches!(
+            self,
+            Verdict::Pass | Verdict::TestFailure | Verdict::GateFailure
+        )
     }
 }
 
@@ -57,6 +87,10 @@ impl fmt::Display for Verdict {
         match self {
             Verdict::Pass => write!(f, "Pass"),
             Verdict::TestFailure => write!(f, "TestFailure"),
+            Verdict::GateFailure => write!(f, "GateFailure"),
+            Verdict::InfraFailure => write!(f, "InfraFailure"),
+            Verdict::Cancelled => write!(f, "Cancelled"),
+            Verdict::Superseded => write!(f, "Superseded"),
         }
     }
 }
@@ -168,6 +202,102 @@ pub trait RemoteBackend {
     }
 }
 
+/// FailureClass: detailed failure classification from verdict.json.
+///
+/// Derived from cargo's stable `--message-format json` stream in the remote
+/// executor. Allows agents to branch on failure type without parsing logs.
+///
+/// Phase 1a: supports compile-error, test-failure, doctest, harness-panic.
+/// Absent verdict.json = exit-code-only interpretation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureClass {
+    /// Compilation error (cargo build/cargo check failed).
+    CompileError,
+    /// Test failure (cargo test found failing tests).
+    TestFailure,
+    /// Doctest failure.
+    Doctest,
+    /// Test harness panic (the test harness itself crashed).
+    HarnessPanic,
+}
+
+/// VerdictJson: versioned verdict.json structure from remote executor.
+///
+/// Emitted as a Workflow output parameter by the remote template. Contains
+/// the authoritative classification of the run outcome, including optional
+/// failure class and infrastructure signals (OOM, deadline exceeded).
+///
+/// Consumers ignore unknown fields; absent verdict.json degrades gracefully
+/// to exit-code-only interpretation (command contract).
+///
+/// Phase 1a: implements schema_version 1 with phase, exit_code, oom, deadline,
+/// and optional failure_class. Later versions may add fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerdictJson {
+    /// Schema version for backward compatibility.
+    #[serde(rename = "schema_version")]
+    pub schema_version: u32,
+
+    /// Workflow phase from status.phase (Succeeded, Failed, Error, etc.).
+    /// authoritative source for workflow-level outcome.
+    pub phase: String,
+
+    /// Exit code from the cargo/test run.
+    pub exit_code: i32,
+
+    /// Whether the pod was OOMKilled (InfraFailure signal).
+    #[serde(default)]
+    pub oom: bool,
+
+    /// Whether the workflow exceeded its deadline (InfraFailure signal).
+    #[serde(default)]
+    pub deadline_exceeded: bool,
+
+    /// Optional failure class from cargo --message-format json analysis.
+    /// Absent means exit-code-only interpretation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<FailureClass>,
+}
+
+impl VerdictJson {
+    /// Parse verdict.json from a JSON string.
+    ///
+    /// Returns Err if JSON is malformed or schema_version is unsupported.
+    pub fn parse(json: &str) -> Result<Self, BackendError> {
+        let parsed: Self = serde_json::from_str(json)
+            .map_err(|e| BackendError::new(&format!("failed to parse verdict.json: {}", e)))?;
+
+        // Validate schema version (Phase 1a only supports version 1)
+        if parsed.schema_version != 1 {
+            return Err(BackendError::new(&format!(
+                "unsupported verdict.json schema version: {}",
+                parsed.schema_version
+            )));
+        }
+
+        Ok(parsed)
+    }
+
+    /// Convert the verdict.json to a Verdict using full ladder semantics.
+    ///
+    /// Applies infra-failure classification (OOM, deadline) before mapping
+    /// exit code to TestFailure/Pass. Failure class is informational only.
+    pub fn to_verdict(&self) -> Verdict {
+        // InfraFailure signals take precedence
+        if self.oom || self.deadline_exceeded {
+            return Verdict::InfraFailure;
+        }
+
+        // Map exit code using standard ladder
+        match self.exit_code {
+            0 => Verdict::Pass,
+            1 => Verdict::TestFailure,
+            _ => Verdict::InfraFailure,
+        }
+    }
+}
+
 /// RunSpec: the specification of a run to submit to the remote backend.
 ///
 /// Phase 0.5: minimal struct with repo URL, SHA, and args.
@@ -193,4 +323,5 @@ impl RunSpec {
     }
 }
 
+pub mod argo;
 pub mod command;

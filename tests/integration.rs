@@ -177,6 +177,13 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
 fn test_passing_suite_round_trip_returns_exit_0() {
     let (exit_code, _stdout, stderr) = run_cargo_test("passing-suite");
 
+    // First, print stderr for debugging
+    if !stderr.is_empty() {
+        eprintln!("=== STDERR from passing suite ===");
+        eprintln!("{}", stderr);
+        eprintln!("=== END STDERR ===");
+    }
+
     assert_eq!(
         exit_code, 0,
         "passing suite should exit with 0, got {}",

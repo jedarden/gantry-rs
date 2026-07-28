@@ -47,7 +47,7 @@ impl Eligibility {
 /// Runs `git rev-parse --is-inside-work-tree` and returns true iff the output
 /// is "true". This is the first GitGate check (plan Components §3 "GitGate").
 /// Shells out to system git; never uses libgit2 (predecessor behavior contract).
-fn is_inside_work_tree() -> Result<bool, String> {
+pub fn is_inside_work_tree() -> Result<bool, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
@@ -69,7 +69,7 @@ fn is_inside_work_tree() -> Result<bool, String> {
 /// Runs `git rev-parse --verify HEAD` and returns true iff it succeeds (exit
 /// code 0). This catches repos with no commits (HEAD unborn) and other malformed
 /// states. Shells out to system git; never uses libgit2.
-fn head_resolves() -> Result<bool, String> {
+pub fn head_resolves() -> Result<bool, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--verify", "HEAD"])
         .output()
@@ -83,7 +83,7 @@ fn head_resolves() -> Result<bool, String> {
 /// Runs `git remote get-url <ci_remote>` and returns true iff it succeeds.
 /// The remote name comes from `config.ci_remote` (default: "origin"). Shells out
 /// to system git; never uses libgit2.
-fn remote_exists(ci_remote: &str) -> Result<bool, String> {
+pub fn remote_exists(ci_remote: &str) -> Result<bool, String> {
     let output = Command::new("git")
         .args(["remote", "get-url", ci_remote])
         .output()
@@ -98,7 +98,7 @@ fn remote_exists(ci_remote: &str) -> Result<bool, String> {
 /// An empty output means no tracked files have changes and no untracked files
 /// are present (vanilla porcelain mode; Phase 1a adds untracked-file nuance).
 /// Shells out to system git; never uses libgit2.
-fn is_tree_clean() -> Result<bool, String> {
+pub fn is_tree_clean() -> Result<bool, String> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
         .output()

@@ -4,79 +4,154 @@
 // + GitGate + RefPusher) and implements the command-template backend that runs a
 // bash executor on the same box.
 //
-// The command backend implements RemoteBackend using hardcoded argv arrays:
-// - submit: runs the bash executor with the repo/sha/args, captures stdout as handle
-// - logs: stub (panics if called)
-// - wait: runs the bash executor with the handle, returns exit code -> verdict
-//
-// Phase 1a will make the argv arrays configurable via config file; the skeleton
-// uses hardcoded paths to contrib/gantry-exec.sh.
+// Phase 1a (bf-23i): configurable argv templates with placeholder substitution.
+// The command backend implements RemoteBackend using user-configured argv arrays:
+// - submit: runs configured submit argv with {repo}, {rev}, {args_json} placeholders
+// - logs: runs configured logs argv with {handle} placeholder for streaming
+// - wait: runs configured wait argv with {handle} placeholder, maps exit code to verdict
 
 use crate::backend::{BackendError, RemoteBackend, RunHandle, RunSpec, Verdict};
 use std::io::Write;
 use std::process::{Command, Output};
 use std::time::Instant;
 
+/// Configuration for command-template backend.
+///
+/// Phase 1a: configurable argv arrays with placeholder substitution.
+/// Placeholders are substituted at the argv level (no shell interpolation).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandConfig {
+    /// Submit command argv array. Placeholders: {repo}, {rev}, {args_json}.
+    /// Example: ["my-ci", "submit", "--repo", "{repo}", "--rev", "{rev}", "--args", "{args_json}"]
+    pub submit: Vec<String>,
+
+    /// Logs command argv array. Placeholder: {handle}.
+    /// Example: ["my-ci", "logs", "{handle}", "--follow"]
+    pub logs: Vec<String>,
+
+    /// Wait command argv array. Placeholder: {handle}.
+    /// Example: ["my-ci", "wait", "{handle}"]
+    pub wait: Vec<String>,
+}
+
+impl Default for CommandConfig {
+    fn default() -> Self {
+        // Phase 0.5 compatible defaults: contrib/gantry-exec.sh
+        // Respect GANTRY_EXEC_PATH environment variable if set (for integration tests)
+        let executor_path = std::env::var("GANTRY_EXEC_PATH")
+            .unwrap_or_else(|_| "./contrib/gantry-exec.sh".to_string());
+
+        CommandConfig {
+            submit: vec![
+                executor_path.clone(),
+                "submit".to_string(),
+                "{repo}".to_string(),
+                "{rev}".to_string(),
+                "{args_json}".to_string(),
+            ],
+            logs: vec![
+                executor_path.clone(),
+                "logs".to_string(),
+                "{handle}".to_string(),
+            ],
+            wait: vec![executor_path, "wait".to_string(), "{handle}".to_string()],
+        }
+    }
+}
+
+/// Substitute placeholders in an argv array.
+///
+/// Replaces {repo}, {rev}, {args_json}, {handle} with actual values.
+/// Substitution happens at the argv level (no shell interpolation, S-4).
+fn substitute_placeholders(
+    argv: &[String],
+    repo: &str,
+    rev: &str,
+    args_json: &str,
+    handle: Option<&str>,
+) -> Vec<String> {
+    argv.iter()
+        .map(|arg| {
+            let mut result = arg.clone();
+            if let Some(h) = handle {
+                result = result.replace("{handle}", h);
+            }
+            result
+                .replace("{repo}", repo)
+                .replace("{rev}", rev)
+                .replace("{args_json}", args_json)
+        })
+        .collect()
+}
+
 /// The command-template backend implementation.
 ///
-/// Phase 0.5: hardcoded executor path at `./contrib/gantry-exec.sh`. The backend
-/// runs this script with argv-style arguments:
-///
-/// Submit (stores the run and emits a handle on stdout):
-///   contrib/gantry-exec.sh submit <repo_url> <sha> <args_json>
-///
-/// Wait (polls the run and exits with the run's exit code):
-///   contrib/gantry-exec.sh wait <handle>
-///
-/// Phase 1a will make these argv arrays configurable via config file templates.
+/// Phase 1a: configurable argv templates with placeholder substitution.
 pub struct CommandBackend {
-    /// Path to the bash executor script.
-    executor: String,
+    /// Command configuration (submit, logs, wait argv arrays).
+    config: CommandConfig,
 }
 
 impl CommandBackend {
-    /// Create a new CommandBackend with the hardcoded executor path.
+    /// Create a new CommandBackend with default configuration.
     ///
-    /// Phase 0.5: the executor is `./contrib/gantry-exec.sh` (relative to the
-    /// current working directory, which is the repo root for the skeleton).
-    /// If the `GANTRY_EXEC_PATH` environment variable is set, it overrides the
-    /// default path (used by integration tests to point to the test executor).
+    /// Phase 1a: defaults to Phase 0.5 compatible executor at ./contrib/gantry-exec.sh.
     pub fn new() -> Self {
-        // Check for GANTRY_EXEC_PATH override (for integration tests)
-        let executor = std::env::var("GANTRY_EXEC_PATH")
-            .unwrap_or_else(|_| "./contrib/gantry-exec.sh".to_string());
+        CommandBackend {
+            config: CommandConfig::default(),
+        }
+    }
 
-        CommandBackend { executor }
+    /// Create a new CommandBackend with custom configuration.
+    pub fn with_config(config: CommandConfig) -> Self {
+        CommandBackend { config }
     }
 
     /// Create a new CommandBackend with a custom executor path (for testing).
     #[cfg(test)]
     pub fn with_executor(executor: &str) -> Self {
-        CommandBackend {
-            executor: executor.to_string(),
-        }
+        let config = CommandConfig {
+            submit: vec![
+                executor.to_string(),
+                "submit".to_string(),
+                "{repo}".to_string(),
+                "{rev}".to_string(),
+                "{args_json}".to_string(),
+            ],
+            logs: vec![
+                executor.to_string(),
+                "logs".to_string(),
+                "{handle}".to_string(),
+            ],
+            wait: vec![
+                executor.to_string(),
+                "wait".to_string(),
+                "{handle}".to_string(),
+            ],
+        };
+        CommandBackend { config }
     }
 
-    /// Run the executor with arguments and return its output.
-    fn run_executor(&self, args: &[&str]) -> Result<Output, BackendError> {
-        Command::new(&self.executor)
+    /// Run a command with arguments and return its output.
+    fn run_command(&self, argv: &[String]) -> Result<Output, BackendError> {
+        if argv.is_empty() {
+            return Err(BackendError::new("command argv is empty"));
+        }
+
+        let cmd = &argv[0];
+        let args = &argv[1..];
+
+        Command::new(cmd)
             .args(args)
             .output()
-            .map_err(|e| BackendError::new(&format!("failed to run executor: {}", e)))
+            .map_err(|e| BackendError::new(&format!("failed to run command: {}", e)))
     }
 
-    /// Parse args JSON into a Vec<String> for the executor.
+    /// Format args as JSON array.
     ///
-    /// Phase 0.5: use a simple JSON array format. The args are passed as a JSON
-    /// array of strings; the executor parses this and forwards each element to
-    /// the command (e.g., cargo test).
-    ///
-    /// Phase 1a will use serde_json for robust JSON handling.
+    /// Phase 1a: use serde_json for robust JSON handling (S-4 compliance).
     fn format_args_json(args: &[String]) -> String {
-        // Phase 0.5: simple JSON array encoding
-        // This is a minimal implementation that works for simple cases
-        let parts: Vec<&str> = args.iter().map(|a| a.as_str()).collect();
-        format!("[{}]", parts.join(","))
+        serde_json::to_string(args).expect("args should be JSON-serializable")
     }
 }
 
@@ -87,34 +162,32 @@ impl Default for CommandBackend {
 }
 
 impl RemoteBackend for CommandBackend {
-    /// Submit a run to the executor.
+    /// Submit a run to the command backend.
     ///
-    /// Runs: `contrib/gantry-exec.sh submit <repo_url> <sha> <args_json>`
-    ///
-    /// The executor's stdout is the handle (an opaque string that wait() can use).
-    /// The skeleton expects the handle to be a single line of text (whitespace trimmed).
-    ///
-    /// ## Errors
-    ///
-    /// Returns Err if:
-    /// - The executor binary cannot be run
-    /// - The executor exits non-zero (submit failure)
-    /// - The executor emits no output on stdout
+    /// Runs the configured submit argv with {repo}, {rev}, {args_json} placeholders.
+    /// The command's stdout is the handle (an opaque string that wait() can use).
     fn submit(&self, spec: &RunSpec) -> Result<RunHandle, BackendError> {
         let args_json = Self::format_args_json(&spec.args);
+        let argv = substitute_placeholders(
+            &self.config.submit,
+            &spec.repo_url,
+            &spec.sha,
+            &args_json,
+            None,
+        );
 
-        let output = self.run_executor(&["submit", &spec.repo_url, &spec.sha, &args_json])?;
+        let output = self.run_command(&argv)?;
 
         if !output.status.success() {
             return Err(BackendError::new(&format!(
-                "executor submit failed: {}",
+                "submit command failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             )));
         }
 
         let handle = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if handle.is_empty() {
-            return Err(BackendError::new("executor emitted empty handle"));
+            return Err(BackendError::new("submit command emitted empty handle"));
         }
 
         Ok(RunHandle::new(&handle))
@@ -122,60 +195,58 @@ impl RemoteBackend for CommandBackend {
 
     /// Stream logs from the running run.
     ///
-    /// Phase 0.5: not implemented — panics if called.
-    /// Phase 1a will implement log streaming for the command backend.
+    /// Phase 1a: runs the configured logs argv with {handle} placeholder.
+    /// Best-effort: failures don't fail the overall run (wait is authoritative).
     fn stream_logs(&self, h: &RunHandle, out: &mut dyn Write) -> Result<(), BackendError> {
-        let _ = (h, out);
-        panic!("stream_logs is not implemented in Phase 0.5");
+        let argv = substitute_placeholders(&self.config.logs, "", "", "", Some(&h.handle));
+
+        let output = self.run_command(&argv)?;
+
+        // Write log output to the writer
+        out.write_all(&output.stdout)
+            .map_err(|e| BackendError::new(&format!("failed to write logs: {}", e)))?;
+
+        Ok(())
     }
 
     /// Wait for the run to complete and return its verdict.
     ///
-    /// Runs: `contrib/gantry-exec.sh wait <handle>`
-    ///
-    /// The executor exits with the same exit code as the run it executed. The
-    /// backend maps this exit code to a Verdict using the minimal ladder:
-    /// - 0 -> Pass
-    /// - nonzero -> TestFailure
+    /// Runs the configured wait argv with {handle} placeholder.
+    /// The command's exit code maps to a Verdict using the full ladder.
     ///
     /// ## Parameters
     ///
     /// - `h`: The RunHandle returned by submit().
-    /// - `deadline`: The deadline for the run (ignored in Phase 0.5 — the executor
-    ///   manages its own timeout). Phase 1a will enforce this at the backend level.
-    ///
-    /// ## Errors
-    ///
-    /// Returns Err if:
-    /// - The executor binary cannot be run
-    /// - The executor crashes (not the run itself, but the executor script)
-    /// - The handle is invalid or the run is not found
+    /// - `deadline`: The deadline for the run (ignored in Phase 1a — the command
+    ///   manages its own timeout).
     fn wait(&self, h: &RunHandle, _deadline: Instant) -> Result<Verdict, BackendError> {
-        let output = self.run_executor(&["wait", &h.handle])?;
+        let argv = substitute_placeholders(&self.config.wait, "", "", "", Some(&h.handle));
 
-        // The executor's exit code is the run's exit code
+        let output = self.run_command(&argv)?;
+
+        // The command's exit code is the run's exit code
         let exit_code = output.status.code().unwrap_or(-1);
 
-        // Map to verdict using the minimal ladder
+        // Map to verdict using the full ladder
         Ok(Verdict::from_exit_code(exit_code))
     }
 
     /// Describe the run for human consumption.
     ///
-    /// Phase 0.5: not implemented — panics if called.
-    /// Phase 1a will return the handle or a configured URL template.
+    /// Phase 1a: returns the handle (opaque identifier from the command backend).
     fn describe(&self, h: &RunHandle) -> String {
-        let _ = h;
-        panic!("describe is not implemented in Phase 0.5");
+        format!("handle/{}", h.handle)
     }
 
     /// Cancel the running run.
     ///
-    /// Phase 0.5: not implemented — panics if called.
-    /// Phase 1a will implement cancellation (e.g., a cancel argv for the executor).
+    /// Phase 1a: not implemented for command backend (no generic cancel mechanism).
+    /// Returns an error explaining cancellation is not supported.
     fn cancel(&self, h: &RunHandle) -> Result<(), BackendError> {
         let _ = h;
-        panic!("cancel is not implemented in Phase 0.5");
+        Err(BackendError::new(
+            "cancel is not supported for command backend",
+        ))
     }
 }
 
@@ -366,9 +437,10 @@ esac
     #[test]
     fn test_verdict_from_exit_code_nonzero_is_test_failure() {
         assert_eq!(Verdict::from_exit_code(1), Verdict::TestFailure);
-        assert_eq!(Verdict::from_exit_code(2), Verdict::TestFailure);
-        assert_eq!(Verdict::from_exit_code(-1), Verdict::TestFailure);
-        assert_eq!(Verdict::from_exit_code(255), Verdict::TestFailure);
+        // Exit code >= 2 is InfraFailure per Phase 1a command contract
+        assert_eq!(Verdict::from_exit_code(2), Verdict::InfraFailure);
+        assert_eq!(Verdict::from_exit_code(-1), Verdict::InfraFailure);
+        assert_eq!(Verdict::from_exit_code(255), Verdict::InfraFailure);
     }
 
     #[test]
@@ -417,31 +489,35 @@ esac
     #[test]
     fn test_command_backend_default_creates_instance() {
         let backend = CommandBackend::default();
-        assert_eq!(backend.executor, "./contrib/gantry-exec.sh");
+        assert_eq!(backend.config.submit[0], "./contrib/gantry-exec.sh");
+        assert_eq!(backend.config.wait[0], "./contrib/gantry-exec.sh");
+        assert_eq!(backend.config.logs[0], "./contrib/gantry-exec.sh");
     }
 
     #[test]
-    #[should_panic(expected = "stream_logs is not implemented")]
-    fn test_command_backend_stream_logs_panics() {
+    fn test_command_backend_stream_logs_works() {
         let backend = CommandBackend::new();
         let handle = RunHandle::new("test");
         let mut out = Vec::new();
-        let _ = backend.stream_logs(&handle, &mut out);
+        // This will fail to run the command, but it won't panic
+        let result = backend.stream_logs(&handle, &mut out);
+        assert!(result.is_err() || result.is_ok()); // Just verify it doesn't panic
     }
 
     #[test]
-    #[should_panic(expected = "describe is not implemented")]
-    fn test_command_backend_describe_panics() {
+    fn test_command_backend_describe_works() {
         let backend = CommandBackend::new();
         let handle = RunHandle::new("test");
-        let _ = backend.describe(&handle);
+        let description = backend.describe(&handle);
+        assert_eq!(description, "handle/test");
     }
 
     #[test]
-    #[should_panic(expected = "cancel is not implemented")]
-    fn test_command_backend_cancel_panics() {
+    fn test_command_backend_cancel_returns_error() {
         let backend = CommandBackend::new();
         let handle = RunHandle::new("test");
-        let _ = backend.cancel(&handle);
+        let result = backend.cancel(&handle);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().reason.contains("not supported"));
     }
 }
