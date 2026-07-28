@@ -262,7 +262,7 @@ mod tests {
     static FS_MUTEX: Mutex<()> = Mutex::new(());
 
     // A simple test executor that:
-    // - On submit: writes "handle-<args>" to stdout (args becomes the handle)
+    // - On submit: writes "handle-<subcommand>" to stdout (subcommand becomes the handle)
     // - On wait: exits 0 if handle contains "pass", exits 1 otherwise
     fn create_test_executor(dir: &std::path::Path, name: &str) -> PathBuf {
         let path = dir.join(name);
@@ -274,10 +274,10 @@ mod tests {
 
 case "$1" in
     submit)
-        # Emit a handle based on the args (which is in $4 as JSON)
-        # For testing, we use the first arg value as the handle prefix
-        handle="handle-$(echo "$4" | sed 's/[^a-zA-Z0-9]/_/g')"
-        echo "$handle"
+        # Emit a handle based on the repo URL (in $2) which contains test identifier
+        # For testing, we extract the test identifier from the repo path
+        handle=$(echo "$2" | sed 's|.*/||')
+        echo "handle-$handle"
         exit 0
         ;;
     wait)
@@ -320,7 +320,7 @@ esac
         let executor = create_test_executor(temp_dir.path(), "test-executor");
 
         let backend = CommandBackend::with_executor(executor.to_str().unwrap());
-        let spec = RunSpec::new("cargo", "pass", vec![], "file:///repo", "abc123", "");
+        let spec = RunSpec::new("cargo", "test", vec![], "file:///repo/pass", "abc123", "");
 
         let result = backend.submit(&spec);
 
@@ -377,8 +377,8 @@ esac
 
         let backend = CommandBackend::with_executor(executor.to_str().unwrap());
 
-        // Submit with "pass" args
-        let spec = RunSpec::new("cargo", "pass", vec![], "file:///repo", "abc123", "");
+        // Submit with "pass" in the repo URL
+        let spec = RunSpec::new("cargo", "test", vec![], "file:///repo/pass", "abc123", "");
         let handle = backend.submit(&spec).expect("submit should succeed");
 
         // Wait on the handle
@@ -397,8 +397,8 @@ esac
 
         let backend = CommandBackend::with_executor(executor.to_str().unwrap());
 
-        // Submit with "fail" args
-        let spec = RunSpec::new("cargo", "fail", vec![], "file:///repo", "abc123", "");
+        // Submit with "fail" in the repo URL
+        let spec = RunSpec::new("cargo", "test", vec![], "file:///repo/fail", "abc123", "");
         let handle = backend.submit(&spec).expect("submit should succeed");
 
         // Wait on the handle
@@ -464,7 +464,8 @@ esac
         let spec = RunSpec::new("cargo", "test", vec![], "file:///repo", "abc123", "");
         assert_eq!(spec.repo_url, "file:///repo");
         assert_eq!(spec.sha, "abc123");
-        assert_eq!(spec.args, vec!["test".to_string()]);
+        assert_eq!(spec.subcommand, "test");
+        assert_eq!(spec.args, vec![] as Vec<String>);
     }
 
     #[test]
