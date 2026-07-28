@@ -304,21 +304,30 @@ impl VerdictJson {
 /// Phase 1a will expand this to include tool, subcommand, cwd_rel, and more.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunSpec {
+    /// Tool to run (e.g., "cargo", "pytest").
+    pub tool: String,
+    /// Subcommand to invoke (e.g., "test", "build", "check").
+    pub subcommand: String,
+    /// Arguments to pass to the command (e.g., ["--", "--nocapture"]).
+    pub args: Vec<String>,
     /// Repository URL (file:// for local testing in the skeleton).
     pub repo_url: String,
     /// Commit SHA to run (the content the executor checks out).
     pub sha: String,
-    /// Arguments to pass to the command (e.g., ["test", "--", "--nocapture"]).
-    pub args: Vec<String>,
+    /// Working directory relative to repo root (e.g., "", "crates/foo").
+    pub cwd_rel: String,
 }
 
 impl RunSpec {
     /// Create a new RunSpec.
-    pub fn new(repo_url: &str, sha: &str, args: Vec<String>) -> Self {
+    pub fn new(tool: &str, subcommand: &str, args: Vec<String>, repo_url: &str, sha: &str, cwd_rel: &str) -> Self {
         RunSpec {
+            tool: tool.to_string(),
+            subcommand: subcommand.to_string(),
+            args,
             repo_url: repo_url.to_string(),
             sha: sha.to_string(),
-            args,
+            cwd_rel: cwd_rel.to_string(),
         }
     }
 }

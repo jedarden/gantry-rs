@@ -164,7 +164,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
 
     // Step 3: Push epoch ref via RefPusher
     let push_start = Instant::now();
-    let push_result = RefPusher::push(config, sha);
+    let push_result = RefPusher::push(config, sha, &run_id);
     let push_duration_ms = push_start.elapsed().as_millis() as u64;
 
     if !push_result.success {
@@ -193,7 +193,20 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
 
     // Step 4: Submit to command backend
     let backend = CommandBackend::new();
-    let spec = RunSpec::new(repo_url, sha, args.to_vec());
+
+    // Extract tool, subcommand, and args from the intercepted command
+    // Phase 0.5: tool is always "cargo", cwd_rel is empty (repo root)
+    let tool = "cargo";
+    let cwd_rel = "";
+    let (subcommand, run_args) = match args.split_first() {
+        Some((first, rest)) => (first.as_str(), rest.to_vec()),
+        None => {
+            eprintln!("[gantry] error: no subcommand provided");
+            return 1;
+        }
+    };
+
+    let spec = RunSpec::new(tool, subcommand, run_args, repo_url, sha, cwd_rel);
 
     let handle = match backend.submit(&spec) {
         Ok(h) => h,

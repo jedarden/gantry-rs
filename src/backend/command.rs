@@ -320,7 +320,7 @@ esac
         let executor = create_test_executor(temp_dir.path(), "test-executor");
 
         let backend = CommandBackend::with_executor(executor.to_str().unwrap());
-        let spec = RunSpec::new("file:///repo", "abc123", vec!["pass".to_string()]);
+        let spec = RunSpec::new("cargo", "pass", vec![], "file:///repo", "abc123", "");
 
         let result = backend.submit(&spec);
 
@@ -378,7 +378,7 @@ esac
         let backend = CommandBackend::with_executor(executor.to_str().unwrap());
 
         // Submit with "pass" args
-        let spec = RunSpec::new("file:///repo", "abc123", vec!["pass".to_string()]);
+        let spec = RunSpec::new("cargo", "pass", vec![], "file:///repo", "abc123", "");
         let handle = backend.submit(&spec).expect("submit should succeed");
 
         // Wait on the handle
@@ -398,7 +398,7 @@ esac
         let backend = CommandBackend::with_executor(executor.to_str().unwrap());
 
         // Submit with "fail" args
-        let spec = RunSpec::new("file:///repo", "abc123", vec!["fail".to_string()]);
+        let spec = RunSpec::new("cargo", "fail", vec![], "file:///repo", "abc123", "");
         let handle = backend.submit(&spec).expect("submit should succeed");
 
         // Wait on the handle
@@ -461,7 +461,7 @@ esac
 
     #[test]
     fn test_run_spec_new_creates_spec() {
-        let spec = RunSpec::new("file:///repo", "abc123", vec!["test".to_string()]);
+        let spec = RunSpec::new("cargo", "test", vec![], "file:///repo", "abc123", "");
         assert_eq!(spec.repo_url, "file:///repo");
         assert_eq!(spec.sha, "abc123");
         assert_eq!(spec.args, vec!["test".to_string()]);
