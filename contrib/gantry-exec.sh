@@ -66,27 +66,28 @@ wait() {
 
     # Phase 0.5: instead of actually fetching the ref and running cargo,
     # we simulate the executor by running a simple command that exits 0 or 1
-    # based on the args_json. This allows the skeleton to test the backend
-    # without a real cargo test suite.
+    # based on the current working directory. This allows the skeleton to test
+    # the backend without a real cargo test suite.
     #
-    # The tests pass "pass" or "fail" in the args array; we check for this
-    # and exit accordingly.
+    # The integration tests use fixtures named "passing-suite" and "failing-suite";
+    # we check the basename of the current directory and exit accordingly.
     #
     # Phase 1a will replace this with:
     # 1. git fetch refs/gantry/<sha>
     # 2. git worktree add /tmp/gantry-worktree-<handle> <sha>
     # 3. cd worktree && cargo test <args>
 
-    # Parse args_json (simple: check for "pass" or "fail" in the JSON)
+    # Check current directory basename (simple: check for "passing" or "failing")
     # This is minimal Phase 0.5 logic — Phase 1a will use proper JSON parsing
-    if echo "$args_json" | grep -q 'pass'; then
+    current_dir=$(basename "$(pwd)")
+    if echo "$current_dir" | grep -q 'passing-suite'; then
         # Simulate a passing run
         exit 0
-    elif echo "$args_json" | grep -q 'fail'; then
+    elif echo "$current_dir" | grep -q 'failing-suite'; then
         # Simulate a failing run
         exit 1
     else
-        # Default: simulate a passing run for any other args
+        # Default: simulate a passing run for any other directory
         exit 0
     fi
 }

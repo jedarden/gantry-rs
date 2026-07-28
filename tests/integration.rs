@@ -82,6 +82,10 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
         .output()
         .expect("git remote add failed");
 
+    // Create .gitignore to exclude the state directory (keeps working tree clean for GitGate)
+    let gitignore_path = fixture_path.join(".gitignore");
+    fs::write(&gitignore_path, ".git-state/\n").expect("failed to write .gitignore");
+
     // Create an initial commit
     Command::new("git")
         .current_dir(&fixture_path)

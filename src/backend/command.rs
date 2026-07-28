@@ -39,10 +39,14 @@ impl CommandBackend {
     ///
     /// Phase 0.5: the executor is `./contrib/gantry-exec.sh` (relative to the
     /// current working directory, which is the repo root for the skeleton).
+    /// If the `GANTRY_EXEC_PATH` environment variable is set, it overrides the
+    /// default path (used by integration tests to point to the test executor).
     pub fn new() -> Self {
-        CommandBackend {
-            executor: "./contrib/gantry-exec.sh".to_string(),
-        }
+        // Check for GANTRY_EXEC_PATH override (for integration tests)
+        let executor = std::env::var("GANTRY_EXEC_PATH")
+            .unwrap_or_else(|_| "./contrib/gantry-exec.sh".to_string());
+
+        CommandBackend { executor }
     }
 
     /// Create a new CommandBackend with a custom executor path (for testing).

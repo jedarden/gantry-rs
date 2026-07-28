@@ -44,6 +44,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     if !eligibility.eligible {
         // Ineligible for remote — should have been caught earlier, but handle it
         eprintln!("[gantry] ineligible: {}", eligibility.reason);
+        eprintln!("[gantry] verdict: Ineligible");
         // Return non-zero to indicate failure
         return 1;
     }
@@ -52,6 +53,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     let push_result = RefPusher::push(config, sha);
     if !push_result.success {
         eprintln!("[gantry] push failed: {}", push_result.reason);
+        eprintln!("[gantry] verdict: PushFailed");
         // Return non-zero to indicate infra failure
         return 1;
     }
@@ -64,6 +66,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         Ok(h) => h,
         Err(e) => {
             eprintln!("[gantry] submit failed: {}", e);
+            eprintln!("[gantry] verdict: InfraFailure");
             // Return non-zero to indicate infra failure
             return 1;
         }
@@ -77,6 +80,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         Ok(v) => v,
         Err(e) => {
             eprintln!("[gantry] wait failed: {}", e);
+            eprintln!("[gantry] verdict: InfraFailure");
             // Return non-zero to indicate infra failure
             return 1;
         }

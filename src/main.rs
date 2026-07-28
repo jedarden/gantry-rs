@@ -12,14 +12,59 @@
 // runs end-to-end as a transparent passthrough shim, proving the argv[0] dispatch
 // and the real-binary resolution layer work.
 
-mod config;
-mod shim;
+// The library crate contains the core modules
+extern crate gantry;
+
+// Re-export what main.rs needs
+use gantry::config;
+use gantry::decision;
+use gantry::shim;
 
 use std::env;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 /// The canonical version string printed by the management CLI.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Get the git repository URL from the origin remote.
+///
+/// Returns a file:// URL for local testing or the actual https:// URL for production.
+fn get_repo_url() -> String {
+    // Try to get the origin remote URL
+    match Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Convert to file:// URL if it's a local path for testing
+            if url.starts_with('/') || url.starts_with('.') {
+                format!("file://{}", url)
+            } else {
+                url
+            }
+        }
+        _ => {
+            // Fallback to current directory as file:// URL for local testing
+            format!("file://{}", env::current_dir().unwrap().display())
+        }
+    }
+}
+
+/// Get the current git commit SHA.
+///
+/// Returns "HEAD" if git rev-parse fails.
+fn get_current_sha() -> String {
+    match Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => "HEAD".to_string(),
+    }
+}
 
 /// Entry point: dispatch on argv[0] and either run the management CLI or the
 /// cargo tool profile.
@@ -72,16 +117,16 @@ fn run_cargo_profile(argv: &[String]) -> ExitCode {
     if force_local || !cfg.intercepts(subcommand) {
         shim::passthrough(&cfg, argv)
     } else {
-        // Intercepted subcommand without GANTRY_LOCAL=1. In Phase 0.5 this branch
-        // is unreachable because the only intercepted subcommand is `test`, and
-        // the skeleton does not yet implement remote offload. The bead scope
-        // explicitly deletes the run_remote() pipeline here, so an intercepted
-        // `cargo test` would hit this placeholder and exit with an error.
-        //
-        // This placeholder is removed when the decision engine lands (Phase 1a).
-        eprintln!("[gantry] remote offload is not implemented in Phase 0.5");
-        eprintln!("[gantry] set GANTRY_LOCAL=1 to run locally");
-        ExitCode::FAILURE
+        // Intercepted subcommand without GANTRY_LOCAL=1. Run the decision pipeline
+        // to determine if we should execute remotely and get the verdict.
+        let repo_url = get_repo_url();
+        let sha = get_current_sha();
+        let args = &argv[1..]; // Skip argv[0] (cargo)
+
+        let exit_code = decision::run_remote(&cfg, &repo_url, &sha, args);
+        // Convert i32 to u8 for ExitCode (clamp to 0-255 range)
+        let exit_code_u8 = if exit_code < 0 { 0 } else { (exit_code & 0xFF) as u8 };
+        ExitCode::from(exit_code_u8)
     }
 }
 
