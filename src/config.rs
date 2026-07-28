@@ -18,6 +18,7 @@ use std::time::Duration;
 /// overrides it, offloads only the subcommands in `intercept_list`, and caps a
 /// remote run at the configured `deadline`.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Phase 0.5 skeleton: fields reserved for Phase 1a
 pub struct Config {
     /// Optional override for the real cargo binary; `None` means "resolve via
     /// PATH" (plan Components §1, "Shim & dispatcher").
@@ -54,6 +55,7 @@ impl Config {
     }
 
     /// The remote-run deadline — a positive [`Duration`].
+    #[allow(dead_code)] // Phase 0.5 skeleton: reserved for Phase 1a
     pub fn deadline(&self) -> Duration {
         self.deadline
     }

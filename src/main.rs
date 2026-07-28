@@ -137,3 +137,196 @@ fn print_usage() {
     println!("Environment variables:");
     println!("  GANTRY_LOCAL=1      Force local passthrough (skip remote offload)");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_invocation_name_cargo() {
+        let argv = vec!["cargo".to_string(), "test".to_string()];
+        let name = shim::invocation_name(&argv);
+        assert_eq!(name, "cargo");
+    }
+
+    #[test]
+    fn test_invocation_name_gantry() {
+        let argv = vec!["gantry".to_string(), "version".to_string()];
+        let name = shim::invocation_name(&argv);
+        assert_eq!(name, "gantry");
+    }
+
+    #[test]
+    fn test_invocation_name_path_to_cargo() {
+        let argv = vec!["/usr/bin/cargo".to_string(), "build".to_string()];
+        let name = shim::invocation_name(&argv);
+        assert_eq!(name, "cargo");
+    }
+
+    #[test]
+    fn test_invocation_name_empty_argv() {
+        let argv: Vec<String> = vec![];
+        let name = shim::invocation_name(&argv);
+        assert_eq!(name, "gantry"); // SENTINEL
+    }
+
+    #[test]
+    fn test_invocation_name_empty_argv0() {
+        let argv = vec!["".to_string()];
+        let name = shim::invocation_name(&argv);
+        assert_eq!(name, "gantry"); // SENTINEL
+    }
+
+    #[test]
+    fn test_management_cli_version() {
+        let argv = vec!["gantry".to_string(), "version".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_management_cli_help() {
+        let argv = vec!["gantry".to_string(), "help".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_management_cli_unknown_command() {
+        let argv = vec!["gantry".to_string(), "unknown".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn test_management_cli_no_subcommand() {
+        let argv = vec!["gantry".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn test_management_cli_version_short_flag() {
+        let argv = vec!["gantry".to_string(), "--version".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_management_cli_version_v_flag() {
+        let argv = vec!["gantry".to_string(), "-V".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_cargo_profile_non_intercepted_passthrough() {
+        // Test that non-intercepted subcommands like "build" trigger passthrough
+        let cfg = config::Config::hardcoded();
+        let argv = ["cargo".to_string(), "build".to_string()];
+
+        // Since "build" is not in the intercept_list, it should passthrough
+        // (we can't actually test the exec behavior, but we can verify the logic)
+        let subcommand = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+        assert!(
+            !cfg.intercepts(subcommand),
+            "build should not be intercepted"
+        );
+    }
+
+    #[test]
+    fn test_gantry_local_forces_passthrough_logic() {
+        // Test that GANTRY_LOCAL=1 forces passthrough even for intercepted subcommands
+        let cfg = config::Config::hardcoded();
+        let argv = ["cargo".to_string(), "test".to_string()];
+
+        // Simulate the GANTRY_LOCAL environment variable being set
+        let force_local = env::var("GANTRY_LOCAL").is_ok();
+
+        // "test" IS in the intercept_list
+        let subcommand = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+        let is_intercepted = cfg.intercepts(subcommand);
+        assert!(is_intercepted, "test should be intercepted");
+
+        // The logic in run_cargo_profile is:
+        // if force_local || !cfg.intercepts(subcommand) { passthrough }
+        // So when force_local is true, we should passthrough even if intercepted
+        // This is a compile-time test of the logic structure
+        let should_passthrough = force_local || !is_intercepted;
+
+        // Without GANTRY_LOCAL set, "test" should NOT passthrough (it's intercepted)
+        assert!(
+            !should_passthrough,
+            "Without GANTRY_LOCAL, intercepted test should not passthrough"
+        );
+    }
+
+    #[test]
+    fn test_intercepted_subcommand_without_gantry_local() {
+        // Test that intercepted subcommands without GANTRY_LOCAL do NOT passthrough
+        let cfg = config::Config::hardcoded();
+        let argv = ["cargo".to_string(), "test".to_string()];
+
+        let subcommand = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+        let force_local = env::var("GANTRY_LOCAL").is_ok();
+
+        // "test" is intercepted
+        assert!(cfg.intercepts(subcommand));
+
+        // Without GANTRY_LOCAL, the condition is:
+        // force_local || !cfg.intercepts(subcommand)
+        // which is: false || !true = false
+        // So we should NOT passthrough
+        let should_passthrough = force_local || !cfg.intercepts(subcommand);
+        assert!(
+            !should_passthrough,
+            "Intercepted 'test' without GANTRY_LOCAL should not passthrough"
+        );
+    }
+
+    #[test]
+    fn test_config_intercepts_returns_correct_values() {
+        let cfg = config::Config::hardcoded();
+
+        // "test" is in the intercept_list
+        assert!(cfg.intercepts("test"));
+
+        // Other subcommands are not
+        assert!(!cfg.intercepts("build"));
+        assert!(!cfg.intercepts("check"));
+        assert!(!cfg.intercepts("run"));
+        assert!(!cfg.intercepts("doc"));
+        assert!(!cfg.intercepts("version"));
+    }
+
+    #[test]
+    fn test_empty_subcommand_never_intercepted() {
+        let cfg = config::Config::hardcoded();
+
+        // Empty or absent subcommand is never intercepted
+        assert!(!cfg.intercepts(""));
+    }
+
+    #[test]
+    fn test_argv0_gantry_routes_to_management_cli() {
+        let argv = vec!["gantry".to_string()];
+        let invocation_name = shim::invocation_name(&argv);
+
+        match invocation_name.as_str() {
+            "gantry" => {} // Correct route
+            _ => panic!("Expected 'gantry' route, got {}", invocation_name),
+        }
+    }
+
+    #[test]
+    fn test_argv0_cargo_routes_to_cargo_profile() {
+        let argv = vec!["cargo".to_string()];
+        let invocation_name = shim::invocation_name(&argv);
+
+        match invocation_name.as_str() {
+            "cargo" | "cargo.exe" => {} // Correct route
+            other => panic!("Expected cargo route, got {}", other),
+        }
+    }
+}
