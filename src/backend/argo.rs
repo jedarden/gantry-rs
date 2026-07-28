@@ -178,7 +178,7 @@ pub struct ArgoHandle {
 
 /// Argo configuration from config file.
 ///
-/// Phase 1a: minimal config (kubeconfig, namespace, template, generate_name).
+/// Phase 1a: minimal config (kubeconfig, namespace, template, generate_name, base_url).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArgoConfig {
     /// Path to kubeconfig file (empty = use default).
@@ -189,6 +189,8 @@ pub struct ArgoConfig {
     pub template: String,
     /// generateName prefix for submitted workflows.
     pub generate_name: String,
+    /// Base URL for Argo UI (optional, for describe() to return human-readable URLs).
+    pub base_url: Option<String>,
 }
 
 impl Default for ArgoConfig {
@@ -198,6 +200,7 @@ impl Default for ArgoConfig {
             namespace: "argo-workflows".to_string(),
             template: "gantry-verify".to_string(),
             generate_name: "gantry-".to_string(),
+            base_url: None,
         }
     }
 }
@@ -449,9 +452,21 @@ impl RemoteBackend for ArgoBackend {
 
     /// Describe the workflow for human consumption.
     ///
-    /// Returns the workflow name (can be used to view in Argo UI).
+    /// Returns a human-readable URL to the workflow in the Argo UI.
+    /// If base_url is configured, returns a full URL like:
+    /// "https://argo-ui.example.com/workflows/{namespace}/{workflow-name}"
+    /// Otherwise returns a simplified identifier.
     fn describe(&self, h: &crate::backend::RunHandle) -> String {
-        format!("workflow/{}", h.handle)
+        if let Some(base_url) = &self.config.base_url {
+            format!(
+                "{}/workflows/{}/{}",
+                base_url.trim_end_matches('/'),
+                self.config.namespace,
+                h.handle
+            )
+        } else {
+            format!("workflow/{}", h.handle)
+        }
     }
 
     /// Cancel the running workflow.
@@ -474,6 +489,7 @@ impl RemoteBackend for ArgoBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::RunHandle;
 
     #[test]
     fn test_workflow_manifest_serialization() {
@@ -554,5 +570,59 @@ mod tests {
 
         let result = VerdictJson::parse(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_argo_backend_describe_without_base_url() {
+        let config = ArgoConfig {
+            kubeconfig: "".to_string(),
+            namespace: "argo-workflows".to_string(),
+            template: "gantry-verify".to_string(),
+            generate_name: "gantry-".to_string(),
+            base_url: None,
+        };
+        let backend = ArgoBackend::new(config);
+        let handle = RunHandle::new("test-workflow-abc123");
+
+        let description = backend.describe(&handle);
+        assert_eq!(description, "workflow/test-workflow-abc123");
+    }
+
+    #[test]
+    fn test_argo_backend_describe_with_base_url() {
+        let config = ArgoConfig {
+            kubeconfig: "".to_string(),
+            namespace: "argo-workflows".to_string(),
+            template: "gantry-verify".to_string(),
+            generate_name: "gantry-".to_string(),
+            base_url: Some("https://argo.example.com".to_string()),
+        };
+        let backend = ArgoBackend::new(config);
+        let handle = RunHandle::new("test-workflow-abc123");
+
+        let description = backend.describe(&handle);
+        assert_eq!(
+            description,
+            "https://argo.example.com/workflows/argo-workflows/test-workflow-abc123"
+        );
+    }
+
+    #[test]
+    fn test_argo_backend_describe_with_base_url_trailing_slash() {
+        let config = ArgoConfig {
+            kubeconfig: "".to_string(),
+            namespace: "my-namespace".to_string(),
+            template: "gantry-verify".to_string(),
+            generate_name: "gantry-".to_string(),
+            base_url: Some("https://argo.example.com/".to_string()),
+        };
+        let backend = ArgoBackend::new(config);
+        let handle = RunHandle::new("test-workflow-abc123");
+
+        let description = backend.describe(&handle);
+        assert_eq!(
+            description,
+            "https://argo.example.com/workflows/my-namespace/test-workflow-abc123"
+        );
     }
 }

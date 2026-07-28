@@ -108,6 +108,9 @@ pub struct ArgoConfig {
     pub template: String,
     /// Workflow name prefix (default: "gantry-").
     pub generate_name: String,
+    /// Base URL for Argo UI (optional, for describe() to return human-readable URLs).
+    /// Example: "https://argo-ci.ardenone.com" or "http://localhost:8080"
+    pub base_url: Option<String>,
 }
 
 /// Command-template backend configuration.
@@ -177,6 +180,8 @@ struct RawArgo {
     template: String,
     #[serde(default = "default_generate_name")]
     generate_name: String,
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -465,6 +470,7 @@ impl Config {
                     namespace: argo.namespace,
                     template: argo.template,
                     generate_name: argo.generate_name,
+                    base_url: argo.base_url,
                 });
             }
 
@@ -711,6 +717,7 @@ impl Config {
                     namespace: a.namespace.clone(),
                     template: a.template.clone(),
                     generate_name: a.generate_name.clone(),
+                    base_url: a.base_url.clone(),
                 }),
                 command: config.remote.command.as_ref().map(|c| RawCommand {
                     submit: c.submit.clone(),
