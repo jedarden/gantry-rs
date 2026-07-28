@@ -101,7 +101,7 @@ impl RefPusher {
         // Run the push: git push <ci_remote> <sha>:<ref_name>
         // This creates (or updates, if the exact ref already exists) the hidden
         // ref on the remote without touching any branch refs (refs/heads/*).
-        match Self::run_git_push(&config.ci_remote, sha, &ref_name) {
+        match Self::run_git_push(&config.remote.ci_remote, sha, &ref_name) {
             Ok(_) => PushResult::success(),
             Err(e) => PushResult::failed(&e),
         }
@@ -394,7 +394,7 @@ mod tests {
 
         // Create a config with a nonexistent remote
         let mut config = Config::hardcoded();
-        config.ci_remote = "nonexistent-remote".to_string();
+        config.remote.ci_remote = "nonexistent-remote".to_string();
 
         let result = RefPusher::push(&config, &sha);
 

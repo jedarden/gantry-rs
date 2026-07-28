@@ -18,10 +18,13 @@ extern crate gantry;
 // Re-export what main.rs needs
 use gantry::config;
 use gantry::decision;
+use gantry::doctor;
 use gantry::shim;
+use gantry::state;
 
 use std::env;
 use std::process::{Command, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The canonical version string printed by the management CLI.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -97,7 +100,22 @@ fn main() -> ExitCode {
 /// cargo binary (self-recursion guard included) and execs it with argv[1..]
 /// forwarded byte-exact. Exit code fidelity is guaranteed (INV-3).
 fn run_cargo_profile(argv: &[String]) -> ExitCode {
-    let cfg = config::Config::hardcoded();
+    let load_result = config::Config::load();
+    let cfg = load_result.config;
+
+    // Print any warnings from config loading
+    for warning in load_result.warnings {
+        eprintln!("[gantry] config warning: {}", warning);
+    }
+
+    // Print broken-config banner if present
+    if let Some(banner) = load_result.broken_banner {
+        eprintln!(
+            "[gantry] WARNING: config broken since {}, {} runs degraded",
+            humantime_timestamp(banner.since),
+            banner.count
+        );
+    }
 
     // Fast-path check: GANTRY_LOCAL=1 forces local passthrough even for an
     // intercepted subcommand (the common case during development and debugging).
@@ -111,7 +129,7 @@ fn run_cargo_profile(argv: &[String]) -> ExitCode {
     // Phase 0.5: if the subcommand is not intercepted (or forced local), run the
     // passthrough fast path. No remote path exists yet — the decision engine,
     // GitGate, RefPusher, and backend all land in later children.
-    if force_local || !cfg.intercepts(subcommand) {
+    if force_local || !cfg.intercepts("cargo", subcommand) {
         shim::passthrough(&cfg, argv)
     } else {
         // Intercepted subcommand without GANTRY_LOCAL=1. Run the decision pipeline
@@ -159,6 +177,68 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
 
+        // on command: enable gantry (remove kill switch)
+        "on" => match state::StateFile::open().and_then(|sf| sf.enable()) {
+            Ok(()) => {
+                println!("gantry enabled");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("gantry on: failed to enable: {}", e);
+                ExitCode::from(1)
+            }
+        },
+
+        // off command: disable gantry (activate kill switch)
+        "off" => match state::StateFile::open().and_then(|sf| sf.disable()) {
+            Ok(()) => {
+                println!("gantry disabled");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("gantry off: failed to disable: {}", e);
+                ExitCode::from(1)
+            }
+        },
+
+        // doctor command: run health checks
+        "doctor" => {
+            let health = doctor::run_all_checks();
+            health.print();
+
+            // Check for --e2e or --drill flags
+            if argv.get(2).map(|s| s.as_str()) == Some("--e2e") {
+                match doctor::run_e2e_test() {
+                    Ok(msg) => {
+                        println!("\nE2E test: {}", msg);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("\nE2E test failed: {}", e);
+                        ExitCode::from(1)
+                    }
+                }
+            } else if argv.get(2).map(|s| s.as_str()) == Some("--drill") {
+                match doctor::run_drill() {
+                    Ok(msg) => {
+                        println!("\nFire drill: {}", msg);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("\nFire drill failed: {}", e);
+                        ExitCode::from(1)
+                    }
+                }
+            } else {
+                // Normal doctor run: exit 0 if healthy, 1 if unhealthy
+                if health.is_healthy() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                }
+            }
+        }
+
         // Unknown command: print a hint and exit 2 (conventional for CLI misuse).
         _ => {
             eprintln!("gantry: unknown command '{subcommand}'");
@@ -168,6 +248,26 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
     }
 }
 
+/// Format a SystemTime as a human-readable timestamp.
+fn humantime_timestamp(time: SystemTime) -> String {
+    use std::fmt::Write;
+    let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+
+    let mut result = String::new();
+    if hours > 0 {
+        write!(&mut result, "{}h ", hours).ok();
+    }
+    if minutes > 0 || hours > 0 {
+        write!(&mut result, "{}m ", minutes).ok();
+    }
+    write!(&mut result, "{}s", seconds).ok();
+    result
+}
+
 /// Print the minimal usage help for Phase 0.5.
 fn print_usage() {
     println!("gantry — transparent offload shim for expensive cargo commands");
@@ -175,6 +275,11 @@ fn print_usage() {
     println!("Management CLI commands:");
     println!("  gantry version      Print version information");
     println!("  gantry help         Print this help message");
+    println!("  gantry on           Enable gantry (remove kill switch)");
+    println!("  gantry off          Disable gantry (activate kill switch)");
+    println!("  gantry doctor       Run health checks");
+    println!("  gantry doctor --e2e Run end-to-end canary test");
+    println!("  gantry doctor --drill Run fault-injection fire drill");
     println!();
     println!("Cargo tool profile:");
     println!("  cargo test          Run cargo test (passthrough in Phase 0.5)");
@@ -182,6 +287,7 @@ fn print_usage() {
     println!();
     println!("Environment variables:");
     println!("  GANTRY_LOCAL=1      Force local passthrough (skip remote offload)");
+    println!("  GANTRY_ON=1         Override state file to enable");
 }
 
 #[cfg(test)]
@@ -276,7 +382,7 @@ mod tests {
         // (we can't actually test the exec behavior, but we can verify the logic)
         let subcommand = argv.get(1).map(|s| s.as_str()).unwrap_or("");
         assert!(
-            !cfg.intercepts(subcommand),
+            !cfg.intercepts("cargo", subcommand),
             "build should not be intercepted"
         );
     }
@@ -292,11 +398,11 @@ mod tests {
 
         // "test" IS in the intercept_list
         let subcommand = argv.get(1).map(|s| s.as_str()).unwrap_or("");
-        let is_intercepted = cfg.intercepts(subcommand);
+        let is_intercepted = cfg.intercepts("cargo", subcommand);
         assert!(is_intercepted, "test should be intercepted");
 
         // The logic in run_cargo_profile is:
-        // if force_local || !cfg.intercepts(subcommand) { passthrough }
+        // if force_local || !cfg.intercepts("cargo", subcommand) { passthrough }
         // So when force_local is true, we should passthrough even if intercepted
         // This is a compile-time test of the logic structure
         let should_passthrough = force_local || !is_intercepted;
@@ -318,13 +424,13 @@ mod tests {
         let force_local = env::var("GANTRY_LOCAL").is_ok();
 
         // "test" is intercepted
-        assert!(cfg.intercepts(subcommand));
+        assert!(cfg.intercepts("cargo", subcommand));
 
         // Without GANTRY_LOCAL, the condition is:
-        // force_local || !cfg.intercepts(subcommand)
+        // force_local || !cfg.intercepts("cargo", subcommand)
         // which is: false || !true = false
         // So we should NOT passthrough
-        let should_passthrough = force_local || !cfg.intercepts(subcommand);
+        let should_passthrough = force_local || !cfg.intercepts("cargo", subcommand);
         assert!(
             !should_passthrough,
             "Intercepted 'test' without GANTRY_LOCAL should not passthrough"
@@ -336,14 +442,14 @@ mod tests {
         let cfg = config::Config::hardcoded();
 
         // "test" is in the intercept_list
-        assert!(cfg.intercepts("test"));
+        assert!(cfg.intercepts("cargo", "test"));
 
         // Other subcommands are not
-        assert!(!cfg.intercepts("build"));
-        assert!(!cfg.intercepts("check"));
-        assert!(!cfg.intercepts("run"));
-        assert!(!cfg.intercepts("doc"));
-        assert!(!cfg.intercepts("version"));
+        assert!(!cfg.intercepts("cargo", "build"));
+        assert!(!cfg.intercepts("cargo", "check"));
+        assert!(!cfg.intercepts("cargo", "run"));
+        assert!(!cfg.intercepts("cargo", "doc"));
+        assert!(!cfg.intercepts("cargo", "version"));
     }
 
     #[test]
@@ -351,7 +457,7 @@ mod tests {
         let cfg = config::Config::hardcoded();
 
         // Empty or absent subcommand is never intercepted
-        assert!(!cfg.intercepts(""));
+        assert!(!cfg.intercepts("cargo", ""));
     }
 
     #[test]

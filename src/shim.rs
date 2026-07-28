@@ -75,10 +75,9 @@ pub fn invocation_name(argv: &[String]) -> String {
 /// binary deleted mid-run, `/proc` unavailable on Linux); the failure surfaces
 /// as a human-readable `Err` rather than a panic or `unwrap`. On success the
 /// parent directory is returned — a directory path, never the binary file.
-//
-// Held private by design (the bead scope says "private helper"): only
-// resolve_real_binary is meant to call it.
-fn shim_dir() -> Result<std::path::PathBuf, String> {
+///
+/// Public for doctor checks (bf-2u0).
+pub fn shim_dir() -> Result<std::path::PathBuf, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("gantry cannot locate its own binary: {e}"))?;
     // `parent()` is None only for a path with no directory component (a bare

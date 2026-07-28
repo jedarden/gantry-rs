@@ -1,7 +1,9 @@
 pub mod backend;
 pub mod config;
 pub mod decision;
+pub mod doctor;
 pub mod gate;
 pub mod refs;
 pub mod runlog;
 pub mod shim;
+pub mod state;

@@ -17,6 +17,7 @@ use crate::runlog::{
     Decision as RunLogDecision, Durations, GateInputs, IntentRecord, RanLocation, RunLog,
     VerdictRecord,
 };
+use crate::state;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Run the decision pipeline for an intercepted subcommand.
@@ -49,6 +50,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// This guarantees that SIGKILL mid-run leaves an orphaned intent that doctor
 /// can report (INV-1), making silently-skipped runs structurally detectable.
 pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -> i32 {
+    // Check kill switches (gantry off state file, GANTRY_ON=0)
+    let (enabled, source) = state::check_enabled();
+    if !enabled {
+        eprintln!("[gantry] kill switch active: {}", source);
+        eprintln!("[gantry] decision: local execution (kill switch)");
+        // Would fall back to local execution here, but for now return 1
+        return 1;
+    }
+
     // Open the runlog (creates state directory if needed)
     // Per EC-08, if runlog cannot be opened, proceed with in-memory records only
     let runlog = match RunLog::open() {
@@ -72,11 +82,11 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     let gate_inputs = GateInputs {
         worktree: crate::gate::is_inside_work_tree().unwrap_or(false),
         head: crate::gate::head_resolves().unwrap_or(false),
-        remote: crate::gate::remote_exists(&config.ci_remote).unwrap_or(false),
+        remote: crate::gate::remote_exists(&config.remote.ci_remote).unwrap_or(false),
         clean: crate::gate::is_tree_clean().unwrap_or(false),
     };
 
-    let eligibility = crate::gate::check_git_gate(&config.ci_remote);
+    let eligibility = crate::gate::check_git_gate(&config.remote.ci_remote);
     let gate_duration_ms = gate_start.elapsed().as_millis() as u64;
 
     if !eligibility.eligible {

@@ -499,6 +499,14 @@ impl Config {
         self.tools.get(tool).and_then(|t| t.real_binary.as_ref())
     }
 
+    /// Try to get the real binary override for `tool`, returning a Result.
+    ///
+    /// This is a convenience method for doctor to get the override or None
+    /// without needing to handle Option<&PathBuf> lifetime issues.
+    pub fn try_get_real_binary(&self) -> Result<Option<std::path::PathBuf>, String> {
+        Ok(self.real_binary("cargo").cloned())
+    }
+
     /// Get the remote-run deadline as a Duration.
     pub fn deadline(&self) -> Duration {
         Duration::from_secs(self.remote.deadline_minutes * 60)
