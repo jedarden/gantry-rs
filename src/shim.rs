@@ -319,7 +319,7 @@ pub fn resolve_real_binary(cfg: &crate::config::Config) -> Result<std::path::Pat
     //    2. Otherwise: exclude gantry's own binary dir so the lookup cannot
     //       re-resolve `cargo` to the gantry shim's directory, then walk the
     //       surviving PATH entries left-to-right for `cargo`.
-    let resolved = match &cfg.real_binary {
+    let resolved = match cfg.real_binary("cargo") {
         Some(path) => path.clone(),
         None => {
             let shim = shim_dir()?;
@@ -857,7 +857,7 @@ mod tests {
         let target = dir.path().join("cargo");
         std::fs::write(&target, b"#!/bin/sh\nexit 0\n").expect("write distinct fixture");
         let mut cfg = Config::hardcoded();
-        cfg.real_binary = Some(target.clone());
+        cfg.tools.get_mut("cargo").unwrap().real_binary = Some(target.clone());
         let resolved = with_path("", || resolve_real_binary(&cfg));
         assert_eq!(
             resolved,
@@ -876,7 +876,7 @@ mod tests {
         // test is the test binary; pointing the override at it canonicalizes to
         // self, so the guard fires. Cross-platform: no symlink is needed.
         let mut cfg = Config::hardcoded();
-        cfg.real_binary =
+        cfg.tools.get_mut("cargo").unwrap().real_binary =
             Some(std::env::current_exe().expect("current_exe resolves under cargo test"));
         let err = resolve_real_binary(&cfg)
             .expect_err("an override equal to the gantry binary must be refused");
@@ -894,7 +894,7 @@ mod tests {
         // than hand back an uncanonicalizable path a later exec might resolve to
         // self. Cross-platform: canonicalize of a missing path fails everywhere.
         let mut cfg = Config::hardcoded();
-        cfg.real_binary = Some(std::path::PathBuf::from(
+        cfg.tools.get_mut("cargo").unwrap().real_binary = Some(std::path::PathBuf::from(
             "/nonexistent/gantry-missing-real-cargo",
         ));
         let err = resolve_real_binary(&cfg)
@@ -918,7 +918,7 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe resolves under cargo test");
         std::os::unix::fs::symlink(&exe, &link).expect("create symlink fixture");
         let mut cfg = Config::hardcoded();
-        cfg.real_binary = Some(link);
+        cfg.tools.get_mut("cargo").unwrap().real_binary = Some(link);
         let err = resolve_real_binary(&cfg)
             .expect_err("an override that symlinks to the gantry binary must be refused");
         assert!(
@@ -1019,7 +1019,7 @@ mod tests {
         let dir = TempDir::new("passthrough-ok");
         let script = touch_executable(dir.path(), "cargo");
         let mut cfg = Config::hardcoded();
-        cfg.real_binary = Some(script);
+        cfg.tools.get_mut("cargo").unwrap().real_binary = Some(script);
         let argv = vec!["cargo".to_string()];
         assert_eq!(
             passthrough(&cfg, &argv),
@@ -1041,7 +1041,7 @@ mod tests {
         let dir = TempDir::new("passthrough-exit42");
         let script = touch_executable_body(dir.path(), "cargo", b"#!/bin/sh\nexit 42\n");
         let mut cfg = Config::hardcoded();
-        cfg.real_binary = Some(script);
+        cfg.tools.get_mut("cargo").unwrap().real_binary = Some(script);
         let argv = vec!["cargo".to_string()];
         assert_eq!(
             passthrough(&cfg, &argv),
@@ -1062,7 +1062,7 @@ mod tests {
         let dir = TempDir::new("passthrough-exit1");
         let script = touch_executable_body(dir.path(), "cargo", b"#!/bin/sh\nexit 1\n");
         let mut cfg = Config::hardcoded();
-        cfg.real_binary = Some(script);
+        cfg.tools.get_mut("cargo").unwrap().real_binary = Some(script);
         let argv = vec!["cargo".to_string()];
         assert_ne!(
             passthrough(&cfg, &argv),
@@ -1090,7 +1090,7 @@ mod tests {
         let dir = TempDir::new("passthrough-sigterm");
         let script = touch_executable_body(dir.path(), "cargo", b"#!/bin/sh\nkill -TERM $$\n");
         let mut cfg = Config::hardcoded();
-        cfg.real_binary = Some(script);
+        cfg.tools.get_mut("cargo").unwrap().real_binary = Some(script);
         let argv = vec!["cargo".to_string()];
         assert_eq!(
             passthrough(&cfg, &argv),
@@ -1128,7 +1128,7 @@ mod tests {
         );
         let script = touch_executable_body(dir.path(), "cargo", body.as_bytes());
         let mut cfg = Config::hardcoded();
-        cfg.real_binary = Some(script); // override → re-exec guard passes (script ≠ gantry binary)
+        cfg.tools.get_mut("cargo").unwrap().real_binary = Some(script); // override → re-exec guard passes (script ≠ gantry binary)
 
         // Pathological argv[1..] (EC-06): a plain baseline, an arg with spaces,
         // the plan's exact Phase-1a acceptance literal `weird: [args]`, a battery
@@ -1239,7 +1239,7 @@ mod tests {
         // compares `current_exe()` to itself), so this mirrors the
         // cross-platform sibling rather than the Unix-gated spawn happy path.
         let mut cfg = Config::hardcoded();
-        cfg.real_binary =
+        cfg.tools.get_mut("cargo").unwrap().real_binary =
             Some(std::env::current_exe().expect("current_exe resolves under cargo test"));
         let argv = vec!["cargo".to_string(), "--list".to_string()];
         assert_eq!(
