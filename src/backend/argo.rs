@@ -385,6 +385,7 @@ impl RemoteBackend for ArgoBackend {
     ///
     /// Polls kubectl get workflow status.phase until terminal or deadline.
     /// Reads verdict.json from outputs.parameters if available.
+    /// Attributions gate failures to "[gantry] gate:" in output.
     fn wait(
         &self,
         h: &crate::backend::RunHandle,
@@ -419,7 +420,14 @@ impl RemoteBackend for ArgoBackend {
                                 if param.name == "verdict" {
                                     if let Some(value) = param.value {
                                         match VerdictJson::parse(&value) {
-                                            Ok(vj) => return Ok(vj.to_verdict()),
+                                            Ok(vj) => {
+                                                let verdict = vj.to_verdict();
+                                                // Attributions for gate failures
+                                                if verdict == Verdict::GateFailure {
+                                                    eprintln!("[gantry] gate: quality gate failed");
+                                                }
+                                                return Ok(verdict);
+                                            }
                                             Err(e) => {
                                                 // Fall back to exit code if verdict.json parsing fails
                                                 eprintln!(
@@ -624,5 +632,148 @@ mod tests {
             description,
             "https://argo.example.com/workflows/my-namespace/test-workflow-abc123"
         );
+    }
+
+    #[test]
+    fn test_verdict_json_parse_gate_failure() {
+        let json = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": false,
+            "failure_class": "gate-failure"
+        }"#;
+
+        let vj = VerdictJson::parse(json).unwrap();
+        assert_eq!(vj.to_verdict(), Verdict::GateFailure);
+    }
+
+    #[test]
+    fn test_verdict_json_gate_failure_with_tests_passed() {
+        // Scenario: tests passed (exit 0) but clippy gate failed (overall exit 1)
+        // The verdict.json explicitly indicates gate failure
+        let json = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": false,
+            "failure_class": "gate-failure"
+        }"#;
+
+        let vj = VerdictJson::parse(json).unwrap();
+        let verdict = vj.to_verdict();
+
+        assert_eq!(verdict, Verdict::GateFailure);
+        // Verify gate failure never triggers local fallback (infra-only)
+        assert!(!verdict.is_infra_failure());
+        // Verify gate failure is considered a test result (tests ran)
+        assert!(verdict.has_test_result());
+    }
+
+    #[test]
+    fn test_verdict_json_test_failure_vs_gate_failure() {
+        // Test failure: no failure_class, exit 1, phase Failed
+        let test_json = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": false
+        }"#;
+
+        let test_vj = VerdictJson::parse(test_json).unwrap();
+        assert_eq!(test_vj.to_verdict(), Verdict::TestFailure);
+
+        // Gate failure: explicit failure_class
+        let gate_json = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": false,
+            "failure_class": "gate-failure"
+        }"#;
+
+        let gate_vj = VerdictJson::parse(gate_json).unwrap();
+        assert_eq!(gate_vj.to_verdict(), Verdict::GateFailure);
+    }
+
+    #[test]
+    fn test_verdict_json_gate_failure_not_infra_failure() {
+        // Gate failures should NOT trigger local fallback
+        let json = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": false,
+            "failure_class": "gate-failure"
+        }"#;
+
+        let vj = VerdictJson::parse(json).unwrap();
+        let verdict = vj.to_verdict();
+
+        assert_eq!(verdict, Verdict::GateFailure);
+        assert_eq!(verdict.to_exit_code(), 1); // Same exit code as test failure
+        assert!(!verdict.is_infra_failure()); // Does NOT trigger local fallback
+    }
+
+    #[test]
+    fn test_verdict_full_ladder_coverage() {
+        // Test all four main verdict variants from verdict.json
+
+        // Pass
+        let pass_json = r#"{
+            "schema_version": 1,
+            "phase": "Succeeded",
+            "exit_code": 0,
+            "oom": false,
+            "deadline_exceeded": false
+        }"#;
+        assert_eq!(VerdictJson::parse(pass_json).unwrap().to_verdict(), Verdict::Pass);
+
+        // TestFailure
+        let test_json = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": false,
+            "failure_class": "test-failure"
+        }"#;
+        assert_eq!(VerdictJson::parse(test_json).unwrap().to_verdict(), Verdict::TestFailure);
+
+        // GateFailure
+        let gate_json = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": false,
+            "failure_class": "gate-failure"
+        }"#;
+        assert_eq!(VerdictJson::parse(gate_json).unwrap().to_verdict(), Verdict::GateFailure);
+
+        // InfraFailure (OOM)
+        let oom_json = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": true,
+            "deadline_exceeded": false
+        }"#;
+        assert_eq!(VerdictJson::parse(oom_json).unwrap().to_verdict(), Verdict::InfraFailure);
+
+        // InfraFailure (deadline)
+        let deadline_json = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": true
+        }"#;
+        assert_eq!(VerdictJson::parse(deadline_json).unwrap().to_verdict(), Verdict::InfraFailure);
     }
 }

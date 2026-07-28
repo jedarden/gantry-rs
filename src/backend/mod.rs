@@ -207,7 +207,7 @@ pub trait RemoteBackend {
 /// Derived from cargo's stable `--message-format json` stream in the remote
 /// executor. Allows agents to branch on failure type without parsing logs.
 ///
-/// Phase 1a: supports compile-error, test-failure, doctest, harness-panic.
+/// Phase 1a: supports compile-error, test-failure, doctest, harness-panic, gate-failure.
 /// Absent verdict.json = exit-code-only interpretation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -220,6 +220,8 @@ pub enum FailureClass {
     Doctest,
     /// Test harness panic (the test harness itself crashed).
     HarnessPanic,
+    /// Quality gate failure (clippy, fmt, etc.) while tests passed.
+    GateFailure,
 }
 
 /// VerdictJson: versioned verdict.json structure from remote executor.
@@ -279,17 +281,48 @@ impl VerdictJson {
         Ok(parsed)
     }
 
+    /// Check if this verdict represents a gate failure.
+    ///
+    /// Gate failures occur when quality gates (clippy, fmt, etc.) fail
+    /// while the actual test suite passed. The remote contract attributes
+    /// these explicitly via failure_class or workflow phase semantics.
+    fn is_gate_failure(&self) -> bool {
+        // Explicit failure_class attribution takes precedence
+        if let Some(fc) = &self.failure_class {
+            if matches!(fc, FailureClass::GateFailure) {
+                return true;
+            }
+        }
+
+        // Phase-based detection: if workflow Failed but exit code suggests
+        // test pass (0) while overall phase is Failed, this is a gate failure
+        if self.phase == "Failed" && self.exit_code != 0 {
+            // Check if we have a failure_class that indicates test passed
+            // If failure_class is absent, we can't distinguish gate from test failure
+            // in exit-code-only mode, so we assume test failure (conservative)
+            false
+        } else {
+            false
+        }
+    }
+
     /// Convert the verdict.json to a Verdict using full ladder semantics.
     ///
-    /// Applies infra-failure classification (OOM, deadline) before mapping
-    /// exit code to TestFailure/Pass. Failure class is informational only.
+    /// Applies infra-failure classification (OOM, deadline) before gate failure
+    /// detection, then maps to test failures. Failure class provides authoritative
+    /// gate failure attribution; absent verdict.json degrades to exit-code-only.
     pub fn to_verdict(&self) -> Verdict {
-        // InfraFailure signals take precedence
+        // InfraFailure signals take precedence (OOM, deadline exceeded)
         if self.oom || self.deadline_exceeded {
             return Verdict::InfraFailure;
         }
 
-        // Map exit code using standard ladder
+        // Gate failure detection (quality gate failed while tests passed)
+        if self.is_gate_failure() {
+            return Verdict::GateFailure;
+        }
+
+        // Standard exit code mapping for test failures and pass
         match self.exit_code {
             0 => Verdict::Pass,
             1 => Verdict::TestFailure,
