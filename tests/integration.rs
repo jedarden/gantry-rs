@@ -126,7 +126,7 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
     // Verify ref invariants:
     // 1. No branch refs (refs/heads/*) should exist before or after
     // 2. Only refs/gantry/* refs should be created/modified
-    let before_stdout = String::from_utf8_lossy(&before_refs.stdout);
+    let _before_stdout = String::from_utf8_lossy(&before_refs.stdout);
     let after_stdout = String::from_utf8_lossy(&after_refs.stdout);
 
     // Parse refs after the run
@@ -137,7 +137,11 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        assert_eq!(parts.len(), 2, "Each ls-remote line should have 2 parts: commit and ref");
+        assert_eq!(
+            parts.len(),
+            2,
+            "Each ls-remote line should have 2 parts: commit and ref"
+        );
 
         let ref_name = parts[1];
 

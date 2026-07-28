@@ -55,10 +55,7 @@ fn get_repo_url() -> String {
 ///
 /// Returns "HEAD" if git rev-parse fails.
 fn get_current_sha() -> String {
-    match Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-    {
+    match Command::new("git").args(["rev-parse", "HEAD"]).output() {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
@@ -125,7 +122,11 @@ fn run_cargo_profile(argv: &[String]) -> ExitCode {
 
         let exit_code = decision::run_remote(&cfg, &repo_url, &sha, args);
         // Convert i32 to u8 for ExitCode (clamp to 0-255 range)
-        let exit_code_u8 = if exit_code < 0 { 0 } else { (exit_code & 0xFF) as u8 };
+        let exit_code_u8 = if exit_code < 0 {
+            0
+        } else {
+            (exit_code & 0xFF) as u8
+        };
         ExitCode::from(exit_code_u8)
     }
 }
