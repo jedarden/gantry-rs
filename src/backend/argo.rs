@@ -732,7 +732,10 @@ mod tests {
             "oom": false,
             "deadline_exceeded": false
         }"#;
-        assert_eq!(VerdictJson::parse(pass_json).unwrap().to_verdict(), Verdict::Pass);
+        assert_eq!(
+            VerdictJson::parse(pass_json).unwrap().to_verdict(),
+            Verdict::Pass
+        );
 
         // TestFailure
         let test_json = r#"{
@@ -743,7 +746,10 @@ mod tests {
             "deadline_exceeded": false,
             "failure_class": "test-failure"
         }"#;
-        assert_eq!(VerdictJson::parse(test_json).unwrap().to_verdict(), Verdict::TestFailure);
+        assert_eq!(
+            VerdictJson::parse(test_json).unwrap().to_verdict(),
+            Verdict::TestFailure
+        );
 
         // GateFailure
         let gate_json = r#"{
@@ -754,7 +760,10 @@ mod tests {
             "deadline_exceeded": false,
             "failure_class": "gate-failure"
         }"#;
-        assert_eq!(VerdictJson::parse(gate_json).unwrap().to_verdict(), Verdict::GateFailure);
+        assert_eq!(
+            VerdictJson::parse(gate_json).unwrap().to_verdict(),
+            Verdict::GateFailure
+        );
 
         // InfraFailure (OOM)
         let oom_json = r#"{
@@ -764,7 +773,10 @@ mod tests {
             "oom": true,
             "deadline_exceeded": false
         }"#;
-        assert_eq!(VerdictJson::parse(oom_json).unwrap().to_verdict(), Verdict::InfraFailure);
+        assert_eq!(
+            VerdictJson::parse(oom_json).unwrap().to_verdict(),
+            Verdict::InfraFailure
+        );
 
         // InfraFailure (deadline)
         let deadline_json = r#"{
@@ -774,6 +786,9 @@ mod tests {
             "oom": false,
             "deadline_exceeded": true
         }"#;
-        assert_eq!(VerdictJson::parse(deadline_json).unwrap().to_verdict(), Verdict::InfraFailure);
+        assert_eq!(
+            VerdictJson::parse(deadline_json).unwrap().to_verdict(),
+            Verdict::InfraFailure
+        );
     }
 }

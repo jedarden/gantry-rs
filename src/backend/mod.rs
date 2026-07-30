@@ -353,7 +353,14 @@ pub struct RunSpec {
 
 impl RunSpec {
     /// Create a new RunSpec.
-    pub fn new(tool: &str, subcommand: &str, args: Vec<String>, repo_url: &str, sha: &str, cwd_rel: &str) -> Self {
+    pub fn new(
+        tool: &str,
+        subcommand: &str,
+        args: Vec<String>,
+        repo_url: &str,
+        sha: &str,
+        cwd_rel: &str,
+    ) -> Self {
         RunSpec {
             tool: tool.to_string(),
             subcommand: subcommand.to_string(),
