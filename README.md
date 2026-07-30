@@ -8,13 +8,24 @@ Extraction of a battle-tested in-house pair of bash scripts (`~/.local/bin/cargo
 
 ## Status
 
-**Planning.** No implementation yet — see [`docs/plan/plan.md`](docs/plan/plan.md).
+**Phase 0.5 (walking skeleton) and most of Phase 1a (core loop, hardened) are implemented** — shim dispatch, hardcoded/layered config with last-known-good fallback, GitGate, RunLog (write-ahead run records + orphan detection), doctor core, RefPusher (epoch-ref push), and both the local-command and Argo backends with a full verdict ladder. See [`docs/plan/plan.md`](docs/plan/plan.md) for the phase breakdown and what's still open (Phase 1b onward).
 
 ## Structure
 
 - `docs/notes/` — features, constraints, design decisions, naming rationale
 - `docs/research/` — prior art survey and the in-house implementation this extracts from
 - `docs/plan/plan.md` — complete application plan
+- `src/` — implementation (see plan for module-to-phase mapping)
+- `tests/integration.rs` — end-to-end round-trip tests against the fixtures in `tests/integration/fixtures/`
+
+## Development
+
+Work directly on `main`. This repo does not use per-bead `wip/*` feature branches —
+an earlier phase of the project accumulated ~48 beads' worth of completed work
+scattered across 17 never-merged `wip/<worker>/<bead-id>` branches, which is more
+git-archaeology than a project this size should need. Commit straight to `main`;
+merge commits are fine when real parallel work legitimately diverges, but don't
+open a new long-lived branch as a matter of routine per-bead workflow.
 
 ## Why this exists
 
