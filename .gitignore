@@ -1,1 +1,10 @@
 /target
+
+# tests/integration.rs runs the fixtures below as real, standalone git repos:
+# it `git init`s each one, symlinks the built gantry binary in as `cargo`, and
+# runs `cargo test` through the shim. That leaves runtime artifacts (a nested
+# .git, a `cargo` symlink, a `.git-state/` dir) inside the fixture directories.
+# Never `git add`/`git add -A` those in from the repo root — doing so once
+# already created broken submodule links here (bf-1hgq). Ignore them instead.
+/tests/integration/fixtures/*/cargo
+/tests/integration/fixtures/*/.git-state/
