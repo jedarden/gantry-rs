@@ -10,6 +10,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
+
+/// Serializes the fixture round-trips (see [`run_cargo_test`]).
+static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Path to the gantry binary (built with `cargo build --bin gantry`).
 fn gantry_binary() -> PathBuf {
@@ -38,6 +42,14 @@ fn fixtures_dir() -> PathBuf {
 /// 3. Running the symlinked binary (so argv[0]="cargo")
 /// 4. Capturing exit code, stdout, and stderr
 fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
+    // The fixtures are shared, mutable state: every run re-creates the `cargo`
+    // symlink and re-initializes the git repo in the same directory, so two tests
+    // over one fixture race (an AlreadyExists symlink, a half-built repo). One
+    // lock around the whole round-trip keeps them honest; the runs are fast.
+    let _lock = FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let fixture_path = fixtures_dir().join(fixture_name);
     let gantry = gantry_binary();
 

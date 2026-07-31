@@ -179,10 +179,6 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::Mutex;
-
-    // Serialize tests that change the current directory to avoid interference
-    static DIR_MUTEX: Mutex<()> = Mutex::new(());
 
     // --- filesystem fixtures ------------------------------------------------
     //
@@ -296,7 +292,7 @@ mod tests {
 
     #[test]
     fn happy_repo_passes_all_checks() {
-        let _lock = DIR_MUTEX.lock().unwrap();
+        let _lock = crate::testutil::lock_cwd();
         let (repo_dir, _remote_dir) = setup_happy_repo();
 
         // Change into the repo directory for the check
@@ -322,7 +318,7 @@ mod tests {
 
     #[test]
     fn repo_with_uncommitted_change_fails_clean_tree_check() {
-        let _lock = DIR_MUTEX.lock().unwrap();
+        let _lock = crate::testutil::lock_cwd();
         let (repo_dir, _remote_dir) = setup_happy_repo();
 
         // Change into the repo directory and add an uncommitted change
@@ -351,7 +347,7 @@ mod tests {
 
     #[test]
     fn repo_without_remote_fails_remote_check() {
-        let _lock = DIR_MUTEX.lock().unwrap();
+        let _lock = crate::testutil::lock_cwd();
         let repo_dir = TempDir::new("no-remote");
 
         // Initialize a repo with no remote
@@ -392,7 +388,7 @@ mod tests {
 
     #[test]
     fn repo_with_untracked_file_fails_clean_tree_check() {
-        let _lock = DIR_MUTEX.lock().unwrap();
+        let _lock = crate::testutil::lock_cwd();
         let (repo_dir, _remote_dir) = setup_happy_repo();
 
         // Change into the repo directory and add an untracked file

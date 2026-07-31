@@ -181,10 +181,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
-    use std::sync::Mutex;
-
-    // Serialize tests that change the current directory to avoid interference
-    static DIR_MUTEX: Mutex<()> = Mutex::new(());
 
     // --- filesystem fixtures ------------------------------------------------
 
@@ -292,7 +288,7 @@ mod tests {
 
     #[test]
     fn push_creates_epoch_ref_on_remote() {
-        let _lock = DIR_MUTEX.lock().unwrap();
+        let _lock = crate::testutil::lock_cwd();
         let (repo_dir, remote_dir, sha) = setup_repo_with_remote();
 
         // Change into the repo directory for the push
@@ -337,7 +333,7 @@ mod tests {
 
     #[test]
     fn push_does_not_modify_branch_refs() {
-        let _lock = DIR_MUTEX.lock().unwrap();
+        let _lock = crate::testutil::lock_cwd();
         let (repo_dir, remote_dir, sha) = setup_repo_with_remote();
 
         // Change into the repo directory for the push
@@ -385,7 +381,7 @@ mod tests {
 
     #[test]
     fn push_to_nonexistent_remote_fails() {
-        let _lock = DIR_MUTEX.lock().unwrap();
+        let _lock = crate::testutil::lock_cwd();
         let (repo_dir, _remote_dir, sha) = setup_repo_with_remote();
 
         // Change into the repo directory for the push

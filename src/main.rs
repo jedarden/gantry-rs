@@ -21,6 +21,7 @@ use gantry::decision;
 use gantry::shim;
 
 use std::env;
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 /// The canonical version string printed by the management CLI.
@@ -116,11 +117,14 @@ fn run_cargo_profile(argv: &[String]) -> ExitCode {
     } else {
         // Intercepted subcommand without GANTRY_LOCAL=1. Run the decision pipeline
         // to determine if we should execute remotely and get the verdict.
+        let tool = "cargo";
+        let args = &argv[2..]; // Skip argv[0] (cargo) and argv[1] (subcommand)
         let repo_url = get_repo_url();
         let sha = get_current_sha();
-        let args = &argv[1..]; // Skip argv[0] (cargo)
+        let cwd_rel = PathBuf::from("."); // Current directory relative to repo root
 
-        let exit_code = decision::run_remote(&cfg, &repo_url, &sha, args);
+        let exit_code =
+            decision::run_remote(&cfg, tool, subcommand, args, &repo_url, &sha, cwd_rel);
         // Convert i32 to u8 for ExitCode (clamp to 0-255 range)
         let exit_code_u8 = if exit_code < 0 {
             0

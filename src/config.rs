@@ -31,6 +31,9 @@ pub struct Config {
     /// Wall-clock budget for a single remote run before it is treated as an
     /// InfraFailure (plan failure modes: client deadline exceeded).
     deadline: Duration,
+    /// How many local runs an InfraFailure may degrade into, per invocation
+    /// (DD-4's capped fallback; see [`crate::decision::FallbackPolicy`]).
+    max_local_fallbacks: u32,
 }
 
 impl Config {
@@ -43,6 +46,7 @@ impl Config {
             ci_remote: "origin".to_string(),
             intercept_list: vec!["test".to_string()],
             deadline: Duration::from_secs(40 * 60),
+            max_local_fallbacks: crate::decision::DEFAULT_MAX_LOCAL_FALLBACKS,
         }
     }
 
@@ -58,6 +62,14 @@ impl Config {
     #[allow(dead_code)] // Phase 0.5 skeleton: reserved for Phase 1a
     pub fn deadline(&self) -> Duration {
         self.deadline
+    }
+
+    /// The capped-local-fallback budget an InfraFailure may spend (DD-4, INV-7).
+    ///
+    /// The decision engine reads its budget from here rather than from a literal
+    /// at the call site, so the Phase 1a config layer changes it in one place.
+    pub fn fallback_policy(&self) -> crate::decision::FallbackPolicy {
+        crate::decision::FallbackPolicy::with_cap(self.max_local_fallbacks)
     }
 }
 
