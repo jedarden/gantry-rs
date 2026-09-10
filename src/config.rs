@@ -539,9 +539,15 @@ impl Config {
     }
 
     fn repo_config_path() -> Option<PathBuf> {
+        Self::repo_config_path_in(Path::new("."))
+    }
+
+    /// [`repo_config_path`], searched upward from an explicit start directory
+    /// instead of the process cwd, so tests can exercise the walk against
+    /// fixture trees without mutating the process-wide current directory.
+    fn repo_config_path_in(start: &Path) -> Option<PathBuf> {
         // Find repo root by looking for .git directory.
-        let current = PathBuf::from(".");
-        let mut path = current.canonicalize().ok()?;
+        let mut path = start.canonicalize().ok()?;
 
         loop {
             let git_dir = path.join(".git");
@@ -774,26 +780,29 @@ mod tests {
         fs::create_dir_all(&repo_root).unwrap();
         fs::create_dir(repo_root.join(".git")).unwrap();
 
-        // Change to repo directory.
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&repo_root).unwrap();
-
-        let result = Config::repo_config_path();
+        // Explicit start directory — the process cwd is never touched.
+        let result = Config::repo_config_path_in(&repo_root);
         assert_eq!(result, Some(repo_root.join(".gantry.toml")));
+    }
 
-        std::env::set_current_dir(original).unwrap();
+    #[test]
+    fn repo_config_path_walks_up_from_subdirectory() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().join("test_repo");
+        let nested = repo_root.join("src").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir(repo_root.join(".git")).unwrap();
+
+        let result = Config::repo_config_path_in(&nested);
+        assert_eq!(result, Some(repo_root.join(".gantry.toml")));
     }
 
     #[test]
     fn repo_config_path_returns_none_outside_git() {
         let temp = TempDir::new().unwrap();
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(temp.path()).unwrap();
 
-        let result = Config::repo_config_path();
+        let result = Config::repo_config_path_in(temp.path());
         assert!(result.is_none());
-
-        std::env::set_current_dir(original).unwrap();
     }
 
     #[test]

@@ -221,13 +221,26 @@ impl StateFile {
 ///
 /// Returns (is_enabled, source) where source describes why the decision was made.
 pub fn check_enabled() -> (bool, String) {
+    check_enabled_with(
+        std::env::var("GANTRY_LOCAL").ok(),
+        std::env::var("GANTRY_ON").ok(),
+    )
+}
+
+/// [`check_enabled`] against explicit kill-switch values instead of the process
+/// environment.
+///
+/// Tests call this with `Some`/`None` inputs, so they never mutate (or
+/// serialize behind) the process-wide environment — the same de-globalization
+/// the gate/refs/config modules apply to the current directory.
+fn check_enabled_with(gantry_local: Option<String>, gantry_on: Option<String>) -> (bool, String) {
     // Check GANTRY_LOCAL first (highest priority)
-    if std::env::var("GANTRY_LOCAL").is_ok() {
+    if gantry_local.is_some() {
         return (false, "GANTRY_LOCAL=1".to_string());
     }
 
     // Check GANTRY_ON override
-    if let Ok(val) = std::env::var("GANTRY_ON") {
+    if let Some(val) = gantry_on {
         let enabled = val == "1";
         return (enabled, format!("GANTRY_ON={}", val));
     }
@@ -268,28 +281,38 @@ mod tests {
         assert_eq!(parsed, state);
     }
 
+    // The kill-switch checks below pass explicit values to `check_enabled_with`
+    // instead of `set_var`/`remove_var` on the real environment: test threads
+    // share one process-wide env, so a var set here could flip a sibling
+    // test's verdict mid-run (GANTRY_LOCAL outranks GANTRY_ON, so a racing
+    // GANTRY_LOCAL would break the GANTRY_ON assertions). Same rule as the
+    // cwd: tests never touch process-global state.
+
     #[test]
     fn test_check_enabled_gantry_local() {
-        std::env::set_var("GANTRY_LOCAL", "1");
-        let (enabled, source) = check_enabled();
+        let (enabled, source) = check_enabled_with(Some("1".to_string()), None);
         assert!(!enabled);
         assert_eq!(source, "GANTRY_LOCAL=1");
-        std::env::remove_var("GANTRY_LOCAL");
     }
 
     #[test]
     fn test_check_enabled_gantry_on() {
-        std::env::set_var("GANTRY_ON", "0");
-        let (enabled, source) = check_enabled();
+        let (enabled, source) = check_enabled_with(None, Some("0".to_string()));
         assert!(!enabled);
         assert!(source.contains("GANTRY_ON"));
 
-        std::env::set_var("GANTRY_ON", "1");
-        let (enabled, source) = check_enabled();
+        let (enabled, source) = check_enabled_with(None, Some("1".to_string()));
         assert!(enabled);
         assert!(source.contains("GANTRY_ON"));
+    }
 
-        std::env::remove_var("GANTRY_ON");
+    #[test]
+    fn test_check_enabled_gantry_local_outranks_gantry_on() {
+        // GANTRY_LOCAL is the hard off-switch: it wins even when GANTRY_ON=1
+        // would otherwise enable the shim.
+        let (enabled, source) = check_enabled_with(Some("1".to_string()), Some("1".to_string()));
+        assert!(!enabled);
+        assert_eq!(source, "GANTRY_LOCAL=1");
     }
 
     #[test]

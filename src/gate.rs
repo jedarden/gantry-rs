@@ -50,16 +50,33 @@ impl Eligibility {
     }
 }
 
+/// Run `git <args>` with `dir` as the working directory and capture the output.
+///
+/// Every gate check shells out to system git (no libgit2 — matches predecessor
+/// behavior, honors the user's git config/credentials/hooks). The directory is
+/// always explicit: production callers pass the process cwd (`.`), and tests
+/// pass fixture repo paths so parallel tests never mutate the process-wide
+/// current directory.
+fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git {} failed: {e}", args.join(" ")))
+}
+
 /// Check whether cwd is inside a git work tree.
 ///
 /// Runs `git rev-parse --is-inside-work-tree` and returns true iff the output
 /// is "true". This is the first GitGate check (plan Components §3 "GitGate").
 /// Shells out to system git; never uses libgit2 (predecessor behavior contract).
 pub fn is_inside_work_tree() -> Result<bool, String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map_err(|e| format!("git rev-parse failed: {e}"))?;
+    is_inside_work_tree_in(Path::new("."))
+}
+
+/// [`is_inside_work_tree`], run against an explicit repository directory.
+fn is_inside_work_tree_in(dir: &Path) -> Result<bool, String> {
+    let output = git_output(dir, &["rev-parse", "--is-inside-work-tree"])?;
 
     if !output.status.success() {
         return Err(format!(
@@ -78,10 +95,15 @@ pub fn is_inside_work_tree() -> Result<bool, String> {
 /// for linked worktrees. This is used for JoinTable and memoization keys
 /// so two worktrees of one repo dedup correctly.
 pub fn git_common_dir() -> Result<String, String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .output()
-        .map_err(|e| format!("git rev-parse failed: {e}"))?;
+    git_common_dir_in(Path::new("."))
+}
+
+/// [`git_common_dir`], run against an explicit repository directory.
+///
+/// The raw git output may be repo-relative (`.git` when run at the repo root);
+/// resolve it against `dir` before treating it as a filesystem path.
+fn git_common_dir_in(dir: &Path) -> Result<String, String> {
+    let output = git_output(dir, &["rev-parse", "--git-common-dir"])?;
 
     if !output.status.success() {
         return Err(format!(
@@ -90,7 +112,13 @@ pub fn git_common_dir() -> Result<String, String> {
         ));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let common_path = Path::new(&common_dir);
+    Ok(if common_path.is_absolute() {
+        common_dir
+    } else {
+        dir.join(common_path).to_string_lossy().into_owned()
+    })
 }
 
 /// Check whether HEAD is detached (EC-02).
@@ -99,10 +127,12 @@ pub fn git_common_dir() -> Result<String, String> {
 /// is "HEAD", indicating detached HEAD state. Detached HEAD is eligible for
 /// remote offload (a sha is a sha), but noted in decision output.
 pub fn is_head_detached() -> Result<bool, String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .map_err(|e| format!("git rev-parse failed: {e}"))?;
+    is_head_detached_in(Path::new("."))
+}
+
+/// [`is_head_detached`], run against an explicit repository directory.
+fn is_head_detached_in(dir: &Path) -> Result<bool, String> {
+    let output = git_output(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
 
     if !output.status.success() {
         return Err(format!(
@@ -121,11 +151,13 @@ pub fn is_head_detached() -> Result<bool, String> {
 /// Submodules are not yet supported in the remote contract, so this causes
 /// a local fallback with a clear reason.
 pub fn has_submodules() -> Result<bool, String> {
+    has_submodules_in(Path::new("."))
+}
+
+/// [`has_submodules`], run against an explicit repository directory.
+fn has_submodules_in(dir: &Path) -> Result<bool, String> {
     // First, get the repository root
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .map_err(|e| format!("git rev-parse failed: {e}"))?;
+    let output = git_output(dir, &["rev-parse", "--show-toplevel"])?;
 
     if !output.status.success() {
         return Err(format!(
@@ -146,10 +178,12 @@ pub fn has_submodules() -> Result<bool, String> {
 /// code 0). This catches repos with no commits (HEAD unborn) and other malformed
 /// states. Shells out to system git; never uses libgit2.
 pub fn head_resolves() -> Result<bool, String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD"])
-        .output()
-        .map_err(|e| format!("git rev-parse failed: {e}"))?;
+    head_resolves_in(Path::new("."))
+}
+
+/// [`head_resolves`], run against an explicit repository directory.
+fn head_resolves_in(dir: &Path) -> Result<bool, String> {
+    let output = git_output(dir, &["rev-parse", "--verify", "HEAD"])?;
 
     Ok(output.status.success())
 }
@@ -160,10 +194,12 @@ pub fn head_resolves() -> Result<bool, String> {
 /// The remote name comes from `config.ci_remote` (default: "origin"). Shells out
 /// to system git; never uses libgit2.
 pub fn remote_exists(ci_remote: &str) -> Result<bool, String> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", ci_remote])
-        .output()
-        .map_err(|e| format!("git remote failed: {e}"))?;
+    remote_exists_in(Path::new("."), ci_remote)
+}
+
+/// [`remote_exists`], run against an explicit repository directory.
+fn remote_exists_in(dir: &Path, ci_remote: &str) -> Result<bool, String> {
+    let output = git_output(dir, &["remote", "get-url", ci_remote])?;
 
     Ok(output.status.success())
 }
@@ -175,10 +211,12 @@ pub fn remote_exists(ci_remote: &str) -> Result<bool, String> {
 /// are present (vanilla porcelain mode; Phase 1a adds untracked-file nuance).
 /// Shells out to system git; never uses libgit2.
 pub fn is_tree_clean() -> Result<bool, String> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| format!("git status failed: {e}"))?;
+    is_tree_clean_in(Path::new("."))
+}
+
+/// [`is_tree_clean`], run against an explicit repository directory.
+fn is_tree_clean_in(dir: &Path) -> Result<bool, String> {
+    let output = git_output(dir, &["status", "--porcelain"])?;
 
     if !output.status.success() {
         return Err(format!(
@@ -194,12 +232,11 @@ pub fn is_tree_clean() -> Result<bool, String> {
 /// Check if there are any tracked or untracked changes (detailed version for AS-4).
 ///
 /// Returns a tuple of (has_tracked_changes, has_untracked_files) so we can give
-/// the user precise guidance on what to do next.
-fn tree_clean_details() -> Result<(bool, bool), String> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .map_err(|e| format!("git status failed: {e}"))?;
+/// the user precise guidance on what to do next. Takes the repository directory
+/// explicitly so tests can run gate checks against fixture repos without
+/// mutating the process-wide current directory.
+fn tree_clean_details_in(dir: &Path) -> Result<(bool, bool), String> {
+    let output = git_output(dir, &["status", "--porcelain"])?;
 
     if !output.status.success() {
         return Err(format!(
@@ -255,11 +292,20 @@ fn tree_clean_details() -> Result<(bool, bool), String> {
 /// with the decision engine, RunLog, or any pipeline stage. Integration lands
 /// in later beads.
 pub fn check_git_gate(ci_remote: &str) -> Eligibility {
+    check_git_gate_in(Path::new("."), ci_remote)
+}
+
+/// [`check_git_gate`], run against an explicit repository directory.
+///
+/// Takes the repository directory instead of the process cwd so tests can run
+/// many gate checks concurrently against distinct fixture repos without
+/// mutating (or serializing behind) the process-wide current directory.
+fn check_git_gate_in(dir: &Path, ci_remote: &str) -> Eligibility {
     let gate_start = Instant::now();
 
     // Check 1: inside a work tree. If we're not even in a git repo, nothing
     // else makes sense — fail fast with a clear reason.
-    match is_inside_work_tree() {
+    match is_inside_work_tree_in(dir) {
         Ok(true) => {}
         Ok(false) => {
             return Eligibility::ineligible(
@@ -271,14 +317,14 @@ pub fn check_git_gate(ci_remote: &str) -> Eligibility {
     }
 
     // EC-01: Linked worktree support - detect git-common-dir for JoinTable keys
-    let _common_dir = match git_common_dir() {
+    let _common_dir = match git_common_dir_in(dir) {
         Ok(dir) => dir,
         Err(e) => panic!("GitGate failed to detect git-common-dir: {e}"),
     };
 
     // Check 2: HEAD resolves. Catches repos with no commits (HEAD unborn) and
     // other malformed states.
-    match head_resolves() {
+    match head_resolves_in(dir) {
         Ok(true) => {}
         Ok(false) => {
             return Eligibility::ineligible(
@@ -290,13 +336,13 @@ pub fn check_git_gate(ci_remote: &str) -> Eligibility {
     }
 
     // EC-02: Detached HEAD is eligible (a sha is a sha)
-    let is_detached = match is_head_detached() {
+    let is_detached = match is_head_detached_in(dir) {
         Ok(detached) => detached,
         Err(e) => panic!("GitGate failed to detect detached HEAD: {e}"),
     };
 
     // EC-03: Submodules cause local fallback (remote contract doesn't recurse yet)
-    match has_submodules() {
+    match has_submodules_in(dir) {
         Ok(true) => {
             return Eligibility::ineligible(
                 "repository contains submodules (not yet supported in remote contract)",
@@ -309,7 +355,7 @@ pub fn check_git_gate(ci_remote: &str) -> Eligibility {
 
     // Check 3: configured remote exists. The ci_remote (default "origin") must
     // be configured or we have nowhere to push epoch refs.
-    match remote_exists(ci_remote) {
+    match remote_exists_in(dir, ci_remote) {
         Ok(true) => {}
         Ok(false) => {
             return Eligibility::ineligible(
@@ -324,7 +370,7 @@ pub fn check_git_gate(ci_remote: &str) -> Eligibility {
 
     // Check 4: clean tree with detailed diagnostics (AS-4). Distinguish between
     // tracked changes and untracked files so the user knows exactly what to do.
-    match tree_clean_details() {
+    match tree_clean_details_in(dir) {
         Ok((has_tracked, has_untracked)) => {
             if has_tracked {
                 return Eligibility::ineligible(
@@ -363,10 +409,11 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::Mutex;
 
-    // Serialize tests that change the current directory to avoid interference
-    static DIR_MUTEX: Mutex<()> = Mutex::new(());
+    // Tests never touch the process-wide current directory: every gate entry
+    // point takes the repository directory explicitly (`check_git_gate_in` &
+    // friends), so parallel tests can each target their own fixture repo
+    // without serialization. See parallel_gate_checks_are_hermetic below.
 
     // --- filesystem fixtures ------------------------------------------------
     //
@@ -480,17 +527,9 @@ mod tests {
 
     #[test]
     fn happy_repo_passes_all_checks() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir) = setup_happy_repo();
 
-        // Change into the repo directory for the check
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
-
-        let result = check_git_gate("origin");
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = check_git_gate_in(repo_dir.path(), "origin");
 
         assert!(
             result.eligible,
@@ -515,21 +554,13 @@ mod tests {
 
     #[test]
     fn repo_with_uncommitted_change_fails_clean_tree_check() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir) = setup_happy_repo();
-
-        // Change into the repo directory and add an uncommitted change
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
 
         // Modify a file without committing
         let test_file = repo_dir.path().join("test.txt");
         fs::write(&test_file, "modified content").expect("write modified file");
 
-        let result = check_git_gate("origin");
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = check_git_gate_in(repo_dir.path(), "origin");
 
         assert!(
             !result.eligible,
@@ -549,7 +580,6 @@ mod tests {
 
     #[test]
     fn repo_without_remote_fails_remote_check() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let repo_dir = TempDir::new("no-remote");
 
         // Initialize a repo with no remote
@@ -568,14 +598,7 @@ mod tests {
         git_cmd(repo_dir.path(), &["add", "."]).expect("git add");
         git_cmd(repo_dir.path(), &["commit", "-m", "Initial commit"]).expect("git commit");
 
-        // Change into the repo directory for the check
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
-
-        let result = check_git_gate("origin");
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = check_git_gate_in(repo_dir.path(), "origin");
 
         assert!(
             !result.eligible,
@@ -595,21 +618,13 @@ mod tests {
 
     #[test]
     fn repo_with_untracked_file_fails_clean_tree_check() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir) = setup_happy_repo();
-
-        // Change into the repo directory and add an untracked file
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
 
         // Create an untracked file
         let untracked_file = repo_dir.path().join("untracked.txt");
         fs::write(&untracked_file, "untracked content").expect("write untracked file");
 
-        let result = check_git_gate("origin");
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = check_git_gate_in(repo_dir.path(), "origin");
 
         assert!(
             !result.eligible,
@@ -649,21 +664,13 @@ mod tests {
 
     #[test]
     fn detached_head_is_eligible_ec02() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir) = setup_happy_repo();
-
-        // Change into the repo directory
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
 
         // Detach HEAD: checkout the current commit
         let sha = git_cmd(repo_dir.path(), &["rev-parse", "HEAD"]).expect("get sha");
         git_cmd(repo_dir.path(), &["checkout", &sha]).expect("detach HEAD");
 
-        let result = check_git_gate("origin");
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = check_git_gate_in(repo_dir.path(), "origin");
 
         assert!(
             result.eligible,
@@ -678,12 +685,7 @@ mod tests {
 
     #[test]
     fn repo_with_submodules_fails_ec03() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir) = setup_happy_repo();
-
-        // Change into the repo directory
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
 
         // Create a .gitmodules file
         let gitmodules_path = repo_dir.path().join(".gitmodules");
@@ -693,10 +695,7 @@ mod tests {
         )
         .expect("write .gitmodules");
 
-        let result = check_git_gate("origin");
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = check_git_gate_in(repo_dir.path(), "origin");
 
         assert!(
             !result.eligible,
@@ -716,17 +715,9 @@ mod tests {
 
     #[test]
     fn git_common_dir_returns_valid_path_ec01() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir) = setup_happy_repo();
 
-        // Change into the repo directory
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
-
-        let common_dir = git_common_dir();
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let common_dir = git_common_dir_in(repo_dir.path());
 
         assert!(
             common_dir.is_ok(),
@@ -734,40 +725,125 @@ mod tests {
             common_dir
         );
         let dir = common_dir.unwrap();
+        // git_common_dir_in resolves repo-relative git output against the repo
+        // directory, so the result is usable from any cwd — assert exactly that.
         assert!(
-            Path::new(&dir).exists(),
-            "git_common_dir should return an existing path: {}",
+            Path::new(&dir).is_absolute() && Path::new(&dir).exists(),
+            "git_common_dir should return an existing absolute path: {}",
             dir
         );
     }
 
     #[test]
     fn tree_clean_details_distinguishes_tracked_vs_untracked() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir) = setup_happy_repo();
-
-        // Change into the repo directory
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
+        let repo = repo_dir.path();
 
         // Test clean tree
-        let (tracked, untracked) = tree_clean_details().expect("clean tree check");
+        let (tracked, untracked) = tree_clean_details_in(repo).expect("clean tree check");
         assert!(!tracked && !untracked, "clean tree should have no changes");
 
         // Test with untracked file
-        let untracked_file = repo_dir.path().join("untracked.txt");
+        let untracked_file = repo.join("untracked.txt");
         fs::write(&untracked_file, "untracked").expect("write untracked");
-        let (tracked, untracked) = tree_clean_details().expect("untracked check");
+        let (tracked, untracked) = tree_clean_details_in(repo).expect("untracked check");
         assert!(!tracked && untracked, "should have only untracked files");
 
         // Test with tracked change - remove untracked file first
         fs::remove_file(&untracked_file).expect("remove untracked file");
-        let test_file = repo_dir.path().join("test.txt");
+        let test_file = repo.join("test.txt");
         fs::write(&test_file, "modified").expect("modify tracked file");
-        let (tracked, untracked) = tree_clean_details().expect("tracked check");
+        let (tracked, untracked) = tree_clean_details_in(repo).expect("tracked check");
         assert!(tracked && !untracked, "should have only tracked changes");
+    }
 
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+    /// Regression: gate checks must be runnable concurrently without mutating
+    /// process-wide state (gantry-275ec80c).
+    ///
+    /// These tests once drove `check_git_gate` by `set_current_dir` into a
+    /// fixture repo and restoring afterwards. The cwd is per-process, not
+    /// per-thread, and gate.rs / refs.rs / config.rs each kept their *own*
+    /// mutex around it — so two modules could interleave, one test's saved
+    /// "original" directory could be another test's already-deleted TempDir,
+    /// and the restore would fail (poisoning that module's mutex and
+    /// cascading through every test queued behind it).
+    ///
+    /// The gate now takes the repository directory explicitly, so this test
+    /// runs many gate checks in parallel threads against distinct repos with
+    /// distinct expected verdicts and asserts no cross-talk — safe under the
+    /// default parallel harness by construction, no lock required.
+    #[test]
+    fn parallel_gate_checks_are_hermetic() {
+        // (label, repo, expected eligibility, expected reason fragment)
+        let mut scenarios: Vec<(String, TempDir, bool, &'static str)> = Vec::new();
+
+        let (clean, _) = setup_happy_repo();
+        scenarios.push(("clean".into(), clean, true, ""));
+
+        let (dirty, _) = setup_happy_repo();
+        fs::write(dirty.path().join("test.txt"), "modified").expect("dirty the tree");
+        scenarios.push(("dirty".into(), dirty, false, "tracked"));
+
+        let (untracked, _) = setup_happy_repo();
+        fs::write(untracked.path().join("extra.txt"), "untracked").expect("add untracked file");
+        scenarios.push(("untracked".into(), untracked, false, "untracked"));
+
+        let no_remote = TempDir::new("hermetic-no-remote");
+        git_cmd(no_remote.path(), &["init"]).expect("git init");
+        git_cmd(no_remote.path(), &["config", "user.name", "Test User"]).expect("user.name");
+        git_cmd(
+            no_remote.path(),
+            &["config", "user.email", "test@example.com"],
+        )
+        .expect("user.email");
+        fs::write(no_remote.path().join("test.txt"), "content").expect("seed file");
+        git_cmd(no_remote.path(), &["add", "."]).expect("git add");
+        git_cmd(no_remote.path(), &["commit", "-m", "Initial commit"]).expect("git commit");
+        scenarios.push(("no-remote".into(), no_remote, false, "remote"));
+
+        let (submodules, _) = setup_happy_repo();
+        fs::write(
+            submodules.path().join(".gitmodules"),
+            "[submodule \"example\"]\n    path = lib/example\n    url = https://example.com/example.git",
+        )
+        .expect("write .gitmodules");
+        scenarios.push(("submodules".into(), submodules, false, "submodule"));
+
+        let handles: Vec<_> = scenarios
+            .into_iter()
+            .map(|(label, repo, expected_eligible, expected_fragment)| {
+                std::thread::spawn(move || {
+                    // Repeat each check so threads overlap for the whole test
+                    // rather than racing through a single short pass.
+                    for _ in 0..4 {
+                        let result = check_git_gate_in(repo.path(), "origin");
+                        assert_eq!(
+                            result.eligible, expected_eligible,
+                            "[{label}] verdict leaked across repos: {}",
+                            result.reason
+                        );
+                        assert!(
+                            result.reason.contains(expected_fragment),
+                            "[{label}] expected reason containing {expected_fragment:?}, got: {}",
+                            result.reason
+                        );
+                    }
+                    repo
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("hermetic gate worker panicked");
+        }
+
+        // The process cwd is shared by every test in this binary; whatever ran
+        // concurrently, it must be where it started. (This is the tripwire for
+        // reintroducing the set_current_dir pattern this file gave up.)
+        assert_eq!(
+            std::env::current_dir().expect("current_dir"),
+            crate::testutil::cwd_at_test_start(),
+            "the process cwd moved during the test run"
+        );
     }
 }

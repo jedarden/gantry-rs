@@ -7,3 +7,5 @@ pub mod refs;
 pub mod runlog;
 pub mod shim;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod testutil;

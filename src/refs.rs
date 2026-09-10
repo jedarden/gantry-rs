@@ -10,7 +10,7 @@
 use crate::config::{Config, PushMode};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -156,6 +156,26 @@ impl RefPusher {
     /// `success=false` with a human-readable reason. The `ref_name` field
     /// contains the ref that was (or would have been) created.
     pub fn push(config: &Config, sha: &str, run_id: &str) -> PushResult {
+        // Lease records live in the default state directory; when it cannot be
+        // resolved the push still proceeds (lease + GC are non-fatal extras).
+        let state_dir = dirs::state_dir().map(|d| d.join("gantry"));
+        Self::push_in(config, Path::new("."), state_dir.as_deref(), sha, run_id)
+    }
+
+    /// [`RefPusher::push`] against an explicit repository and state directory.
+    ///
+    /// `repo` is where git runs (production passes the process cwd; tests pass
+    /// fixture repo paths, so parallel tests never mutate the process-wide
+    /// current directory). `state_dir` holds the lease records — `None` skips
+    /// lease bookkeeping and the GC sweep entirely (tests that only exercise
+    /// the push itself pass `None` to stay off the real user state).
+    fn push_in(
+        config: &Config,
+        repo: &Path,
+        state_dir: Option<&Path>,
+        sha: &str,
+        run_id: &str,
+    ) -> PushResult {
         // Generate the epoch prefix: unix seconds (monotonic, time-derived).
         // This is the GC lever (plan §4 "RefPusher").
         let epoch = Self::epoch_now();
@@ -179,23 +199,32 @@ impl RefPusher {
         };
 
         // Run the push: git push <ci_remote> <sha>:<ref_name>
-        match Self::run_git_push(&config.remote.ci_remote, sha, &ref_name) {
+        match Self::run_git_push_in(repo, &config.remote.ci_remote, sha, &ref_name) {
             Ok(_) => {
-                // Push succeeded: create lease record
-                let lease = LeaseRecord::new(
-                    ref_name.clone(),
-                    run_id.to_string(),
-                    DEFAULT_LEASE_DURATION_SECONDS,
-                );
-                if let Err(e) = Self::create_lease(&lease) {
-                    // Non-fatal: log warning but continue
-                    eprintln!("[gantry] warning: failed to create lease record: {e}");
-                }
+                match state_dir {
+                    Some(state_dir) => {
+                        // Push succeeded: create lease record
+                        let lease = LeaseRecord::new(
+                            ref_name.clone(),
+                            run_id.to_string(),
+                            DEFAULT_LEASE_DURATION_SECONDS,
+                        );
+                        if let Err(e) = Self::create_lease_in(state_dir, &lease) {
+                            // Non-fatal: log warning but continue
+                            eprintln!("[gantry] warning: failed to create lease record: {e}");
+                        }
 
-                // Opportunistic sweep of expired+terminal refs (EC-09)
-                if let Err(e) = Self::opportunistic_sweep(config) {
-                    // Non-fatal: log warning but continue
-                    eprintln!("[gantry] warning: GC sweep failed: {e}");
+                        // Opportunistic sweep of expired+terminal refs (EC-09)
+                        if let Err(e) = Self::opportunistic_sweep_in(config, repo, state_dir) {
+                            // Non-fatal: log warning but continue
+                            eprintln!("[gantry] warning: GC sweep failed: {e}");
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "[gantry] warning: no state directory; skipping lease record and GC sweep"
+                        );
+                    }
                 }
 
                 PushResult::success(ref_name)
@@ -209,7 +238,13 @@ impl RefPusher {
     /// Called when a run finishes (pass, fail, gate_failure, etc.). The ref
     /// is kept for the retention window but marked as no longer in-flight.
     pub fn mark_terminal(run_id: &str) -> Result<(), String> {
-        let leases_path = Self::leases_path()?;
+        let state_dir = Self::default_state_dir()?;
+        Self::mark_terminal_in(&state_dir, run_id)
+    }
+
+    /// [`RefPusher::mark_terminal`] against an explicit state directory.
+    fn mark_terminal_in(state_dir: &Path, run_id: &str) -> Result<(), String> {
+        let leases_path = Self::leases_path_in(state_dir);
         let file =
             File::open(&leases_path).map_err(|e| format!("failed to open leases file: {e}"))?;
 
@@ -233,13 +268,13 @@ impl RefPusher {
         }
 
         // Rewrite the leases file with updated records
-        Self::rewrite_leases(&updated_leases)?;
+        Self::rewrite_leases_in(state_dir, &updated_leases)?;
         Ok(())
     }
 
     /// Create a lease record in the state directory.
-    fn create_lease(lease: &LeaseRecord) -> Result<(), String> {
-        let leases_path = Self::leases_path()?;
+    fn create_lease_in(state_dir: &Path, lease: &LeaseRecord) -> Result<(), String> {
+        let leases_path = Self::leases_path_in(state_dir);
 
         // Ensure state directory exists
         if let Some(parent) = leases_path.parent() {
@@ -261,18 +296,21 @@ impl RefPusher {
         Ok(())
     }
 
-    /// Get the path to the leases.jsonl file.
-    fn leases_path() -> Result<PathBuf, String> {
-        let state_dir = dirs::state_dir()
-            .ok_or_else(|| "cannot determine state directory".to_string())?
-            .join("gantry");
+    /// Resolve the default state directory (`~/.local/state/gantry`).
+    fn default_state_dir() -> Result<PathBuf, String> {
+        dirs::state_dir()
+            .map(|p| p.join("gantry"))
+            .ok_or_else(|| "cannot determine state directory".to_string())
+    }
 
-        Ok(state_dir.join("leases.jsonl"))
+    /// Get the path to the leases.jsonl file inside `state_dir`.
+    fn leases_path_in(state_dir: &Path) -> PathBuf {
+        state_dir.join("leases.jsonl")
     }
 
     /// Rewrite the leases file with updated records.
-    fn rewrite_leases(leases: &[LeaseRecord]) -> Result<(), String> {
-        let leases_path = Self::leases_path()?;
+    fn rewrite_leases_in(state_dir: &Path, leases: &[LeaseRecord]) -> Result<(), String> {
+        let leases_path = Self::leases_path_in(state_dir);
         let temp_path = leases_path.with_extension("tmp");
 
         let mut file = File::create(&temp_path)
@@ -304,14 +342,18 @@ impl RefPusher {
     ///
     /// Refs whose epoch is recent (>= sweep_threshold) are never touched,
     /// regardless of lease state. This is the safety guarantee (plan §4).
-    fn opportunistic_sweep(config: &Config) -> Result<(), String> {
+    fn opportunistic_sweep_in(
+        config: &Config,
+        repo: &Path,
+        state_dir: &Path,
+    ) -> Result<(), String> {
         let sweep_threshold = Self::epoch_now() - (DEFAULT_RETENTION_DAYS * 24 * 3600);
 
         // Load all local leases
-        let local_leases = Self::load_local_leases()?;
+        let local_leases = Self::load_local_leases_in(state_dir)?;
 
         // List all refs on the remote
-        let remote_refs = Self::list_remote_refs(&config.remote.ci_remote)?;
+        let remote_refs = Self::list_remote_refs_in(repo, &config.remote.ci_remote)?;
 
         // Find refs to delete: epoch < threshold AND lease expired
         let refs_to_delete: Vec<String> = remote_refs
@@ -337,7 +379,7 @@ impl RefPusher {
 
         // Delete the refs in a single git push call (with :ref syntax)
         for ref_name in refs_to_delete {
-            match Self::delete_remote_ref(&config.remote.ci_remote, &ref_name) {
+            match Self::delete_remote_ref_in(repo, &config.remote.ci_remote, &ref_name) {
                 Ok(_) => {
                     eprintln!("[gantry] gc: deleted expired ref {ref_name}");
                 }
@@ -352,7 +394,13 @@ impl RefPusher {
 
     /// Load all local lease records.
     pub fn load_local_leases() -> Result<Vec<LeaseRecord>, String> {
-        let leases_path = Self::leases_path()?;
+        let state_dir = Self::default_state_dir()?;
+        Self::load_local_leases_in(&state_dir)
+    }
+
+    /// [`RefPusher::load_local_leases`] against an explicit state directory.
+    fn load_local_leases_in(state_dir: &Path) -> Result<Vec<LeaseRecord>, String> {
+        let leases_path = Self::leases_path_in(state_dir);
 
         if !leases_path.exists() {
             return Ok(Vec::new());
@@ -375,8 +423,9 @@ impl RefPusher {
     }
 
     /// List all `refs/gantry/*` refs on the remote via `ls-remote`.
-    fn list_remote_refs(ci_remote: &str) -> Result<Vec<RemoteRef>, String> {
+    fn list_remote_refs_in(repo: &Path, ci_remote: &str) -> Result<Vec<RemoteRef>, String> {
         let output = Command::new("git")
+            .current_dir(repo)
             .args(["ls-remote", ci_remote, "refs/gantry/*"])
             .output()
             .map_err(|e| format!("git ls-remote failed: {e}"))?;
@@ -426,8 +475,9 @@ impl RefPusher {
     }
 
     /// Delete a remote ref via `git push <remote> :<ref_name>`.
-    fn delete_remote_ref(ci_remote: &str, ref_name: &str) -> Result<(), String> {
+    fn delete_remote_ref_in(repo: &Path, ci_remote: &str, ref_name: &str) -> Result<(), String> {
         let output = Command::new("git")
+            .current_dir(repo)
             .args(["push", ci_remote, &format!(":{ref_name}")])
             .output()
             .map_err(|e| format!("git push delete failed: {e}"))?;
@@ -458,6 +508,8 @@ impl RefPusher {
     ///
     /// ## Parameters
     ///
+    /// - `repo`: The directory git runs in (resolves the remote; production
+    ///   passes the process cwd, tests pass fixture repo paths).
     /// - `ci_remote`: The remote name (e.g., "origin").
     /// - `sha`: The commit SHA to push.
     /// - `ref_name`: The fully-qualified ref name (e.g., "refs/gantry/123-abc").
@@ -465,8 +517,14 @@ impl RefPusher {
     /// ## Returns
     ///
     /// Ok(()) if the push succeeded, Err(reason) otherwise.
-    fn run_git_push(ci_remote: &str, sha: &str, ref_name: &str) -> Result<(), String> {
+    fn run_git_push_in(
+        repo: &Path,
+        ci_remote: &str,
+        sha: &str,
+        ref_name: &str,
+    ) -> Result<(), String> {
         let output = Command::new("git")
+            .current_dir(repo)
             .args(["push", ci_remote, &format!("{sha}:{ref_name}")])
             .output()
             .map_err(|e| format!("git push command failed: {e}"))?;
@@ -539,10 +597,11 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
-    use std::sync::Mutex;
 
-    // Serialize tests that change the current directory to avoid interference
-    static DIR_MUTEX: Mutex<()> = Mutex::new(());
+    // Tests never touch the process-wide current directory: pushes run via
+    // `push_in` with an explicit repo path, and lease records go to a per-test
+    // temp state dir instead of the real user state. No serialization needed —
+    // see parallel_pushes_are_hermetic below.
 
     // --- filesystem fixtures ------------------------------------------------
 
@@ -650,19 +709,11 @@ mod tests {
 
     #[test]
     fn push_creates_epoch_ref_on_remote() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, remote_dir, sha) = setup_repo_with_remote();
-
-        // Change into the repo directory for the push
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
 
         let config = Config::hardcoded();
         let run_id = "test-run-123";
-        let result = RefPusher::push(&config, &sha, run_id);
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = RefPusher::push_in(&config, repo_dir.path(), None, &sha, run_id);
 
         assert!(
             result.success,
@@ -696,12 +747,7 @@ mod tests {
 
     #[test]
     fn push_does_not_modify_branch_refs() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, remote_dir, sha) = setup_repo_with_remote();
-
-        // Change into the repo directory for the push
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
 
         // Get ls-remote before push
         let before = Command::new("git")
@@ -714,10 +760,7 @@ mod tests {
         // Run the push
         let config = Config::hardcoded();
         let run_id = "test-run-inv2";
-        let result = RefPusher::push(&config, &sha, run_id);
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = RefPusher::push_in(&config, repo_dir.path(), None, &sha, run_id);
 
         assert!(result.success, "push should succeed");
 
@@ -745,24 +788,25 @@ mod tests {
 
     #[test]
     fn push_creates_lease_record() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir, sha) = setup_repo_with_remote();
-
-        // Change into the repo directory for the push
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
+        let state_dir = TempDir::new("state");
 
         let config = Config::hardcoded();
         let run_id = "test-run-lease-123";
-        let result = RefPusher::push(&config, &sha, run_id);
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = RefPusher::push_in(
+            &config,
+            repo_dir.path(),
+            Some(state_dir.path()),
+            &sha,
+            run_id,
+        );
 
         assert!(result.success, "push should succeed");
 
-        // Verify lease record was created
-        let leases = RefPusher::load_local_leases().expect("failed to load leases");
+        // Verify lease record was created in the test state dir (never the
+        // real user state — see push_in's `state_dir` parameter).
+        let leases =
+            RefPusher::load_local_leases_in(state_dir.path()).expect("failed to load leases");
         let lease = leases.iter().find(|l| l.run_id == run_id);
 
         assert!(lease.is_some(), "lease record should be created");
@@ -774,22 +818,15 @@ mod tests {
 
     #[test]
     fn push_to_nonexistent_remote_fails() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir, sha) = setup_repo_with_remote();
-
-        // Change into the repo directory for the push
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
 
         // Create a config with a nonexistent remote
         let mut config = Config::hardcoded();
         config.remote.ci_remote = "nonexistent-remote".to_string();
 
         let run_id = "test-run-fail-remote";
-        let result = RefPusher::push(&config, &sha, run_id);
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        // The push fails before any lease bookkeeping, so no state dir needed.
+        let result = RefPusher::push_in(&config, repo_dir.path(), None, &sha, run_id);
 
         assert!(!result.success, "push to nonexistent remote should fail");
         assert!(
@@ -855,30 +892,120 @@ mod tests {
 
     #[test]
     fn mark_terminal_marks_lease_as_terminal() {
-        let _lock = DIR_MUTEX.lock().unwrap();
         let (repo_dir, _remote_dir, sha) = setup_repo_with_remote();
-
-        // Change into the repo directory for the push
-        let current_dir = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(repo_dir.path()).expect("set_current_dir");
+        let state_dir = TempDir::new("state");
 
         let config = Config::hardcoded();
         let run_id = "test-run-terminal-123";
-        let result = RefPusher::push(&config, &sha, run_id);
-
-        // Restore the original directory
-        std::env::set_current_dir(current_dir).expect("restore current_dir");
+        let result = RefPusher::push_in(
+            &config,
+            repo_dir.path(),
+            Some(state_dir.path()),
+            &sha,
+            run_id,
+        );
 
         assert!(result.success, "push should succeed");
 
         // Mark as terminal
-        RefPusher::mark_terminal(run_id).expect("mark_terminal should succeed");
+        RefPusher::mark_terminal_in(state_dir.path(), run_id)
+            .expect("mark_terminal should succeed");
 
         // Verify lease is marked terminal
-        let leases = RefPusher::load_local_leases().expect("failed to load leases");
+        let leases =
+            RefPusher::load_local_leases_in(state_dir.path()).expect("failed to load leases");
         let lease = leases.iter().find(|l| l.run_id == run_id);
 
         assert!(lease.is_some(), "lease record should exist");
         assert!(lease.unwrap().terminal, "lease should be marked terminal");
+    }
+
+    /// Regression: pushes must be runnable concurrently without mutating
+    /// process-wide state (gantry-275ec80c).
+    ///
+    /// These tests once drove `RefPusher::push` by `set_current_dir` into a
+    /// fixture repo and restoring afterwards, serialized behind a
+    /// module-local DIR_MUTEX. The cwd is per-process, not per-thread, and
+    /// gate.rs / refs.rs / config.rs each kept their *own* mutex around it —
+    /// so two modules could interleave, one test's saved "original" directory
+    /// could be another test's already-deleted TempDir, and the restore would
+    /// fail (poisoning the mutex and cascading through every test queued
+    /// behind it).
+    ///
+    /// Pushes now take the repo and lease state directories explicitly, so
+    /// this test runs pushes in parallel threads, each against its own repo,
+    /// remote, and lease file, and asserts no cross-talk — safe under the
+    /// default parallel harness by construction, no lock required.
+    #[test]
+    fn parallel_pushes_are_hermetic() {
+        let handles: Vec<_> = (0..4)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    let (repo_dir, remote_dir, sha) = setup_repo_with_remote();
+                    let state_dir = TempDir::new("state");
+                    let config = Config::hardcoded();
+                    let run_id = format!("parallel-run-{worker}");
+
+                    // Repeat each push so threads overlap for the whole test
+                    // rather than racing through a single short pass. The ref
+                    // name is content-addressed (epoch + sha), so repeats are
+                    // idempotent pushes of the same ref.
+                    const ITERATIONS: usize = 4;
+                    for _ in 0..ITERATIONS {
+                        let result = RefPusher::push_in(
+                            &config,
+                            repo_dir.path(),
+                            Some(state_dir.path()),
+                            &sha,
+                            &run_id,
+                        );
+                        assert!(result.success, "[{run_id}] push failed: {}", result.reason);
+
+                        // The ref landed on *this worker's* remote…
+                        let output = Command::new("git")
+                            .args([
+                                "ls-remote",
+                                remote_dir.path().to_str().expect("remote path is utf-8"),
+                            ])
+                            .output()
+                            .expect("git ls-remote failed");
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        assert!(
+                            stdout.contains(&sha) && stdout.contains("refs/gantry/"),
+                            "[{run_id}] ref missing from its own remote, got: {stdout}"
+                        );
+
+                        // …and every lease went to *this worker's* state dir.
+                        let leases =
+                            RefPusher::load_local_leases_in(state_dir.path()).expect("load leases");
+                        assert!(
+                            leases.iter().all(|l| l.run_id == run_id),
+                            "[{run_id}] foreign lease in its state dir: {:?}",
+                            leases.iter().map(|l| &l.run_id).collect::<Vec<_>>()
+                        );
+                    }
+                    let leases =
+                        RefPusher::load_local_leases_in(state_dir.path()).expect("load leases");
+                    assert_eq!(
+                        leases.len(),
+                        ITERATIONS,
+                        "[{run_id}] expected one lease per push"
+                    );
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("hermetic push worker panicked");
+        }
+
+        // The process cwd is shared by every test in this binary; whatever ran
+        // concurrently, it must be where it started. (This is the tripwire for
+        // reintroducing the set_current_dir pattern this file gave up.)
+        assert_eq!(
+            std::env::current_dir().expect("current_dir"),
+            crate::testutil::cwd_at_test_start(),
+            "the process cwd moved during the test run"
+        );
     }
 }

@@ -82,9 +82,34 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
         .output()
         .expect("git remote add failed");
 
-    // Create .gitignore to exclude the state directory (keeps working tree clean for GitGate)
+    // Keep the fixture's working tree clean for GitGate: the inner repo must
+    // ignore both the runtime state directory (.git-state/, holding the bare
+    // remote) and cargo build output (/target — still present from the
+    // previous run on every run after the first, and `git add .` below must
+    // not stage it). The committed fixture .gitignore already lists both, so
+    // only write when a line is missing: an unconditional overwrite here used
+    // to drop /target, dirtiying the source tree on every run and staging the
+    // whole target/ tree into the fixture's commit on the next one.
     let gitignore_path = fixture_path.join(".gitignore");
-    fs::write(&gitignore_path, ".git-state/\n").expect("failed to write .gitignore");
+    let mut lines: Vec<String> = fs::read_to_string(&gitignore_path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect();
+    let mut changed = false;
+    for required in ["/target", ".git-state/"] {
+        if !lines.iter().any(|line| line == required) {
+            lines.push(required.to_string());
+            changed = true;
+        }
+    }
+    if changed {
+        let mut content = lines.join("\n");
+        content.push('\n');
+        fs::write(&gitignore_path, content).expect("failed to write .gitignore");
+    }
 
     // Create an initial commit
     Command::new("git")
