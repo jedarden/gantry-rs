@@ -374,3 +374,97 @@ impl RunSpec {
 
 pub mod argo;
 pub mod command;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every variant of the verdict ladder, so predicate tests can't silently
+    /// miss one when a variant is added later.
+    const ALL_VARIANTS: &[Verdict] = &[
+        Verdict::Pass,
+        Verdict::TestFailure,
+        Verdict::GateFailure,
+        Verdict::InfraFailure,
+        Verdict::Cancelled,
+        Verdict::Superseded,
+    ];
+
+    #[test]
+    fn from_exit_code_follows_documented_ladder() {
+        assert_eq!(Verdict::from_exit_code(0), Verdict::Pass);
+        assert_eq!(Verdict::from_exit_code(1), Verdict::TestFailure);
+        // >= 2 is InfraFailure, including signal-derived negative codes.
+        assert_eq!(Verdict::from_exit_code(2), Verdict::InfraFailure);
+        assert_eq!(Verdict::from_exit_code(3), Verdict::InfraFailure);
+        assert_eq!(Verdict::from_exit_code(127), Verdict::InfraFailure);
+        assert_eq!(Verdict::from_exit_code(-1), Verdict::InfraFailure);
+    }
+
+    #[test]
+    fn to_exit_code_follows_documented_ladder() {
+        assert_eq!(Verdict::Pass.to_exit_code(), 0);
+        assert_eq!(Verdict::TestFailure.to_exit_code(), 1);
+        assert_eq!(Verdict::GateFailure.to_exit_code(), 1);
+        assert_eq!(Verdict::InfraFailure.to_exit_code(), 2);
+        assert_eq!(Verdict::Cancelled.to_exit_code(), 130);
+        assert_eq!(Verdict::Superseded.to_exit_code(), 0);
+    }
+
+    #[test]
+    fn round_trip_preserves_semantics() {
+        // from_exit_code(to_exit_code(v)) preserves semantics where the
+        // exit-code ladder is defined. Superseded deliberately degrades to
+        // Pass (both exit 0); Cancelled lands in the >=2 bucket as
+        // InfraFailure (exit 130).
+        for &v in ALL_VARIANTS {
+            let round = Verdict::from_exit_code(v.to_exit_code());
+            let expected = match v {
+                Verdict::Pass | Verdict::Superseded => Verdict::Pass,
+                Verdict::TestFailure | Verdict::GateFailure => Verdict::TestFailure,
+                Verdict::InfraFailure | Verdict::Cancelled => Verdict::InfraFailure,
+            };
+            assert_eq!(round, expected, "round trip broke semantics for {}", v);
+        }
+    }
+
+    #[test]
+    fn is_infra_failure_true_only_for_infra_failure() {
+        for &v in ALL_VARIANTS {
+            assert_eq!(
+                v.is_infra_failure(),
+                v == Verdict::InfraFailure,
+                "is_infra_failure wrong for {}",
+                v
+            );
+        }
+        assert!(Verdict::InfraFailure.is_infra_failure());
+        assert!(!Verdict::Pass.is_infra_failure());
+        assert!(!Verdict::TestFailure.is_infra_failure());
+        assert!(!Verdict::Cancelled.is_infra_failure());
+    }
+
+    #[test]
+    fn has_test_result_true_exactly_for_run_verdicts() {
+        assert!(Verdict::Pass.has_test_result());
+        assert!(Verdict::TestFailure.has_test_result());
+        assert!(Verdict::GateFailure.has_test_result());
+        assert!(!Verdict::InfraFailure.has_test_result());
+        assert!(!Verdict::Cancelled.has_test_result());
+        assert!(!Verdict::Superseded.has_test_result());
+
+        // Belt-and-suspenders: exactly the three run verdicts, via the list.
+        for &v in ALL_VARIANTS {
+            let expected = matches!(
+                v,
+                Verdict::Pass | Verdict::TestFailure | Verdict::GateFailure
+            );
+            assert_eq!(
+                v.has_test_result(),
+                expected,
+                "has_test_result wrong for {}",
+                v
+            );
+        }
+    }
+}
