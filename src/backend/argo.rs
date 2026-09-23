@@ -915,6 +915,27 @@ mod tests {
         path
     }
 
+    /// Retry a mock-backed call a few times when exec fails with ETXTBSY
+    /// ("Text file busy"). Under the parallel test harness, exec of a
+    /// freshly-written mock can transiently race a still-open write handle
+    /// from another test's fork/exec traffic; the condition clears once every
+    /// straggler handle closes. Production exec paths deliberately do NOT get
+    /// this treatment — they must surface real spawn errors loudly.
+    fn with_exec_retry<T>(
+        mut f: impl FnMut() -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let mut attempt = 0;
+        loop {
+            match f() {
+                Err(e) if attempt < 4 && e.reason.contains("Text file busy") => {
+                    attempt += 1;
+                    thread::sleep(Duration::from_millis(50 * attempt));
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// A kubectl binary that cannot be spawned (nonexistent path) is a loud error.
     #[test]
     fn test_submit_kubectl_spawn_failure_is_error() {
@@ -969,8 +990,7 @@ mod tests {
             "",
         );
 
-        let err = backend
-            .submit(&spec)
+        let err = with_exec_retry(|| backend.submit(&spec))
             .expect_err("submit must fail when kubectl exits non-zero");
         assert!(
             err.reason.contains("workflow submission failed")
@@ -1009,7 +1029,7 @@ mod tests {
             "",
         );
 
-        let handle = backend.submit(&spec).expect("submit must succeed");
+        let handle = with_exec_retry(|| backend.submit(&spec)).expect("submit must succeed");
         assert_eq!(handle.handle, "gantry-abc123");
 
         // The mock received the manifest on stdin: verify the parameter contract.
@@ -1056,8 +1076,7 @@ mod tests {
             "",
         );
 
-        let err = backend
-            .submit(&spec)
+        let err = with_exec_retry(|| backend.submit(&spec))
             .expect_err("submit must fail on unrecognized stdout");
         assert!(
             err.reason.contains("missing workflow name"),
@@ -1115,9 +1134,9 @@ mod tests {
         });
         let handle = RunHandle::new("gantry-abc123");
 
-        let verdict = backend
-            .wait(&handle, Instant::now() + Duration::from_secs(5))
-            .expect("wait must return on terminal phase");
+        let verdict =
+            with_exec_retry(|| backend.wait(&handle, Instant::now() + Duration::from_secs(5)))
+                .expect("wait must return on terminal phase");
         assert_eq!(verdict, Verdict::Pass);
     }
 
@@ -1151,9 +1170,9 @@ mod tests {
         });
         let handle = RunHandle::new("gantry-abc123");
 
-        let verdict = backend
-            .wait(&handle, Instant::now() + Duration::from_secs(30))
-            .expect("wait must survive pending polls");
+        let verdict =
+            with_exec_retry(|| backend.wait(&handle, Instant::now() + Duration::from_secs(30)))
+                .expect("wait must survive pending polls");
         assert_eq!(verdict, Verdict::TestFailure);
     }
 
@@ -1206,9 +1225,9 @@ mod tests {
         });
         let handle = RunHandle::new("gantry-abc123");
 
-        let verdict = backend
-            .wait(&handle, Instant::now() + Duration::from_secs(5))
-            .expect("wait must return on terminal phase");
+        let verdict =
+            with_exec_retry(|| backend.wait(&handle, Instant::now() + Duration::from_secs(5)))
+                .expect("wait must return on terminal phase");
         assert_eq!(verdict, Verdict::InfraFailure);
     }
 
@@ -1237,8 +1256,7 @@ mod tests {
         let handle = RunHandle::new("gantry-abc123");
 
         let mut out: Vec<u8> = Vec::new();
-        backend
-            .stream_logs(&handle, &mut out)
+        with_exec_retry(|| backend.stream_logs(&handle, &mut out))
             .expect("stream_logs must succeed against the mock");
         assert_eq!(
             String::from_utf8_lossy(&out),
@@ -1259,9 +1277,9 @@ mod tests {
         });
         let handle = RunHandle::new("gantry-abc123");
 
-        let err = backend
-            .discover_pod_with_retry(&handle.handle, Duration::ZERO)
-            .expect_err("discovery must give up after the timeout");
+        let err =
+            with_exec_retry(|| backend.discover_pod_with_retry(&handle.handle, Duration::ZERO))
+                .expect_err("discovery must give up after the timeout");
         assert!(
             err.reason.contains("no pod found for workflow"),
             "{}",
