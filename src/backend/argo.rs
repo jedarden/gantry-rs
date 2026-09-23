@@ -15,13 +15,26 @@ use crate::backend::{BackendError, RemoteBackend, RunSpec, Verdict, VerdictJson}
 use std::io::Write;
 use std::process::{Command, Output};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long stream_logs waits for the workflow's pod to exist before giving
+/// up. Log streaming is best-effort (wait() is the authoritative verdict
+/// source), so a workflow that never schedules must not hang the run.
+const POD_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Poll interval while waiting for the workflow's pod to exist.
+const POD_DISCOVERY_POLL: Duration = Duration::from_secs(1);
+/// Poll interval while waiting for the workflow to reach a terminal phase.
+const STATUS_POLL: Duration = Duration::from_secs(2);
 
 /// Argo Workflow manifest structures (serde-based, no string splicing).
 ///
 /// Phase 1a implements minimal Workflow submit spec matching the gantry-verify
-/// template contract: parameters (repo, revision, args_json), generateName,
-/// templateRef, and entrypoint.
+/// template contract: parameters (repo, revision, args-json, builder-image),
+/// generateName, entrypoint, and a workflowTemplateRef to the cluster's
+/// WorkflowTemplate. Workflow-level arguments are merged with the template's
+/// arguments (argo-workflows docs §"Workflow Templates"): names the workflow
+/// supplies take effect; names it omits keep the template's default — which is
+/// how an unconfigured builder-image falls back to the template default.
 mod workflow {
     use serde::{Deserialize, Serialize};
 
@@ -36,6 +49,7 @@ mod workflow {
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
     pub struct Metadata {
         pub generate_name: String,
     }
@@ -44,7 +58,10 @@ mod workflow {
     #[serde(rename_all = "camelCase")]
     pub struct WorkflowSpec {
         pub entrypoint: String,
-        pub templates: Vec<Template>,
+        /// Reference to the cluster's WorkflowTemplate (namespaced by default:
+        /// clusterScope false, same namespace as the workflow).
+        pub workflow_template_ref: WorkflowTemplateRef,
+        #[serde(skip_serializing_if = "Option::is_none")]
         pub arguments: Option<Arguments>,
     }
 
@@ -62,24 +79,28 @@ mod workflow {
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
-    pub struct Template {
+    pub struct WorkflowTemplateRef {
         pub name: String,
-        pub template_ref: Option<TemplateRef>,
-        pub arguments: Option<Arguments>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct TemplateRef {
-        pub name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         pub cluster_scope: Option<bool>,
     }
 
-    /// Workflow status from kubectl get workflow -o json.
+    /// The Workflow object as `kubectl get workflow -o json` returns it.
+    /// Only `status` is read; every other field is ignored. `status` is
+    /// absent entirely until the controller first reconciles the workflow.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct WorkflowObject {
+        pub status: Option<WorkflowStatus>,
+    }
+
+    /// The `status` stanza of a Workflow.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct WorkflowStatus {
-        pub phase: String,
+        /// Terminal phase (Succeeded / Failed / Error); None until the
+        /// controller sets it — an early object may carry a bare status.
+        pub phase: Option<String>,
         pub message: Option<String>,
         pub outputs: Option<Outputs>,
         pub nodes: Option<std::collections::HashMap<String, NodeStatus>>,
@@ -108,20 +129,46 @@ mod workflow {
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct NodeStatus {
-        pub phase: String,
+        pub phase: Option<String>,
         pub message: Option<String>,
         pub outputs: Option<Outputs>,
     }
 
     impl Workflow {
         /// Create a new Workflow manifest for gantry.
+        ///
+        /// Parameters follow the gantry-verify template contract (plan §argo):
+        /// repo, revision, args-json always; builder-image only when configured
+        /// (omitting it lets the WorkflowTemplate default apply).
         pub fn new(
             generate_name: &str,
             template_name: &str,
             repo_url: &str,
             sha: &str,
             args_json: &str,
+            builder_image: Option<&str>,
         ) -> Self {
+            let mut parameters = vec![
+                Parameter {
+                    name: "repo".to_string(),
+                    value: repo_url.to_string(),
+                },
+                Parameter {
+                    name: "revision".to_string(),
+                    value: sha.to_string(),
+                },
+                Parameter {
+                    name: "args-json".to_string(),
+                    value: args_json.to_string(),
+                },
+            ];
+            if let Some(image) = builder_image {
+                parameters.push(Parameter {
+                    name: "builder-image".to_string(),
+                    value: image.to_string(),
+                });
+            }
+
             Workflow {
                 api_version: "argoproj.io/v1alpha1".to_string(),
                 kind: "Workflow".to_string(),
@@ -130,37 +177,21 @@ mod workflow {
                 },
                 spec: WorkflowSpec {
                     entrypoint: "gantry-verify".to_string(),
-                    arguments: Some(Arguments {
-                        parameters: vec![
-                            Parameter {
-                                name: "repo".to_string(),
-                                value: repo_url.to_string(),
-                            },
-                            Parameter {
-                                name: "revision".to_string(),
-                                value: sha.to_string(),
-                            },
-                            Parameter {
-                                name: "args-json".to_string(),
-                                value: args_json.to_string(),
-                            },
-                        ],
-                    }),
-                    templates: vec![Template {
-                        name: "gantry-verify".to_string(),
-                        template_ref: Some(TemplateRef {
-                            name: template_name.to_string(),
-                            cluster_scope: Some(false),
-                        }),
-                        arguments: None,
-                    }],
+                    workflow_template_ref: WorkflowTemplateRef {
+                        name: template_name.to_string(),
+                        // Namespaced: the WorkflowTemplate lives in the same
+                        // namespace as the submitted workflow (k8s default;
+                        // omitted rather than written out as false).
+                        cluster_scope: None,
+                    },
+                    arguments: Some(Arguments { parameters }),
                 },
             }
         }
     }
 }
 
-use workflow::{Workflow, WorkflowStatus};
+use workflow::{Workflow, WorkflowObject};
 
 /// RunHandle for Argo workflows.
 ///
@@ -178,9 +209,13 @@ pub struct ArgoHandle {
 
 /// Argo configuration from config file.
 ///
-/// Phase 1a: minimal config (kubeconfig, namespace, template, generate_name, base_url).
+/// Phase 1a: kubectl path, WorkflowTemplate reference, and submit plumbing
+/// (kubeconfig, namespace, generate_name, builder_image, base_url).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArgoConfig {
+    /// Path to the kubectl binary ("kubectl" = resolve via PATH).
+    /// Configurable so the backend is testable against mock executables.
+    pub kubectl_path: String,
     /// Path to kubeconfig file (empty = use default).
     pub kubeconfig: String,
     /// Kubernetes namespace.
@@ -189,6 +224,11 @@ pub struct ArgoConfig {
     pub template: String,
     /// generateName prefix for submitted workflows.
     pub generate_name: String,
+    /// Builder image passed as the template's `builder-image` parameter.
+    /// None omits the parameter so the WorkflowTemplate default applies
+    /// (an empty override would break the template; Q-4 governs repo-layer
+    /// selection, so user config supplies the trusted value for now).
+    pub builder_image: Option<String>,
     /// Base URL for Argo UI (optional, for describe() to return human-readable URLs).
     pub base_url: Option<String>,
 }
@@ -196,10 +236,12 @@ pub struct ArgoConfig {
 impl Default for ArgoConfig {
     fn default() -> Self {
         ArgoConfig {
+            kubectl_path: "kubectl".to_string(),
             kubeconfig: "".to_string(),
             namespace: "argo-workflows".to_string(),
             template: "gantry-verify".to_string(),
             generate_name: "gantry-".to_string(),
+            builder_image: None,
             base_url: None,
         }
     }
@@ -226,7 +268,7 @@ impl ArgoBackend {
 
     /// Run kubectl with arguments and return output.
     fn kubectl(&self, args: &[&str]) -> Result<Output, BackendError> {
-        let mut cmd = Command::new("kubectl");
+        let mut cmd = Command::new(&self.config.kubectl_path);
 
         // Add kubeconfig flag if set
         if !self.config.kubeconfig.is_empty() {
@@ -241,6 +283,31 @@ impl ArgoBackend {
 
         cmd.output()
             .map_err(|e| BackendError::new(&format!("failed to run kubectl: {}", e)))
+    }
+
+    /// Discover the pod name for a workflow by listing pods, retrying until
+    /// `timeout` elapses. Best-effort streaming must not hang forever on a
+    /// workflow that never schedules, so expiry is a loud error, not a hang.
+    fn discover_pod_with_retry(
+        &self,
+        workflow_name: &str,
+        timeout: Duration,
+    ) -> Result<String, BackendError> {
+        let start = Instant::now();
+        loop {
+            match self.discover_pod(workflow_name)? {
+                Some(pod) => return Ok(pod),
+                None => {
+                    if start.elapsed() >= timeout {
+                        return Err(BackendError::new(&format!(
+                            "no pod found for workflow {} within {:?}",
+                            workflow_name, timeout
+                        )));
+                    }
+                    thread::sleep(POD_DISCOVERY_POLL);
+                }
+            }
+        }
     }
 
     /// Discover the pod name for a workflow by listing pods.
@@ -291,6 +358,7 @@ impl RemoteBackend for ArgoBackend {
             &spec.repo_url,
             &spec.sha,
             &args_json,
+            self.config.builder_image.as_deref(),
         );
 
         // Serialize to JSON
@@ -298,7 +366,7 @@ impl RemoteBackend for ArgoBackend {
             .map_err(|e| BackendError::new(&format!("failed to serialize workflow: {}", e)))?;
 
         // Submit via kubectl create -f -
-        let mut cmd = Command::new("kubectl");
+        let mut cmd = Command::new(&self.config.kubectl_path);
 
         // Add kubeconfig flag if set
         if !self.config.kubeconfig.is_empty() {
@@ -317,11 +385,20 @@ impl RemoteBackend for ArgoBackend {
             .spawn()
             .map_err(|e| BackendError::new(&format!("failed to spawn kubectl: {}", e)))?;
 
-        // Write workflow to stdin
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(workflow_json.as_bytes())
-                .map_err(|e| BackendError::new(&format!("failed to write workflow: {}", e)))?;
+        // Write the manifest to kubectl's stdin. A broken pipe means kubectl
+        // exited before reading it (e.g. the manifest was rejected client-side)
+        // — fall through so wait_with_output surfaces kubectl's stderr as the
+        // real error instead of masking it.
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(workflow_json.as_bytes()) {
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(BackendError::new(&format!(
+                        "failed to write workflow: {}",
+                        e
+                    )));
+                }
+            }
+            // Drop stdin to signal EOF, then wait for kubectl to finish.
         }
 
         // Wait for completion and get output
@@ -336,11 +413,22 @@ impl RemoteBackend for ArgoBackend {
             )));
         }
 
-        // Extract workflow name from stdout
+        // Extract the workflow name from stdout. Real kubectl prints
+        // "workflow.argoproj.io/<generated-name> created" — keep only the
+        // name token, never the status word.
         let stdout = String::from_utf8_lossy(&output.stdout);
         let workflow_name = stdout
             .trim()
             .strip_prefix("workflow.argoproj.io/")
+            .ok_or_else(|| {
+                BackendError::new(&format!(
+                    "kubectl output missing workflow name: {:?}",
+                    stdout.trim()
+                ))
+            })?
+            .split_whitespace()
+            .next()
+            .filter(|name| !name.is_empty())
             .ok_or_else(|| BackendError::new("kubectl output missing workflow name"))?
             .to_string();
 
@@ -358,16 +446,9 @@ impl RemoteBackend for ArgoBackend {
         h: &crate::backend::RunHandle,
         out: &mut dyn Write,
     ) -> Result<(), BackendError> {
-        // Discover pod name
-        let pod_name = loop {
-            match self.discover_pod(&h.handle)? {
-                Some(name) => break name,
-                None => {
-                    thread::sleep(std::time::Duration::from_secs(1));
-                    continue;
-                }
-            }
-        };
+        // Discover the pod name, bounded — a workflow that never schedules
+        // must fail streaming loudly instead of hanging the run.
+        let pod_name = self.discover_pod_with_retry(&h.handle, POD_DISCOVERY_TIMEOUT)?;
 
         // Stream logs from the pod
         let output = self
@@ -401,18 +482,25 @@ impl RemoteBackend for ArgoBackend {
             let output = self.kubectl(&["get", "workflow", &h.handle, "-o", "json"])?;
 
             if !output.status.success() {
-                thread::sleep(std::time::Duration::from_secs(2));
+                thread::sleep(STATUS_POLL);
                 continue;
             }
 
+            // kubectl returns the whole Workflow object; the phase lives in
+            // its `status` stanza, which is absent until the controller first
+            // reconciles the workflow (and may be phase-less right after).
             let json = String::from_utf8_lossy(&output.stdout);
-            let status: WorkflowStatus = serde_json::from_str(&json).map_err(|e| {
+            let obj: WorkflowObject = serde_json::from_str(&json).map_err(|e| {
                 BackendError::new(&format!("failed to parse workflow status: {}", e))
             })?;
+            let Some(status) = obj.status else {
+                thread::sleep(STATUS_POLL);
+                continue;
+            };
 
             // Check if terminal phase
-            match status.phase.as_str() {
-                "Succeeded" | "Failed" | "Error" => {
+            match status.phase.as_deref() {
+                Some("Succeeded" | "Failed" | "Error") => {
                     // Terminal phase - try to read verdict.json
                     if let Some(outputs) = status.outputs {
                         if let Some(parameters) = outputs.parameters {
@@ -443,16 +531,15 @@ impl RemoteBackend for ArgoBackend {
                     }
 
                     // Fall back to phase-based classification
-                    return Ok(match status.phase.as_str() {
-                        "Succeeded" => Verdict::Pass,
-                        "Failed" => Verdict::TestFailure,
-                        "Error" => Verdict::InfraFailure,
+                    return Ok(match status.phase.as_deref() {
+                        Some("Succeeded") => Verdict::Pass,
+                        Some("Failed") => Verdict::TestFailure,
                         _ => Verdict::InfraFailure,
                     });
                 }
                 _ => {
                     // Not terminal - sleep and retry
-                    thread::sleep(std::time::Duration::from_secs(2));
+                    thread::sleep(STATUS_POLL);
                 }
             }
         }
@@ -507,6 +594,7 @@ mod tests {
             "https://github.com/example/repo",
             "abc123",
             r#"["test","--","--nocapture"]"#,
+            Some("rust:1.83"),
         );
 
         let json = serde_json::to_string(&workflow);
@@ -517,12 +605,101 @@ mod tests {
         assert_eq!(parsed.metadata.generate_name, "gantry-");
     }
 
+    /// The serialized manifest must match the expected Kubernetes/YAML structure
+    /// exactly: k8s camelCase key names, the gantry-verify template contract, and
+    /// all four parameters (repo, revision, args-json, builder-image). kubectl
+    /// receives JSON on stdin, and JSON is a YAML subset, so this pins the YAML
+    /// manifest shape too. Object key order is irrelevant to the comparison.
+    #[test]
+    fn test_workflow_manifest_matches_expected_yaml_structure() {
+        let workflow = Workflow::new(
+            "gantry-",
+            "gantry-verify",
+            "https://github.com/example/repo",
+            "abc123",
+            r#"["test","--","--nocapture"]"#,
+            Some("rust:1.83"),
+        );
+
+        let actual: serde_json::Value =
+            serde_json::to_value(&workflow).expect("manifest must serialize");
+
+        let expected = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Workflow",
+            "metadata": {
+                "generateName": "gantry-"
+            },
+            "spec": {
+                "entrypoint": "gantry-verify",
+                "workflowTemplateRef": {
+                    "name": "gantry-verify"
+                },
+                "arguments": {
+                    "parameters": [
+                        { "name": "repo", "value": "https://github.com/example/repo" },
+                        { "name": "revision", "value": "abc123" },
+                        { "name": "args-json", "value": r#"["test","--","--nocapture"]"# },
+                        { "name": "builder-image", "value": "rust:1.83" },
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    /// Unconfigured builder image must omit the parameter entirely, so the
+    /// WorkflowTemplate default applies (an empty-value override would break it).
+    #[test]
+    fn test_workflow_manifest_omits_builder_image_when_unset() {
+        let workflow = Workflow::new(
+            "gantry-",
+            "gantry-verify",
+            "https://github.com/example/repo",
+            "abc123",
+            "[]",
+            None,
+        );
+
+        let actual: serde_json::Value =
+            serde_json::to_value(&workflow).expect("manifest must serialize");
+
+        // The whole manifest must match the three-parameter shape exactly:
+        // no `builder-image` parameter, no `clusterScope` in the template
+        // ref, and no other structural drift.
+        let expected = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Workflow",
+            "metadata": {
+                "generateName": "gantry-"
+            },
+            "spec": {
+                "entrypoint": "gantry-verify",
+                "workflowTemplateRef": {
+                    "name": "gantry-verify"
+                },
+                "arguments": {
+                    "parameters": [
+                        { "name": "repo", "value": "https://github.com/example/repo" },
+                        { "name": "revision", "value": "abc123" },
+                        { "name": "args-json", "value": "[]" },
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn test_argo_config_default() {
         let config = ArgoConfig::default();
+        assert_eq!(config.kubectl_path, "kubectl");
         assert_eq!(config.namespace, "argo-workflows");
         assert_eq!(config.template, "gantry-verify");
         assert_eq!(config.generate_name, "gantry-");
+        assert_eq!(config.builder_image, None);
     }
 
     #[test]
@@ -583,10 +760,12 @@ mod tests {
     #[test]
     fn test_argo_backend_describe_without_base_url() {
         let config = ArgoConfig {
+            kubectl_path: "kubectl".to_string(),
             kubeconfig: "".to_string(),
             namespace: "argo-workflows".to_string(),
             template: "gantry-verify".to_string(),
             generate_name: "gantry-".to_string(),
+            builder_image: None,
             base_url: None,
         };
         let backend = ArgoBackend::new(config);
@@ -599,10 +778,12 @@ mod tests {
     #[test]
     fn test_argo_backend_describe_with_base_url() {
         let config = ArgoConfig {
+            kubectl_path: "kubectl".to_string(),
             kubeconfig: "".to_string(),
             namespace: "argo-workflows".to_string(),
             template: "gantry-verify".to_string(),
             generate_name: "gantry-".to_string(),
+            builder_image: None,
             base_url: Some("https://argo.example.com".to_string()),
         };
         let backend = ArgoBackend::new(config);
@@ -618,10 +799,12 @@ mod tests {
     #[test]
     fn test_argo_backend_describe_with_base_url_trailing_slash() {
         let config = ArgoConfig {
+            kubectl_path: "kubectl".to_string(),
             kubeconfig: "".to_string(),
             namespace: "my-namespace".to_string(),
             template: "gantry-verify".to_string(),
             generate_name: "gantry-".to_string(),
+            builder_image: None,
             base_url: Some("https://argo.example.com/".to_string()),
         };
         let backend = ArgoBackend::new(config);
@@ -718,6 +901,372 @@ mod tests {
         assert_eq!(verdict, Verdict::GateFailure);
         assert_eq!(verdict.to_exit_code(), 1); // Same exit code as test failure
         assert!(!verdict.is_infra_failure()); // Does NOT trigger local fallback
+    }
+
+    /// Write an executable mock kubectl into `dir` and return its path
+    /// (same idiom as tests/command_backend_integration.rs).
+    fn write_mock_kubectl(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("mock-kubectl");
+        fs::write(&path, body).expect("write mock kubectl");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make mock kubectl executable");
+        path
+    }
+
+    /// A kubectl binary that cannot be spawned (nonexistent path) is a loud error.
+    #[test]
+    fn test_submit_kubectl_spawn_failure_is_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: tmp
+                .path()
+                .join("no-such-kubectl")
+                .to_string_lossy()
+                .into_owned(),
+            ..ArgoConfig::default()
+        });
+        let spec = RunSpec::new(
+            "cargo",
+            "test",
+            vec![],
+            "https://github.com/example/repo",
+            "abc123",
+            "",
+        );
+
+        let err = backend
+            .submit(&spec)
+            .expect_err("submit must fail when kubectl cannot spawn");
+        assert!(
+            err.reason.contains("failed to spawn kubectl"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// A failing kubectl surfaces its stderr as the submit error, not a
+    /// masked "failed to write workflow" (the manifest write may hit a
+    /// broken pipe because kubectl exited before reading stdin).
+    #[test]
+    fn test_submit_surfaces_kubectl_stderr_on_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            "#!/usr/bin/env bash\necho 'mock kubectl exploded' >&2\nexit 1\n",
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let spec = RunSpec::new(
+            "cargo",
+            "test",
+            vec![],
+            "https://github.com/example/repo",
+            "abc123",
+            "",
+        );
+
+        let err = backend
+            .submit(&spec)
+            .expect_err("submit must fail when kubectl exits non-zero");
+        assert!(
+            err.reason.contains("workflow submission failed")
+                && err.reason.contains("mock kubectl exploded"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// The happy path: submit pipes the manifest to kubectl's stdin, parses
+    /// `workflow.argoproj.io/<name> created` back out as the bare handle, and
+    /// every template parameter (repo, revision, args-json, builder-image) is
+    /// populated from the RunSpec and config.
+    #[test]
+    fn test_submit_passes_manifest_and_returns_workflow_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stdin_capture = tmp.path().join("stdin.json");
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            &format!(
+                "#!/usr/bin/env bash\ncat > {}\necho 'workflow.argoproj.io/gantry-abc123 created'\n",
+                stdin_capture.display()
+            ),
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            builder_image: Some("rust:1.83".to_string()),
+            ..ArgoConfig::default()
+        });
+        let spec = RunSpec::new(
+            "cargo",
+            "test",
+            vec!["--nocapture".to_string()],
+            "https://github.com/example/repo",
+            "abc123",
+            "",
+        );
+
+        let handle = backend.submit(&spec).expect("submit must succeed");
+        assert_eq!(handle.handle, "gantry-abc123");
+
+        // The mock received the manifest on stdin: verify the parameter contract.
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&stdin_capture).expect("mock captured stdin"),
+        )
+        .expect("captured manifest must be valid JSON");
+        let params = manifest["spec"]["arguments"]["parameters"]
+            .as_array()
+            .expect("parameters array");
+        let value_of = |name: &str| {
+            params
+                .iter()
+                .find(|p| p["name"] == name)
+                .expect("parameter present")["value"]
+                .as_str()
+                .unwrap()
+        };
+        assert_eq!(value_of("repo"), "https://github.com/example/repo");
+        assert_eq!(value_of("revision"), "abc123");
+        assert_eq!(value_of("args-json"), r#"["--nocapture"]"#);
+        assert_eq!(value_of("builder-image"), "rust:1.83");
+    }
+
+    /// stdout that does not carry the `workflow.argoproj.io/` prefix (e.g. an
+    /// unexpected message) is a loud error, not a garbage handle.
+    #[test]
+    fn test_submit_rejects_stdout_without_workflow_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            "#!/usr/bin/env bash\necho 'error: unrecognized resource'\n",
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let spec = RunSpec::new(
+            "cargo",
+            "test",
+            vec![],
+            "https://github.com/example/repo",
+            "abc123",
+            "",
+        );
+
+        let err = backend
+            .submit(&spec)
+            .expect_err("submit must fail on unrecognized stdout");
+        assert!(
+            err.reason.contains("missing workflow name"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// wait() reads status.phase from the nested `status` stanza of the real
+    /// kubectl Workflow object and prefers the verdict output parameter.
+    #[test]
+    fn test_wait_parses_nested_status_and_verdict_output() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workflow_json = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Workflow",
+            "metadata": {
+                "name": "gantry-abc123",
+                "generateName": "gantry-"
+            },
+            "spec": { "entrypoint": "gantry-verify" },
+            "status": {
+                "phase": "Succeeded",
+                "startedAt": "2026-09-23T17:00:00Z",
+                "finishedAt": "2026-09-23T17:05:00Z",
+                "outputs": {
+                    "parameters": [
+                        {
+                            "name": "verdict",
+                            "value": r#"{"schema_version": 1, "phase": "Succeeded", "exit_code": 0, "oom": false, "deadline_exceeded": false}"#
+                        }
+                    ]
+                },
+                "nodes": {
+                    "gantry-abc123": {
+                        "id": "gantry-abc123",
+                        "name": "gantry-abc123",
+                        "displayName": "gantry-abc123",
+                        "type": "DAG",
+                        "phase": "Succeeded"
+                    }
+                }
+            }
+        });
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            &format!(
+                "#!/usr/bin/env bash\ncat <<'JSON'\n{}\nJSON\n",
+                workflow_json
+            ),
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(5))
+            .expect("wait must return on terminal phase");
+        assert_eq!(verdict, Verdict::Pass);
+    }
+
+    /// A workflow the controller has not reconciled yet has no status stanza
+    /// (or a phase-less one) — that is pending, not a parse error: the next
+    /// poll sees the terminal phase and returns the verdict.
+    #[test]
+    fn test_wait_treats_missing_or_empty_status_as_pending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let counter = tmp.path().join("calls");
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            &format!(
+                "#!/usr/bin/env bash\n\
+                 n=$(($(cat {}) + 1))\n\
+                 echo $n > {}\n\
+                 if [ $n -eq 1 ]; then\n\
+                   echo '{{\"apiVersion\":\"argoproj.io/v1alpha1\",\"kind\":\"Workflow\",\"metadata\":{{\"name\":\"gantry-abc123\"}}}}'\n\
+                 elif [ $n -eq 2 ]; then\n\
+                   echo '{{\"status\":{{}}}}'\n\
+                 else\n\
+                   echo '{{\"status\":{{\"phase\":\"Failed\"}}}}'\n\
+                 fi\n",
+                counter.display(),
+                counter.display()
+            ),
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("wait must survive pending polls");
+        assert_eq!(verdict, Verdict::TestFailure);
+    }
+
+    /// An already-passed deadline errors out immediately — before any kubectl
+    /// call — instead of polling forever.
+    #[test]
+    fn test_wait_deadline_exceeded_is_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(tmp.path(), "#!/usr/bin/env bash\nexit 1\n");
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .wait(&handle, Instant::now() - Duration::from_secs(1))
+            .expect_err("wait must fail once the deadline has passed");
+        assert!(err.reason.contains("deadline"), "{}", err.reason);
+    }
+
+    /// An OOM verdict.json output classifies the run as InfraFailure even
+    /// though the workflow phase is Failed.
+    #[test]
+    fn test_wait_oom_verdict_output_is_infra_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workflow_json = serde_json::json!({
+            "status": {
+                "phase": "Failed",
+                "outputs": {
+                    "parameters": [
+                        {
+                            "name": "verdict",
+                            "value": r#"{"schema_version": 1, "phase": "Failed", "exit_code": 137, "oom": true, "deadline_exceeded": false}"#
+                        }
+                    ]
+                }
+            }
+        });
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            &format!(
+                "#!/usr/bin/env bash\ncat <<'JSON'\n{}\nJSON\n",
+                workflow_json
+            ),
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(5))
+            .expect("wait must return on terminal phase");
+        assert_eq!(verdict, Verdict::InfraFailure);
+    }
+
+    /// stream_logs discovers the workflow's pod and pipes its logs to the
+    /// writer.
+    ///
+    /// The mock dispatches on the whole argv, not $1/$2: ArgoBackend prepends
+    /// the global `-n <namespace>` flag before the subcommand, so positional
+    /// checks never see `get`/`logs` (they see `-n`).
+    #[test]
+    fn test_stream_logs_emits_pod_logs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            "#!/usr/bin/env bash\n\
+             case \" $* \" in\n\
+               *' pods '*) echo '{\"items\":[{\"metadata\":{\"name\":\"gantry-abc123-1234567890\"}}]}' ;;\n\
+               *' logs '*) printf 'running 137 tests\\nall passed\\n' ;;\n\
+               *) exit 1 ;;\n\
+             esac\n",
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let mut out: Vec<u8> = Vec::new();
+        backend
+            .stream_logs(&handle, &mut out)
+            .expect("stream_logs must succeed against the mock");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "running 137 tests\nall passed\n"
+        );
+    }
+
+    /// Pod discovery gives up (loud error) once the timeout expires instead
+    /// of spinning forever on a workflow that never schedules.
+    #[test]
+    fn test_pod_discovery_gives_up_after_timeout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl =
+            write_mock_kubectl(tmp.path(), "#!/usr/bin/env bash\necho '{\"items\":[]}'\n");
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .discover_pod_with_retry(&handle.handle, Duration::ZERO)
+            .expect_err("discovery must give up after the timeout");
+        assert!(
+            err.reason.contains("no pod found for workflow"),
+            "{}",
+            err.reason
+        );
     }
 
     #[test]
