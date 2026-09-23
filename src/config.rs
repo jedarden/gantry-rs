@@ -135,6 +135,8 @@ impl std::fmt::Display for ConfigLayer {
 /// Argo Workflows backend configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArgoConfig {
+    /// Path to the kubectl binary (default: "kubectl", resolved via PATH).
+    pub kubectl_path: String,
     /// Path to kubeconfig (default: "~/.kube/config").
     pub kubeconfig: PathBuf,
     /// Kubernetes namespace.
@@ -143,6 +145,10 @@ pub struct ArgoConfig {
     pub template: String,
     /// Workflow name prefix (default: "gantry-").
     pub generate_name: String,
+    /// Builder image passed as the template's `builder-image` parameter
+    /// (optional; omitted from the manifest when unset so the template
+    /// default applies).
+    pub builder_image: Option<String>,
     /// Base URL for Argo UI (optional, for describe() to return human-readable URLs).
     /// Example: "https://argo-ci.ardenone.com" or "http://localhost:8080"
     pub base_url: Option<String>,
@@ -207,6 +213,8 @@ struct RawRemote {
 
 #[derive(Deserialize, Serialize)]
 struct RawArgo {
+    #[serde(default = "default_kubectl_path")]
+    kubectl_path: String,
     #[serde(default = "default_kubeconfig")]
     kubeconfig: String,
     #[serde(default = "default_namespace")]
@@ -215,6 +223,8 @@ struct RawArgo {
     template: String,
     #[serde(default = "default_generate_name")]
     generate_name: String,
+    #[serde(default)]
+    builder_image: Option<String>,
     #[serde(default)]
     base_url: Option<String>,
 }
@@ -248,6 +258,9 @@ fn default_push_mode() -> String {
 }
 fn default_deadline() -> u64 {
     40
+}
+fn default_kubectl_path() -> String {
+    "kubectl".to_string()
 }
 fn default_kubeconfig() -> String {
     "~/.kube/config".to_string()
@@ -507,10 +520,12 @@ impl GantryConfig {
             // Argo config.
             if let Some(argo) = remote.argo {
                 base.remote.argo = Some(ArgoConfig {
+                    kubectl_path: argo.kubectl_path,
                     kubeconfig: Self::expand_home(&argo.kubeconfig),
                     namespace: argo.namespace,
                     template: argo.template,
                     generate_name: argo.generate_name,
+                    builder_image: argo.builder_image,
                     base_url: argo.base_url,
                 });
             }
@@ -763,10 +778,12 @@ impl GantryConfig {
                 },
                 deadline_minutes: config.remote.deadline_minutes,
                 argo: config.remote.argo.as_ref().map(|a| RawArgo {
+                    kubectl_path: a.kubectl_path.clone(),
                     kubeconfig: a.kubeconfig.to_string_lossy().to_string(),
                     namespace: a.namespace.clone(),
                     template: a.template.clone(),
                     generate_name: a.generate_name.clone(),
+                    builder_image: a.builder_image.clone(),
                     base_url: a.base_url.clone(),
                 }),
                 command: config.remote.command.as_ref().map(|c| RawCommand {
@@ -1042,6 +1059,126 @@ mod tests {
 
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         assert_eq!(cfg, Config::tier_0_defaults());
+    }
+
+    /// The [remote.argo] block deserializes with its documented defaults:
+    /// kubectl resolved via PATH, builder-image omitted so the
+    /// WorkflowTemplate default applies (backend/argo.rs drops the parameter
+    /// from the manifest when it is None).
+    #[test]
+    fn merge_layer_argo_defaults_kubectl_path_and_builder_image() {
+        let mut cfg = Config::tier_0_defaults();
+        let temp = TempDir::new().unwrap();
+        let config = write_test_config(
+            temp.path(),
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            "#,
+        );
+
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
+
+        let argo = cfg.remote.argo.as_ref().expect("argo config present");
+        assert_eq!(argo.kubectl_path, "kubectl");
+        assert_eq!(argo.builder_image, None);
+        assert_eq!(argo.template, "gantry-verify");
+        assert_eq!(argo.generate_name, "gantry-");
+        assert_eq!(argo.base_url, None);
+    }
+
+    /// Explicit kubectl_path and builder_image values flow through the merge
+    /// untouched — these are user-layer (trusted) knobs per S-2.
+    #[test]
+    fn merge_layer_argo_explicit_kubectl_path_and_builder_image() {
+        let mut cfg = Config::tier_0_defaults();
+        let temp = TempDir::new().unwrap();
+        let config = write_test_config(
+            temp.path(),
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            kubectl_path = "/usr/local/bin/kubectl"
+            builder_image = "ronaldraygun/gantry-builder:1.83"
+            base_url = "https://argo-ci.example.com"
+            "#,
+        );
+
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
+
+        let argo = cfg.remote.argo.as_ref().expect("argo config present");
+        assert_eq!(argo.kubectl_path, "/usr/local/bin/kubectl");
+        assert_eq!(
+            argo.builder_image,
+            Some("ronaldraygun/gantry-builder:1.83".to_string())
+        );
+        assert_eq!(
+            argo.base_url,
+            Some("https://argo-ci.example.com".to_string())
+        );
+    }
+
+    /// The last-known-good snapshot path — to_raw, TOML serialize, reparse at
+    /// the Defaults layer — preserves the full [remote.argo] block. A field
+    /// added to RawArgo but missed in to_raw would otherwise drop silently
+    /// from every snapshot persist_lkg writes.
+    #[test]
+    fn argo_config_survives_lkg_snapshot_round_trip() {
+        let mut cfg = Config::tier_0_defaults();
+        let temp = TempDir::new().unwrap();
+        let config = write_test_config(
+            temp.path(),
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            kubectl_path = "/usr/local/bin/kubectl"
+            kubeconfig = "/etc/gantry-test/kubeconfig"
+            namespace = "argo-workflows"
+            template = "gantry-verify"
+            generate_name = "gantry-"
+            builder_image = "ronaldraygun/gantry-builder:1.83"
+            base_url = "https://argo-ci.example.com"
+            "#,
+        );
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+
+        // Exactly what persist_lkg and load_lkg do around the snapshot file.
+        let serialized = toml::to_string_pretty(&Config::to_raw(&cfg)).expect("serialize snapshot");
+        let snapshot_path = temp.path().join("last-known-good.toml");
+        fs::write(&snapshot_path, &serialized).unwrap();
+
+        let mut restored = Config::tier_0_defaults();
+        let mut warnings = Vec::new();
+        Config::merge_layer(
+            &mut restored,
+            &snapshot_path,
+            ConfigLayer::Defaults,
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+
+        let argo = restored.remote.argo.as_ref().expect("argo config restored");
+        assert_eq!(argo.kubectl_path, "/usr/local/bin/kubectl");
+        assert_eq!(
+            argo.builder_image,
+            Some("ronaldraygun/gantry-builder:1.83".to_string())
+        );
+        assert_eq!(
+            restored.remote.argo.as_ref(),
+            cfg.remote.argo.as_ref(),
+            "argo block drifted across the LKG round trip"
+        );
     }
 
     #[test]
