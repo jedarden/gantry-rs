@@ -940,6 +940,110 @@ mod tests {
         assert!(!cfg.intercepts("cargo", "build"));
     }
 
+    /// A zero-byte config file merged at any layer is a no-op: Ok, no
+    /// warnings, and the Tier-0 baseline untouched (bf-2fef acceptance:
+    /// "can parse empty config files").
+    #[test]
+    fn merge_layer_empty_file_is_noop_for_every_layer() {
+        for layer in [ConfigLayer::System, ConfigLayer::User, ConfigLayer::Repo] {
+            let mut cfg = Config::tier_0_defaults();
+            let temp = TempDir::new().unwrap();
+            let config = write_test_config(temp.path(), "");
+            assert_eq!(
+                fs::metadata(&config).unwrap().len(),
+                0,
+                "{layer}: fixture not empty"
+            );
+
+            let mut warnings = Vec::new();
+            Config::merge_layer(&mut cfg, &config, layer, &mut warnings).unwrap();
+
+            assert!(warnings.is_empty(), "{layer}: warnings: {warnings:?}");
+            assert_eq!(cfg, Config::tier_0_defaults(), "{layer}: baseline drifted");
+        }
+    }
+
+    /// A file containing only comments and whitespace parses identically to
+    /// a zero-byte one: Ok, no warnings, Tier-0 baseline untouched.
+    #[test]
+    fn merge_layer_comments_and_whitespace_only_is_noop_for_every_layer() {
+        let content = "\
+# gantry config — commentary only, no keys.
+# Another comment line.
+
+\t
+        # an indented comment
+";
+
+        for layer in [ConfigLayer::System, ConfigLayer::User, ConfigLayer::Repo] {
+            let mut cfg = Config::tier_0_defaults();
+            let temp = TempDir::new().unwrap();
+            let config = write_test_config(temp.path(), content);
+
+            let mut warnings = Vec::new();
+            Config::merge_layer(&mut cfg, &config, layer, &mut warnings).unwrap();
+
+            assert!(warnings.is_empty(), "{layer}: warnings: {warnings:?}");
+            assert_eq!(cfg, Config::tier_0_defaults(), "{layer}: baseline drifted");
+        }
+    }
+
+    /// An empty `[tool.<name>]` section — table header present, no keys —
+    /// parses to the cargo-default intercept behavior: `["test"]` with no
+    /// real_binary override, and no warnings.
+    #[test]
+    fn merge_layer_empty_tool_section_gets_cargo_default_intercept() {
+        let mut cfg = Config::tier_0_defaults();
+        let temp = TempDir::new().unwrap();
+        let config = write_test_config(
+            temp.path(),
+            r#"
+            [tool.cargo]
+
+            [tool.nextest]
+            "#,
+        );
+
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::Repo, &mut warnings).unwrap();
+
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert!(cfg.intercepts("cargo", "test"));
+        assert!(cfg.intercepts("nextest", "test"));
+        assert!(!cfg.intercepts("cargo", "build"));
+
+        let expected = ToolConfig {
+            intercept: vec!["test".to_string()],
+            real_binary: None,
+        };
+        assert_eq!(cfg.tools.get("cargo"), Some(&expected));
+        assert_eq!(cfg.tools.get("nextest"), Some(&expected));
+    }
+
+    /// A repo whose `.gantry.toml` is empty resolves through the upward walk
+    /// and would load without error: merging the resolved path at the repo
+    /// layer is Ok, warning-free, and leaves the Tier-0 baseline.
+    #[test]
+    fn repo_config_path_resolves_empty_gantry_toml_and_loads_clean() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().join("empty_repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::create_dir(repo_root.join(".git")).unwrap();
+        let gantry_toml = repo_root.join(".gantry.toml");
+        fs::write(&gantry_toml, "").unwrap();
+
+        let resolved = Config::repo_config_path_in(&repo_root).expect("repo config path");
+        assert_eq!(resolved, gantry_toml);
+        assert_eq!(fs::metadata(&resolved).unwrap().len(), 0);
+
+        let mut cfg = Config::tier_0_defaults();
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &resolved, ConfigLayer::Repo, &mut warnings).unwrap();
+
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(cfg, Config::tier_0_defaults());
+    }
+
     #[test]
     fn trust_boundary_blocks_repo_ci_remote() {
         let mut cfg = Config::tier_0_defaults();
