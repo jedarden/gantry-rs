@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// Repo layer has restrictions per security consideration S-2: it cannot
 /// set `ci_remote`, `push_mode`, or command-template backends.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Config {
+pub struct GantryConfig {
     /// Local execution caps (plan §6 LocalExecutor).
     pub local: LocalConfig,
     /// Tool-specific interception rules (plan §1 Shim & dispatcher).
@@ -36,6 +36,10 @@ pub struct Config {
     /// Remote backend configuration (plan §2 DecisionEngine).
     pub remote: RemoteConfig,
 }
+
+/// Back-compat alias: this struct shipped as `Config`; the canonical name is
+/// [`GantryConfig`], matching the plan and bead naming.
+pub type Config = GantryConfig;
 
 /// Local execution resource limits.
 #[derive(Clone, Debug, PartialEq)]
@@ -285,7 +289,7 @@ pub struct BrokenBanner {
 /// Result type that includes warnings for unknown keys.
 #[derive(Clone, Debug)]
 pub struct ConfigLoadResult {
-    pub config: Config,
+    pub config: GantryConfig,
     pub warnings: Vec<String>,
     pub broken_banner: Option<BrokenBanner>,
 }
@@ -294,7 +298,7 @@ pub struct ConfigLoadResult {
 // Public API
 // ============================================================================
 
-impl Config {
+impl GantryConfig {
     /// Load configuration from all three layers with Tier-0 defaults.
     ///
     /// Layer precedence (later layers override earlier ones):
@@ -347,7 +351,7 @@ impl Config {
     /// This is the behavior when no config file exists or when the system
     /// has no valid config at all. Gantry becomes a pure local cap-wrapper.
     fn tier_0_defaults() -> Self {
-        Config {
+        GantryConfig {
             local: LocalConfig {
                 cpu_quota_pct: 200,
                 memory_max: "6G".to_string(),
@@ -422,7 +426,7 @@ impl Config {
     /// ci_remote, push_mode, and command backend cannot be modified from
     /// the repo config.
     fn merge_layer(
-        base: &mut Config,
+        base: &mut GantryConfig,
         path: &Path,
         layer: ConfigLayer,
         warnings: &mut Vec<String>,
@@ -630,7 +634,7 @@ impl Config {
     }
 
     /// Persist the current config as the last-known-good snapshot.
-    fn persist_lkg(config: &Config) -> Result<(), String> {
+    fn persist_lkg(config: &GantryConfig) -> Result<(), String> {
         let state_dir = Self::state_dir()?;
         fs::create_dir_all(&state_dir).map_err(|e| format!("failed to create state dir: {}", e))?;
 
@@ -666,7 +670,7 @@ impl Config {
     fn load_lkg(
         warnings: &mut Vec<String>,
         broken_banner: &mut Option<BrokenBanner>,
-    ) -> Result<Config, String> {
+    ) -> Result<GantryConfig, String> {
         let lkg_path = Self::lkg_path()?;
         let meta_path = Self::lkg_meta_path()?;
         let marker_path = Self::broken_marker_path()?;
@@ -723,7 +727,7 @@ impl Config {
     }
 
     /// Convert Config to RawConfig for serialization.
-    fn to_raw(config: &Config) -> RawConfig {
+    fn to_raw(config: &GantryConfig) -> RawConfig {
         RawConfig {
             local: Some(RawLocal {
                 cpu_quota_pct: config.local.cpu_quota_pct,
