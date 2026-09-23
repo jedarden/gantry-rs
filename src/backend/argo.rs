@@ -692,14 +692,18 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// Every field of the Default impl is asserted: a new field added to
+    /// ArgoConfig must land here too, or the default drifts silently.
     #[test]
     fn test_argo_config_default() {
         let config = ArgoConfig::default();
         assert_eq!(config.kubectl_path, "kubectl");
+        assert_eq!(config.kubeconfig, ""); // empty = cluster default
         assert_eq!(config.namespace, "argo-workflows");
         assert_eq!(config.template, "gantry-verify");
         assert_eq!(config.generate_name, "gantry-");
-        assert_eq!(config.builder_image, None);
+        assert_eq!(config.builder_image, None); // omit the parameter
+        assert_eq!(config.base_url, None);
     }
 
     #[test]
