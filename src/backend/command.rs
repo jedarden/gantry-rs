@@ -413,6 +413,80 @@ esac
         );
     }
 
+    // --- placeholder substitution (bf-3rer) ---
+
+    #[test]
+    fn substitute_replaces_all_four_placeholders() {
+        let argv = vec![
+            "ci".to_string(),
+            "submit".to_string(),
+            "{repo}".to_string(),
+            "{rev}".to_string(),
+            "{args_json}".to_string(),
+            "{handle}".to_string(),
+        ];
+        let out = substitute_placeholders(&argv, "file:///r", "abc123", "[\"test\"]", Some("h-1"));
+        assert_eq!(
+            out,
+            vec!["ci", "submit", "file:///r", "abc123", "[\"test\"]", "h-1"]
+        );
+    }
+
+    #[test]
+    fn substitute_embedded_placeholder_inside_larger_arg() {
+        let argv = vec!["--repo={repo}".to_string(), "rev:{rev}:head".to_string()];
+        let out = substitute_placeholders(&argv, "file:///r", "abc123", "", None);
+        assert_eq!(out, vec!["--repo=file:///r", "rev:abc123:head"]);
+    }
+
+    #[test]
+    fn substitute_repeated_placeholder_in_one_arg() {
+        let argv = vec!["{rev}..{rev}".to_string()];
+        let out = substitute_placeholders(&argv, "", "abc123", "", None);
+        assert_eq!(out, vec!["abc123..abc123"]);
+    }
+
+    #[test]
+    fn substitute_without_placeholders_leaves_argv_unchanged() {
+        let argv = vec!["ci".to_string(), "--flag".to_string(), "value".to_string()];
+        let out = substitute_placeholders(&argv, "r", "v", "a", Some("h"));
+        assert_eq!(out, argv);
+    }
+
+    #[test]
+    fn substitute_leaves_handle_literal_when_handle_absent() {
+        // submit has no handle yet: {handle} must stay literal rather than
+        // being silently dropped or replaced with an empty string.
+        let argv = vec![
+            "ci".to_string(),
+            "{handle}".to_string(),
+            "x{handle}y".to_string(),
+        ];
+        let out = substitute_placeholders(&argv, "r", "v", "a", None);
+        assert_eq!(out, vec!["ci", "{handle}", "x{handle}y"]);
+    }
+
+    #[test]
+    fn substitute_unknown_placeholder_left_alone() {
+        let argv = vec!["{unknown}".to_string(), "{repo}".to_string()];
+        let out = substitute_placeholders(&argv, "r", "v", "a", Some("h"));
+        assert_eq!(out, vec!["{unknown}", "r"]);
+    }
+
+    #[test]
+    fn substitute_empty_argv_yields_empty() {
+        assert!(substitute_placeholders(&[], "r", "v", "a", Some("h")).is_empty());
+    }
+
+    #[test]
+    fn substitute_args_json_with_spaces_stays_single_element() {
+        // argv-level substitution (S-4): the JSON blob is ONE argument even
+        // though it contains spaces — no shell re-splitting happens.
+        let argv = vec!["{args_json}".to_string()];
+        let out = substitute_placeholders(&argv, "r", "v", "[\"test\", \"--nocapture\"]", None);
+        assert_eq!(out, vec!["[\"test\", \"--nocapture\"]"]);
+    }
+
     #[test]
     fn test_format_args_json_simple() {
         let args = vec![
