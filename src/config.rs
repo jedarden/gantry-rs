@@ -97,6 +97,37 @@ pub enum PushMode {
     Branch,
 }
 
+/// Configuration layer, in precedence order (later layers override earlier).
+///
+/// Serde representation is the lowercase layer name ("system", "user",
+/// "repo", "defaults") so it round-trips through TOML and JSON config
+/// metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigLayer {
+    /// System config: `/etc/gantry/config.toml`.
+    System,
+    /// User config: `~/.config/gantry/config.toml`.
+    User,
+    /// Repo config: `.gantry.toml` (trust boundary S-2 applies).
+    Repo,
+    /// Built-in Tier-0 defaults (no file); also the provenance recorded for
+    /// merged last-known-good snapshots.
+    Defaults,
+}
+
+impl std::fmt::Display for ConfigLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            ConfigLayer::System => "system",
+            ConfigLayer::User => "user",
+            ConfigLayer::Repo => "repo",
+            ConfigLayer::Defaults => "defaults",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Argo Workflows backend configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArgoConfig {
@@ -238,8 +269,8 @@ struct LkgMetadata {
     schema_version: u32,
     /// When this snapshot was created.
     created_at: u64,
-    /// Source layer that provided this config ("system", "user", "repo", "defaults").
-    source: String,
+    /// Source layer that provided this config.
+    source: ConfigLayer,
 }
 
 /// Escalating banner state for broken configuration.
@@ -359,21 +390,26 @@ impl Config {
         // Layer 1: System config (/etc/gantry/config.toml)
         if let Ok(system_path) = Self::system_config_path() {
             if system_path.exists() {
-                Self::merge_layer(&mut base_config, &system_path, "system", false, warnings)?;
+                Self::merge_layer(
+                    &mut base_config,
+                    &system_path,
+                    ConfigLayer::System,
+                    warnings,
+                )?;
             }
         }
 
         // Layer 2: User config (~/.config/gantry/config.toml)
         if let Ok(user_path) = Self::user_config_path() {
             if user_path.exists() {
-                Self::merge_layer(&mut base_config, &user_path, "user", false, warnings)?;
+                Self::merge_layer(&mut base_config, &user_path, ConfigLayer::User, warnings)?;
             }
         }
 
         // Layer 3: Repo config (.gantry.toml) - WITH TRUST BOUNDARY
         if let Some(repo_path) = Self::repo_config_path() {
             if repo_path.exists() {
-                Self::merge_layer(&mut base_config, &repo_path, "repo", true, warnings)?;
+                Self::merge_layer(&mut base_config, &repo_path, ConfigLayer::Repo, warnings)?;
             }
         }
 
@@ -382,15 +418,16 @@ impl Config {
 
     /// Merge a single config layer into the base config.
     ///
-    /// If `repo_layer` is true, enforces trust boundary: ci_remote, push_mode,
-    /// and command backend cannot be modified from the repo config.
+    /// If `layer` is [`ConfigLayer::Repo`], enforces trust boundary:
+    /// ci_remote, push_mode, and command backend cannot be modified from
+    /// the repo config.
     fn merge_layer(
         base: &mut Config,
         path: &Path,
-        layer: &str,
-        repo_layer: bool,
+        layer: ConfigLayer,
         warnings: &mut Vec<String>,
     ) -> Result<(), String> {
+        let repo_layer = layer == ConfigLayer::Repo;
         let content =
             fs::read_to_string(path).map_err(|e| format!("{}: failed to read: {}", layer, e))?;
 
@@ -613,7 +650,9 @@ impl Config {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            source: "merged".to_string(),
+            // The snapshot is the merged product of all layers, not the
+            // product of any single file layer.
+            source: ConfigLayer::Defaults,
         };
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| format!("failed to serialize metadata: {}", e))?;
@@ -675,9 +714,10 @@ impl Config {
         let _snapshot_content = fs::read_to_string(&lkg_path)
             .map_err(|e| format!("failed to read LKG snapshot: {}", e))?;
 
-        // Parse using merge_layer with no trust boundary.
+        // Parse using merge_layer with no trust boundary: the snapshot was
+        // written by gantry itself, not supplied by the repo layer.
         let mut config = Self::tier_0_defaults();
-        Self::merge_layer(&mut config, &lkg_path, "lkg_snapshot", false, warnings)?;
+        Self::merge_layer(&mut config, &lkg_path, ConfigLayer::Defaults, warnings)?;
 
         Ok(config)
     }
@@ -763,6 +803,57 @@ mod tests {
         assert!(cfg.intercepts("cargo", "test"));
     }
 
+    /// Wrapper so ConfigLayer can be exercised through real toml/JSON
+    /// documents rather than just the serializer's raw string output.
+    #[derive(Deserialize, Serialize)]
+    struct ConfigLayerWrapper {
+        layer: ConfigLayer,
+    }
+
+    #[test]
+    fn config_layer_serde_round_trips_all_variants() {
+        let layers = [
+            (ConfigLayer::System, "system"),
+            (ConfigLayer::User, "user"),
+            (ConfigLayer::Repo, "repo"),
+            (ConfigLayer::Defaults, "defaults"),
+        ];
+
+        for (layer, name) in layers {
+            // JSON string form, both directions.
+            assert_eq!(
+                serde_json::to_string(&layer).unwrap(),
+                format!("\"{name}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ConfigLayer>(&format!("\"{name}\"")).unwrap(),
+                layer
+            );
+
+            // TOML string form, both directions.
+            let wrapper = ConfigLayerWrapper { layer };
+            assert_eq!(
+                toml::to_string(&wrapper).unwrap(),
+                format!("layer = \"{name}\"\n")
+            );
+            let parsed: ConfigLayerWrapper =
+                toml::from_str(&format!("layer = \"{name}\"")).unwrap();
+            assert_eq!(parsed.layer, layer);
+        }
+
+        // Distinct variants compare distinctly (PartialEq/Eq semantics).
+        assert_ne!(ConfigLayer::System, ConfigLayer::Repo);
+        assert_ne!(ConfigLayer::User, ConfigLayer::Defaults);
+    }
+
+    #[test]
+    fn config_layer_display_matches_serde_form() {
+        assert_eq!(ConfigLayer::System.to_string(), "system");
+        assert_eq!(ConfigLayer::User.to_string(), "user");
+        assert_eq!(ConfigLayer::Repo.to_string(), "repo");
+        assert_eq!(ConfigLayer::Defaults.to_string(), "defaults");
+    }
+
     #[test]
     fn config_expands_tilde_in_paths() {
         assert_eq!(
@@ -819,7 +910,7 @@ mod tests {
         );
 
         let mut warnings = Vec::new();
-        Config::merge_layer(&mut cfg, &config, "test", false, &mut warnings).unwrap();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
 
         assert_eq!(cfg.local.cpu_quota_pct, 150);
         assert_eq!(cfg.local.memory_max, "12G");
@@ -838,7 +929,7 @@ mod tests {
         );
 
         let mut warnings = Vec::new();
-        Config::merge_layer(&mut cfg, &config, "test", false, &mut warnings).unwrap();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
 
         assert!(cfg.intercepts("cargo", "test"));
         assert!(cfg.intercepts("cargo", "check"));
@@ -858,7 +949,7 @@ mod tests {
         );
 
         let mut warnings = Vec::new();
-        Config::merge_layer(&mut cfg, &config, "test", true, &mut warnings).unwrap();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::Repo, &mut warnings).unwrap();
 
         // Repo layer cannot change ci_remote.
         assert_eq!(cfg.remote.ci_remote, "origin");
@@ -877,7 +968,7 @@ mod tests {
         );
 
         let mut warnings = Vec::new();
-        Config::merge_layer(&mut cfg, &config, "test", true, &mut warnings).unwrap();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::Repo, &mut warnings).unwrap();
 
         // Repo layer cannot change push_mode.
         assert_eq!(cfg.remote.push_mode, PushMode::Ref);
@@ -898,7 +989,7 @@ mod tests {
         );
 
         let mut warnings = Vec::new();
-        let result = Config::merge_layer(&mut cfg, &config, "test", true, &mut warnings);
+        let result = Config::merge_layer(&mut cfg, &config, ConfigLayer::Repo, &mut warnings);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("trust boundary"));
@@ -922,7 +1013,7 @@ mod tests {
         );
 
         let mut warnings = Vec::new();
-        Config::merge_layer(&mut cfg, &config, "test", false, &mut warnings).unwrap();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
 
         assert_eq!(cfg.remote.backend, Backend::Command);
         assert!(cfg.remote.command.is_some());
@@ -941,7 +1032,7 @@ mod tests {
         );
 
         let mut warnings = Vec::new();
-        Config::merge_layer(&mut cfg, &config, "test", false, &mut warnings).unwrap();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
 
         assert_eq!(cfg.remote.backend, Backend::None);
         assert!(warnings.iter().any(|w| w.contains("unknown backend")));
