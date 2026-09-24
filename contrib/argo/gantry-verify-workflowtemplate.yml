@@ -1,0 +1,80 @@
+# gantry-verify — reference WorkflowTemplate for the gantry Argo backend.
+#
+# This is the genericized rust-verify contract from docs/plan/plan.md (§"argo"):
+# gantry submits a Workflow whose parameters bind to the four inputs below and
+# whose entrypoint is `gantry-verify`. The backend (src/backend/argo.rs) reads
+# the run verdict from the `verdict` output parameter, which carries this
+# template's verdict.json (schema documented in src/backend/mod.rs, VerdictJson).
+#
+# Remote contract: the remote executes exactly the argv the caller typed. v1
+# intercepts `cargo test` only, so the step runs `cargo test` + args-json.
+# Quality gates (clippy/fmt) are NOT run here — opt-in gates are a later phase.
+#
+# Builder image requirements: git and jq alongside the Rust toolchain. The
+# pinned default below is the stock Rust image; override `builder-image` with
+# an image that includes git + jq (never a moving tag). sccache is optional:
+# mount credentials and export SCCACHE_* env vars via an executor-level patch
+# or a derived template — this reference keeps it out to stay credential-free.
+#
+# Install: kubectl apply -f this file in the cluster's Argo Workflows
+# namespace (namespaced, matching the backend's workflowTemplateRef — the
+# submitted Workflow must target the same namespace for the reference to
+# resolve).
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: gantry-verify
+  namespace: argo-workflows
+spec:
+  entrypoint: gantry-verify
+  arguments:
+    parameters:
+      - name: repo
+      - name: revision
+      - name: args-json
+        value: "[]"
+      - name: builder-image
+        value: rust:1.83
+  templates:
+    - name: gantry-verify
+      inputs:
+        parameters:
+          - name: repo
+          - name: revision
+          - name: args-json
+          - name: builder-image
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              path: /tmp/gantry-verdict/verdict.json
+      container:
+        image: "{{inputs.parameters.builder-image}}"
+        command: [bash, -c]
+        workingDir: /workspace
+        args:
+          - |
+            set -euo pipefail
+            mkdir -p /tmp/gantry-verdict
+            verdict_file=/tmp/gantry-verdict/verdict.json
+
+            git init -q /workspace
+            git -C /workspace remote add origin "{{inputs.parameters.repo}}"
+            git -C /workspace fetch -q --depth=1 origin "{{inputs.parameters.revision}}"
+            git -C /workspace checkout -q FETCH_HEAD
+
+            # Parse args-json into the argv the caller typed (jq required).
+            mapfile -t args < <(printf '%s' '{{inputs.parameters.args-json}}' | jq -r '.[]')
+
+            exit_code=0
+            cargo test "${args[@]}" || exit_code=$?
+
+            # OOM (SIGKILL -> 137) and other signals classify as InfraFailure
+            # through VerdictJson.to_verdict's exit-code ladder.
+            phase=Succeeded
+            [ "$exit_code" -eq 0 ] || phase=Failed
+            cat > "$verdict_file" <<EOF
+            {"schema_version": 1, "phase": "$phase", "exit_code": $exit_code,
+             "oom": false, "deadline_exceeded": false}
+            EOF
+            exit "$exit_code"
