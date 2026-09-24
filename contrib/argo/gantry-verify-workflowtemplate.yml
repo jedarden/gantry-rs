@@ -4,7 +4,12 @@
 # gantry submits a Workflow whose parameters bind to the four inputs below and
 # whose entrypoint is `gantry-verify`. The backend (src/backend/argo.rs) reads
 # the run verdict from the `verdict` output parameter, which carries this
-# template's verdict.json (schema documented in src/backend/mod.rs, VerdictJson).
+# template's verdict.json (schema documented in src/backend/mod.rs, VerdictJson),
+# and recovers the run log from the `output` output parameter when podGC
+# (OnPodCompletion) deleted the pod before `kubectl logs -f` could stream it.
+# Argo output parameters are size-capped (~256KiB): huge logs truncate (Q-6).
+# The recovery contract (fast-run podGC, mid-stream pod vanish, loud error
+# when neither source exists) is pinned by tests/argo_backend_integration.rs.
 #
 # Remote contract: the remote executes exactly the argv the caller typed. v1
 # intercepts `cargo test` only, so the step runs `cargo test` + args-json.
@@ -48,6 +53,11 @@ spec:
           - name: verdict
             valueFrom:
               path: /tmp/gantry-verdict/verdict.json
+          # Full run log (stdout+stderr merged), the backend's recovery source
+          # when podGC ate the pod before or during `kubectl logs -f`.
+          - name: output
+            valueFrom:
+              path: /tmp/gantry-verdict/output.log
       container:
         image: "{{inputs.parameters.builder-image}}"
         command: [bash, -c]
@@ -67,7 +77,10 @@ spec:
             mapfile -t args < <(printf '%s' '{{inputs.parameters.args-json}}' | jq -r '.[]')
 
             exit_code=0
-            cargo test "${args[@]}" || exit_code=$?
+            # tee captures the full run log for the `output` output parameter;
+            # pipefail keeps the pipeline exit at cargo's own status (the
+            # failing step in a pipe wins under `set -o pipefail`).
+            cargo test "${args[@]}" 2>&1 | tee /tmp/gantry-verdict/output.log || exit_code=$?
 
             # OOM (SIGKILL -> 137) and other signals classify as InfraFailure
             # through VerdictJson.to_verdict's exit-code ladder.

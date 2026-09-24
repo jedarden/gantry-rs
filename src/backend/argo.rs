@@ -12,7 +12,7 @@
 // - cancel: kubectl delete workflow
 
 use crate::backend::{BackendError, RemoteBackend, RunSpec, Verdict, VerdictJson};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -134,6 +134,23 @@ mod workflow {
         pub outputs: Option<Outputs>,
     }
 
+    impl WorkflowStatus {
+        /// Find an output parameter by name and return its value.
+        ///
+        /// Output parameters are how the gantry-verify template exports
+        /// results that outlive the pod (`verdict` = verdict.json, `output` =
+        /// the captured run log the backend recovers when podGC ate the pod).
+        pub fn output_parameter(&self, name: &str) -> Option<&str> {
+            self.outputs
+                .as_ref()?
+                .parameters
+                .as_ref()?
+                .iter()
+                .find(|p| p.name == name)
+                .and_then(|p| p.value.as_deref())
+        }
+    }
+
     impl Workflow {
         /// Create a new Workflow manifest for gantry.
         ///
@@ -247,6 +264,18 @@ impl Default for ArgoConfig {
     }
 }
 
+/// Outcome of bounded pod discovery for log streaming.
+#[derive(Debug, Clone, PartialEq)]
+enum PodDiscovery {
+    /// The workflow's pod exists — stream logs from it.
+    Pod(String),
+    /// The workflow reached a terminal phase with no pod ever observed:
+    /// podGC (`OnPodCompletion`) deleted the pod at completion, so there is
+    /// nothing left to stream from and the log must be recovered from the
+    /// workflow's `output` parameter instead.
+    PodGone,
+}
+
 /// The Argo Workflows backend implementation.
 pub struct ArgoBackend {
     /// Argo-specific configuration.
@@ -285,29 +314,145 @@ impl ArgoBackend {
             .map_err(|e| BackendError::new(&format!("failed to run kubectl: {}", e)))
     }
 
-    /// Discover the pod name for a workflow by listing pods, retrying until
-    /// `timeout` elapses. Best-effort streaming must not hang forever on a
-    /// workflow that never schedules, so expiry is a loud error, not a hang.
-    fn discover_pod_with_retry(
+    /// Fetch and parse the workflow's `status` stanza.
+    ///
+    /// `Ok(None)` means kubectl could not serve the object (not created yet,
+    /// transient API error) — pending for callers that poll, not an error. A
+    /// malformed object is a loud error: gantry never guesses at a status it
+    /// cannot parse.
+    fn workflow_status(
+        &self,
+        workflow_name: &str,
+    ) -> Result<Option<workflow::WorkflowStatus>, BackendError> {
+        let output = self.kubectl(&["get", "workflow", workflow_name, "-o", "json"])?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let json = String::from_utf8_lossy(&output.stdout);
+        let obj: WorkflowObject = serde_json::from_str(&json)
+            .map_err(|e| BackendError::new(&format!("failed to parse workflow status: {}", e)))?;
+        Ok(obj.status)
+    }
+
+    /// Whether the workflow has reached a terminal phase
+    /// (Succeeded / Failed / Error).
+    fn workflow_is_terminal(&self, workflow_name: &str) -> Result<bool, BackendError> {
+        Ok(self
+            .workflow_status(workflow_name)?
+            .and_then(|status| status.phase)
+            .is_some_and(|phase| matches!(phase.as_str(), "Succeeded" | "Failed" | "Error")))
+    }
+
+    /// Read one output parameter's value from the workflow's status.
+    /// `Ok(None)` = workflow not retrievable yet or parameter absent.
+    fn read_output_parameter(
+        &self,
+        workflow_name: &str,
+        wanted: &str,
+    ) -> Result<Option<String>, BackendError> {
+        Ok(self
+            .workflow_status(workflow_name)?
+            .and_then(|status| status.output_parameter(wanted).map(str::to_string)))
+    }
+
+    /// Discover the pod to stream logs from, retrying until `timeout`.
+    ///
+    /// Returns [`PodDiscovery::PodGone`] as soon as the workflow itself goes
+    /// terminal with no pod ever observed: podGC (`OnPodCompletion`) deletes
+    /// the pod the moment the run finishes, so a fast run goes straight from
+    /// "no pod" to a terminal workflow — waiting out the full timeout would
+    /// idle five minutes on every quick run before the output-parameter
+    /// fallback could fire. A workflow that never schedules still expires as
+    /// a loud error, not a hang.
+    fn discover_pod_or_terminal(
         &self,
         workflow_name: &str,
         timeout: Duration,
-    ) -> Result<String, BackendError> {
+    ) -> Result<PodDiscovery, BackendError> {
         let start = Instant::now();
         loop {
-            match self.discover_pod(workflow_name)? {
-                Some(pod) => return Ok(pod),
-                None => {
-                    if start.elapsed() >= timeout {
-                        return Err(BackendError::new(&format!(
-                            "no pod found for workflow {} within {:?}",
-                            workflow_name, timeout
-                        )));
-                    }
-                    thread::sleep(POD_DISCOVERY_POLL);
-                }
+            if let Some(pod) = self.discover_pod(workflow_name)? {
+                return Ok(PodDiscovery::Pod(pod));
             }
+            if self.workflow_is_terminal(workflow_name)? {
+                return Ok(PodDiscovery::PodGone);
+            }
+            if start.elapsed() >= timeout {
+                return Err(BackendError::new(&format!(
+                    "no pod found for workflow {} within {:?}",
+                    workflow_name, timeout
+                )));
+            }
+            thread::sleep(POD_DISCOVERY_POLL);
         }
+    }
+
+    /// Stream `kubectl logs -f <pod>` into `out` as the logs arrive.
+    ///
+    /// `-f` blocks until the pod's log stream closes, so output must be
+    /// copied through incrementally — a buffered `.output()` would withhold
+    /// every line until the run finished, defeating the point of streaming.
+    /// kubectl's stderr is drained concurrently (a full stderr pipe would
+    /// otherwise deadlock the copy) and reported when the stream fails.
+    fn follow_pod_logs(&self, pod_name: &str, out: &mut dyn Write) -> Result<(), BackendError> {
+        let mut cmd = Command::new(&self.config.kubectl_path);
+
+        // Add kubeconfig flag if set
+        if !self.config.kubeconfig.is_empty() {
+            cmd.arg("--kubeconfig").arg(&self.config.kubeconfig);
+        }
+
+        // Add namespace flag
+        cmd.arg("-n").arg(&self.config.namespace);
+        cmd.args(["logs", "-f", pod_name]);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| BackendError::new(&format!("failed to spawn kubectl logs: {}", e)))?;
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BackendError::new("kubectl logs has no stdout pipe"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| BackendError::new("kubectl logs has no stderr pipe"))?;
+        let stderr_drain = thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        });
+
+        let copied = std::io::copy(&mut stdout, out);
+        let status = child
+            .wait()
+            .map_err(|e| BackendError::new(&format!("failed to wait for kubectl logs: {}", e)))?;
+        let stderr_buf = stderr_drain
+            .join()
+            .unwrap_or_else(|_| b"kubectl logs stderr unreadable".to_vec());
+
+        match copied {
+            Ok(_) if status.success() => Ok(()),
+            Ok(_) => Err(BackendError::new(&format!(
+                "kubectl logs -f {} failed: {}",
+                pod_name,
+                String::from_utf8_lossy(&stderr_buf).trim()
+            ))),
+            Err(e) => Err(BackendError::new(&format!(
+                "failed to stream pod logs: {}",
+                e
+            ))),
+        }
+    }
+
+    /// Recover the run log when podGC deleted the pod: the workflow's
+    /// `output` output parameter carries the captured log (contrib template
+    /// tees the step's output into it). `Ok(None)` = the parameter is absent.
+    fn recover_output_log(&self, workflow_name: &str) -> Result<Option<String>, BackendError> {
+        self.read_output_parameter(workflow_name, "output")
     }
 
     /// Discover the pod name for a workflow by listing pods.
@@ -445,33 +590,58 @@ impl RemoteBackend for ArgoBackend {
 
     /// Stream logs from the workflow's pod.
     ///
-    /// Discovers the pod name, then streams kubectl logs -f.
-    /// Best-effort: failures don't fail the overall run (wait is authoritative).
+    /// Discovers the pod name, then streams `kubectl logs -f` into `out` as
+    /// the logs arrive. Best-effort: failures don't fail the overall run
+    /// (wait is authoritative).
+    ///
+    /// podGC (`OnPodCompletion`) deletes the pod the moment the run finishes,
+    /// so the pod may be gone before we ever see it (fast run) or vanish
+    /// mid-stream. Both recover the run log from the workflow's `output`
+    /// output parameter (the contrib template tees the step's output into
+    /// it); only when that is missing too does streaming fail loudly.
     fn stream_logs(
         &self,
         h: &crate::backend::RunHandle,
         out: &mut dyn Write,
     ) -> Result<(), BackendError> {
-        // Discover the pod name, bounded — a workflow that never schedules
-        // must fail streaming loudly instead of hanging the run.
-        let pod_name = self.discover_pod_with_retry(&h.handle, POD_DISCOVERY_TIMEOUT)?;
+        // Discover the pod, bounded — a workflow that never schedules must
+        // fail streaming loudly instead of hanging the run.
+        match self.discover_pod_or_terminal(&h.handle, POD_DISCOVERY_TIMEOUT)? {
+            PodDiscovery::Pod(pod_name) => {
+                if self.follow_pod_logs(&pod_name, out).is_ok() {
+                    return Ok(());
+                }
+                eprintln!(
+                    "[gantry] pod log stream ended early; recovering log from output parameter"
+                );
+            }
+            PodDiscovery::PodGone => {
+                eprintln!(
+                    "[gantry] no pod for workflow {} (podGC deleted it at completion); \
+                     recovering log from output parameter",
+                    h.handle
+                );
+            }
+        }
 
-        // Stream logs from the pod
-        let output = self
-            .kubectl(&["logs", "-f", &pod_name])
-            .map_err(|e| BackendError::new(&format!("failed to stream logs: {}", e)))?;
-
-        // Write log output to the writer
-        out.write_all(&output.stdout)
-            .map_err(|e| BackendError::new(&format!("failed to write logs: {}", e)))?;
-
-        Ok(())
+        // podGC recovery: the pod is unusable, so the captured log in the
+        // `output` parameter is the last copy that exists.
+        match self.recover_output_log(&h.handle)? {
+            Some(recovered) => out
+                .write_all(recovered.as_bytes())
+                .map_err(|e| BackendError::new(&format!("failed to write logs: {}", e))),
+            None => Err(BackendError::new(&format!(
+                "no logs available for workflow {}: no pod to stream and no `output` \
+                 parameter to recover",
+                h.handle
+            ))),
+        }
     }
 
     /// Wait for the workflow to complete and return its verdict.
     ///
     /// Polls kubectl get workflow status.phase until terminal or deadline.
-    /// Reads verdict.json from outputs.parameters if available.
+    /// Reads verdict.json from the `verdict` output parameter if available.
     /// Attributions gate failures to "[gantry] gate:" in output.
     fn wait(
         &self,
@@ -484,22 +654,10 @@ impl RemoteBackend for ArgoBackend {
                 return Err(BackendError::new("workflow deadline exceeded"));
             }
 
-            // Get workflow status
-            let output = self.kubectl(&["get", "workflow", &h.handle, "-o", "json"])?;
-
-            if !output.status.success() {
-                thread::sleep(STATUS_POLL);
-                continue;
-            }
-
-            // kubectl returns the whole Workflow object; the phase lives in
-            // its `status` stanza, which is absent until the controller first
-            // reconciles the workflow (and may be phase-less right after).
-            let json = String::from_utf8_lossy(&output.stdout);
-            let obj: WorkflowObject = serde_json::from_str(&json).map_err(|e| {
-                BackendError::new(&format!("failed to parse workflow status: {}", e))
-            })?;
-            let Some(status) = obj.status else {
+            // The `status` stanza is absent until the controller first
+            // reconciles the workflow (and may be phase-less right after) —
+            // both are pending, not errors.
+            let Some(status) = self.workflow_status(&h.handle)? else {
                 thread::sleep(STATUS_POLL);
                 continue;
             };
@@ -507,31 +665,21 @@ impl RemoteBackend for ArgoBackend {
             // Check if terminal phase
             match status.phase.as_deref() {
                 Some("Succeeded" | "Failed" | "Error") => {
-                    // Terminal phase - try to read verdict.json
-                    if let Some(outputs) = status.outputs {
-                        if let Some(parameters) = outputs.parameters {
-                            for param in parameters {
-                                if param.name == "verdict" {
-                                    if let Some(value) = param.value {
-                                        match VerdictJson::parse(&value) {
-                                            Ok(vj) => {
-                                                let verdict = vj.to_verdict();
-                                                // Attributions for gate failures
-                                                if verdict == Verdict::GateFailure {
-                                                    eprintln!("[gantry] gate: quality gate failed");
-                                                }
-                                                return Ok(verdict);
-                                            }
-                                            Err(e) => {
-                                                // Fall back to exit code if verdict.json parsing fails
-                                                eprintln!(
-                                                    "[gantry] failed to parse verdict.json: {}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
+                    // Terminal phase - try to read verdict.json from the
+                    // workflow's `verdict` output parameter.
+                    if let Some(value) = status.output_parameter("verdict") {
+                        match VerdictJson::parse(value) {
+                            Ok(vj) => {
+                                let verdict = vj.to_verdict();
+                                // Attributions for gate failures
+                                if verdict == Verdict::GateFailure {
+                                    eprintln!("[gantry] gate: quality gate failed");
                                 }
+                                return Ok(verdict);
+                            }
+                            Err(e) => {
+                                // Fall back to exit code if verdict.json parsing fails
+                                eprintln!("[gantry] failed to parse verdict.json: {}", e);
                             }
                         }
                     }
@@ -1249,6 +1397,30 @@ mod tests {
         assert_eq!(verdict, Verdict::TestFailure);
     }
 
+    /// The `Error` phase (e.g. the controller could not resolve the template)
+    /// is terminal: wait() stops polling and classifies it as InfraFailure —
+    /// the workflow itself broke, so no test result exists to report.
+    #[test]
+    fn test_wait_error_phase_is_terminal_infra_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            "#!/usr/bin/env bash\n\
+             echo '{\"status\":{\"phase\":\"Error\",\"message\":\"template not found\"}}'\n",
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict =
+            with_exec_retry(|| backend.wait(&handle, Instant::now() + Duration::from_secs(5)))
+                .expect("wait must return on the terminal Error phase");
+        assert_eq!(verdict, Verdict::InfraFailure);
+        assert!(verdict.is_infra_failure());
+    }
+
     /// An already-passed deadline errors out immediately — before any kubectl
     /// call — instead of polling forever.
     #[test]
@@ -1338,12 +1510,20 @@ mod tests {
     }
 
     /// Pod discovery gives up (loud error) once the timeout expires instead
-    /// of spinning forever on a workflow that never schedules.
+    /// of spinning forever on a workflow that never schedules. The mock's
+    /// `get workflow` fails, so the workflow never goes terminal and the
+    /// podGone shortcut cannot fire — only the timeout can end the wait.
     #[test]
     fn test_pod_discovery_gives_up_after_timeout() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let kubectl =
-            write_mock_kubectl(tmp.path(), "#!/usr/bin/env bash\necho '{\"items\":[]}'\n");
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            "#!/usr/bin/env bash\n\
+             case \" $* \" in\n\
+               *' pods '*) echo '{\"items\":[]}' ;;\n\
+               *) exit 1 ;;\n\
+             esac\n",
+        );
         let backend = ArgoBackend::new(ArgoConfig {
             kubectl_path: kubectl.to_string_lossy().into_owned(),
             ..ArgoConfig::default()
@@ -1351,7 +1531,7 @@ mod tests {
         let handle = RunHandle::new("gantry-abc123");
 
         let err =
-            with_exec_retry(|| backend.discover_pod_with_retry(&handle.handle, Duration::ZERO))
+            with_exec_retry(|| backend.discover_pod_or_terminal(&handle.handle, Duration::ZERO))
                 .expect_err("discovery must give up after the timeout");
         assert!(
             err.reason.contains("no pod found for workflow"),
