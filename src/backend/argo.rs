@@ -415,21 +415,27 @@ impl RemoteBackend for ArgoBackend {
 
         // Extract the workflow name from stdout. Real kubectl prints
         // "workflow.argoproj.io/<generated-name> created" — keep only the
-        // name token, never the status word.
+        // name token, never the status word. The name must start immediately
+        // after the prefix: nothing (or only whitespace) after the slash
+        // means kubectl emitted no name, and falling through would mint a
+        // garbage handle out of the status word ("created"), so any
+        // malformed stdout is a loud error.
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let workflow_name = stdout
-            .trim()
+        let trimmed = stdout.trim();
+        let workflow_name = trimmed
             .strip_prefix("workflow.argoproj.io/")
+            .and_then(|rest| {
+                if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                    return None;
+                }
+                rest.split_whitespace().next()
+            })
             .ok_or_else(|| {
                 BackendError::new(&format!(
                     "kubectl output missing workflow name: {:?}",
-                    stdout.trim()
+                    trimmed
                 ))
             })?
-            .split_whitespace()
-            .next()
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| BackendError::new("kubectl output missing workflow name"))?
             .to_string();
 
         Ok(crate::backend::RunHandle {
@@ -1082,6 +1088,69 @@ mod tests {
 
         let err = with_exec_retry(|| backend.submit(&spec))
             .expect_err("submit must fail on unrecognized stdout");
+        assert!(
+            err.reason.contains("missing workflow name"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// A prefix with no name after the slash (`workflow.argoproj.io/` on its
+    /// own) is a loud error, not a garbage handle.
+    #[test]
+    fn test_submit_rejects_bare_prefix_without_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            "#!/usr/bin/env bash\necho 'workflow.argoproj.io/'\n",
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let spec = RunSpec::new(
+            "cargo",
+            "test",
+            vec![],
+            "https://github.com/example/repo",
+            "abc123",
+            "",
+        );
+
+        let err = with_exec_retry(|| backend.submit(&spec))
+            .expect_err("submit must fail on a nameless workflow prefix");
+        assert!(
+            err.reason.contains("missing workflow name"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// An empty name token followed by the status word (`workflow.argoproj.io/
+    /// created`) is a loud error: taking the first whitespace token would
+    /// otherwise return the status word itself as the handle.
+    #[test]
+    fn test_submit_rejects_empty_name_before_status_word() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            "#!/usr/bin/env bash\necho 'workflow.argoproj.io/ created'\n",
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let spec = RunSpec::new(
+            "cargo",
+            "test",
+            vec![],
+            "https://github.com/example/repo",
+            "abc123",
+            "",
+        );
+
+        let err = with_exec_retry(|| backend.submit(&spec))
+            .expect_err("submit must not return the status word as the handle");
         assert!(
             err.reason.contains("missing workflow name"),
             "{}",
