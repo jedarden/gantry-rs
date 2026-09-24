@@ -154,6 +154,20 @@ pub struct ArgoConfig {
     pub base_url: Option<String>,
 }
 
+impl Default for ArgoConfig {
+    fn default() -> Self {
+        ArgoConfig {
+            kubectl_path: default_kubectl_path(),
+            kubeconfig: PathBuf::from(default_kubeconfig()),
+            namespace: default_namespace(),
+            template: default_template(),
+            generate_name: default_generate_name(),
+            builder_image: None,
+            base_url: None,
+        }
+    }
+}
+
 /// Command-template backend configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommandConfig {
@@ -169,64 +183,67 @@ pub struct CommandConfig {
 // TOML deserialization structures
 // ============================================================================
 
+// Every raw struct carries an `unknown` flatten map: keys we do not recognize
+// land there instead of failing the parse, and merge_layer turns them into
+// warnings (forward compatibility — warn, never error). The map value is
+// `toml::Value`, not `serde_json::Value`, so even a TOML datetime in an
+// unknown key still buffers instead of erroring.
+//
+// Typed fields are Option so that merge can tell "key absent" (inherit the
+// lower layer's value) from "key present" (override). This is what makes the
+// merge key-granular: a layer that sets cpu_quota_pct must not reset the
+// memory_max a lower layer already chose.
+
 #[derive(Deserialize, Serialize)]
 struct RawConfig {
     local: Option<RawLocal>,
     #[serde(default)]
     tool: HashMap<String, RawTool>,
     remote: Option<RawRemote>,
-    // Unknown keys go here and trigger warnings
     #[serde(flatten)]
-    _unknown: HashMap<String, serde_json::Value>,
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct RawLocal {
-    #[serde(default = "default_cpu_quota")]
-    cpu_quota_pct: u8,
-    #[serde(default = "default_memory_max")]
-    memory_max: String,
-    #[serde(default = "default_cap_passthrough")]
-    cap_passthrough: bool,
+    cpu_quota_pct: Option<u8>,
+    memory_max: Option<String>,
+    cap_passthrough: Option<bool>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct RawTool {
-    #[serde(default)]
-    intercept: Vec<String>,
+    intercept: Option<Vec<String>>,
     real_binary: Option<String>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct RawRemote {
-    #[serde(default = "default_backend")]
-    backend: String,
-    #[serde(default = "default_ci_remote")]
-    ci_remote: String,
-    #[serde(default = "default_push_mode")]
-    push_mode: String,
-    #[serde(default = "default_deadline")]
-    deadline_minutes: u64,
+    backend: Option<String>,
+    ci_remote: Option<String>,
+    push_mode: Option<String>,
+    deadline_minutes: Option<u64>,
     argo: Option<RawArgo>,
     command: Option<RawCommand>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct RawArgo {
-    #[serde(default = "default_kubectl_path")]
-    kubectl_path: String,
-    #[serde(default = "default_kubeconfig")]
-    kubeconfig: String,
-    #[serde(default = "default_namespace")]
-    namespace: String,
-    #[serde(default = "default_template")]
-    template: String,
-    #[serde(default = "default_generate_name")]
-    generate_name: String,
-    #[serde(default)]
+    kubectl_path: Option<String>,
+    kubeconfig: Option<String>,
+    namespace: Option<String>,
+    template: Option<String>,
+    generate_name: Option<String>,
     builder_image: Option<String>,
-    #[serde(default)]
     base_url: Option<String>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -234,31 +251,12 @@ struct RawCommand {
     submit: Vec<String>,
     logs: Vec<String>,
     wait: Vec<String>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
-// Default functions
-
-fn default_cpu_quota() -> u8 {
-    200
-}
-fn default_memory_max() -> String {
-    "6G".to_string()
-}
-fn default_cap_passthrough() -> bool {
-    true
-}
-fn default_backend() -> String {
-    "none".to_string()
-}
-fn default_ci_remote() -> String {
-    "origin".to_string()
-}
-fn default_push_mode() -> String {
-    "ref".to_string()
-}
-fn default_deadline() -> u64 {
-    40
-}
+// Default functions — the [remote.argo] baseline. Shared between serde-free
+// construction (ArgoConfig::default) and key-granular layer merging.
 fn default_kubectl_path() -> String {
     "kubectl".to_string()
 }
@@ -330,13 +328,20 @@ impl GantryConfig {
         let mut warnings = Vec::new();
         let mut broken_banner = None;
 
+        // Resolve the real layer paths; a layer whose path cannot be
+        // determined is simply absent.
+        let system = Self::system_config_path().ok();
+        let user = Self::user_config_path().ok();
+        let repo = Self::repo_config_path();
+
         // Try loading from layers; if corrupted, use LKG snapshot.
-        let load_result = Self::load_from_layers(&mut warnings);
+        let load_result = Self::load_layers(system.as_deref(), user.as_deref(), repo.as_deref());
         let config = match load_result {
-            Ok(cfg) => {
+            Ok(result) => {
+                warnings.extend(result.warnings);
                 // Config parsed successfully - persist as LKG snapshot.
-                let _ = Self::persist_lkg(&cfg);
-                cfg
+                let _ = Self::persist_lkg(&result.config);
+                result.config
             }
             Err(err) => {
                 // Config broken - try LKG snapshot.
@@ -357,6 +362,48 @@ impl GantryConfig {
             warnings,
             broken_banner,
         }
+    }
+
+    /// Merge the three config layers over the Tier-0 defaults — the actual
+    /// layering/resolution logic, with every path supplied by the caller.
+    ///
+    /// This is [`load`](Self::load) minus process-global state: no `/etc`,
+    /// no `$HOME`, no cwd walk, no last-known-good reads or writes. `None`
+    /// means the layer is absent; a `Some` path that does not exist is
+    /// skipped the same way. Tests drive this directly against fixture
+    /// files to prove layering end-to-end.
+    ///
+    /// On success the [`ConfigLoadResult`] carries the merged config plus
+    /// every warning (unknown keys, ignored trust-boundary keys). On
+    /// failure — unreadable file, parse error, or a repo-layer trust-
+    /// boundary violation — returns Err and the caller falls back
+    /// (last-known-good, then Tier-0).
+    pub fn load_layers(
+        system: Option<&Path>,
+        user: Option<&Path>,
+        repo: Option<&Path>,
+    ) -> Result<ConfigLoadResult, String> {
+        let mut warnings = Vec::new();
+        let mut config = Self::tier_0_defaults();
+
+        // Later layers override earlier ones, key by key.
+        for (layer, path) in [
+            (ConfigLayer::System, system),
+            (ConfigLayer::User, user),
+            (ConfigLayer::Repo, repo),
+        ] {
+            let Some(path) = path else { continue };
+            if !path.exists() {
+                continue;
+            }
+            Self::merge_layer(&mut config, path, layer, &mut warnings)?;
+        }
+
+        Ok(ConfigLoadResult {
+            config,
+            warnings,
+            broken_banner: None,
+        })
     }
 
     /// Tier-0 zero-config defaults: cap-only mode, no remote backend.
@@ -400,44 +447,13 @@ impl GantryConfig {
         Self::tier_0_defaults()
     }
 
-    /// Load configuration from the three layers in precedence order.
-    fn load_from_layers(warnings: &mut Vec<String>) -> Result<Self, String> {
-        let mut base_config = Self::tier_0_defaults();
-
-        // Layer 1: System config (/etc/gantry/config.toml)
-        if let Ok(system_path) = Self::system_config_path() {
-            if system_path.exists() {
-                Self::merge_layer(
-                    &mut base_config,
-                    &system_path,
-                    ConfigLayer::System,
-                    warnings,
-                )?;
-            }
-        }
-
-        // Layer 2: User config (~/.config/gantry/config.toml)
-        if let Ok(user_path) = Self::user_config_path() {
-            if user_path.exists() {
-                Self::merge_layer(&mut base_config, &user_path, ConfigLayer::User, warnings)?;
-            }
-        }
-
-        // Layer 3: Repo config (.gantry.toml) - WITH TRUST BOUNDARY
-        if let Some(repo_path) = Self::repo_config_path() {
-            if repo_path.exists() {
-                Self::merge_layer(&mut base_config, &repo_path, ConfigLayer::Repo, warnings)?;
-            }
-        }
-
-        Ok(base_config)
-    }
-
     /// Merge a single config layer into the base config.
     ///
-    /// If `layer` is [`ConfigLayer::Repo`], enforces trust boundary:
-    /// ci_remote, push_mode, and command backend cannot be modified from
-    /// the repo config.
+    /// The merge is key-granular: only keys the layer actually sets override
+    /// the base; everything else inherits what a lower layer chose (or the
+    /// Tier-0 default). If `layer` is [`ConfigLayer::Repo`], enforces the
+    /// trust boundary: ci_remote, push_mode, and command templates cannot be
+    /// modified from the repo config.
     fn merge_layer(
         base: &mut GantryConfig,
         path: &Path,
@@ -448,86 +464,153 @@ impl GantryConfig {
         let content =
             fs::read_to_string(path).map_err(|e| format!("{}: failed to read: {}", layer, e))?;
 
-        // Check for unknown keys at TOML parse time.
+        // Parse never rejects unknown keys; each struct's flatten map
+        // captures them and they are reported below (warn, never error).
         let raw: RawConfig =
             toml::from_str(&content).map_err(|e| format!("{}: parse error: {}", layer, e))?;
 
-        // Warn about unknown top-level sections.
-        let _ = &raw._unknown;
-
-        // Merge local config.
-        if let Some(local) = raw.local {
-            base.local.cpu_quota_pct = local.cpu_quota_pct;
-            base.local.memory_max = local.memory_max;
-            base.local.cap_passthrough = local.cap_passthrough;
+        // Unknown keys warn at the top level and within every section.
+        warn_unknown_keys(&raw.unknown, "", layer, warnings);
+        if let Some(local) = &raw.local {
+            warn_unknown_keys(&local.unknown, "local", layer, warnings);
+        }
+        for (name, tool) in &raw.tool {
+            warn_unknown_keys(&tool.unknown, &format!("tool.{name}"), layer, warnings);
+        }
+        if let Some(remote) = &raw.remote {
+            warn_unknown_keys(&remote.unknown, "remote", layer, warnings);
+            if let Some(argo) = &remote.argo {
+                warn_unknown_keys(&argo.unknown, "remote.argo", layer, warnings);
+            }
+            if let Some(command) = &remote.command {
+                warn_unknown_keys(&command.unknown, "remote.command", layer, warnings);
+            }
         }
 
-        // Merge tool configs.
+        // Merge local config, key by key.
+        if let Some(local) = raw.local {
+            if let Some(v) = local.cpu_quota_pct {
+                base.local.cpu_quota_pct = v;
+            }
+            if let Some(v) = local.memory_max {
+                base.local.memory_max = v;
+            }
+            if let Some(v) = local.cap_passthrough {
+                base.local.cap_passthrough = v;
+            }
+        }
+
+        // Merge tool configs. A tool section without an `intercept` key
+        // inherits the lower layer's intercept list; naming a tool that no
+        // lower layer mentioned opts it in with the default `["test"]`. An
+        // explicit `intercept = []` narrows the tool to never intercept.
         for (tool_name, raw_tool) in raw.tool {
-            let tool_config = ToolConfig {
-                intercept: if raw_tool.intercept.is_empty() {
-                    vec!["test".to_string()]
-                } else {
-                    raw_tool.intercept
-                },
-                real_binary: raw_tool.real_binary.map(PathBuf::from),
+            let intercept = match raw_tool.intercept {
+                Some(v) => v,
+                None => base
+                    .tools
+                    .get(&tool_name)
+                    .map(|t| t.intercept.clone())
+                    .unwrap_or_else(|| vec!["test".to_string()]),
             };
-            base.tools.insert(tool_name, tool_config);
+            let real_binary = match raw_tool.real_binary {
+                Some(v) => Some(PathBuf::from(v)),
+                None => base
+                    .tools
+                    .get(&tool_name)
+                    .and_then(|t| t.real_binary.clone()),
+            };
+            base.tools.insert(
+                tool_name,
+                ToolConfig {
+                    intercept,
+                    real_binary,
+                },
+            );
         }
 
         // Merge remote config with trust boundary.
         if let Some(remote) = raw.remote {
-            // Parse backend type.
-            base.remote.backend = match remote.backend.as_str() {
-                "none" => Backend::None,
-                "argo" => Backend::Argo,
-                "command" => {
-                    if repo_layer {
-                        return Err(
-                            "repo config cannot set backend to 'command' (trust boundary S-2)"
-                                .to_string(),
-                        );
+            // Backend: only an explicit key overrides. `command` from the
+            // repo layer rejects the whole layer (fail-closed to LKG) — a
+            // repo-chosen executable template is arbitrary code execution.
+            if let Some(backend) = remote.backend {
+                base.remote.backend = match backend.as_str() {
+                    "none" => Backend::None,
+                    "argo" => Backend::Argo,
+                    "command" => {
+                        if repo_layer {
+                            return Err("repo config cannot set backend to 'command' \
+                                        (trust boundary S-2)"
+                                .to_string());
+                        }
+                        Backend::Command
                     }
-                    Backend::Command
-                }
-                _ => {
-                    warnings.push(format!(
-                        "unknown backend '{}', using 'none'",
-                        remote.backend
-                    ));
-                    Backend::None
-                }
-            };
-
-            // Trust boundary: repo layer cannot set ci_remote or push_mode.
-            if !repo_layer {
-                base.remote.ci_remote = remote.ci_remote;
-                base.remote.push_mode = match remote.push_mode.as_str() {
-                    "ref" => PushMode::Ref,
-                    "branch" => PushMode::Branch,
                     _ => {
-                        warnings.push(format!(
-                            "unknown push_mode '{}', using 'ref'",
-                            remote.push_mode
-                        ));
-                        PushMode::Ref
+                        warnings.push(format!("unknown backend '{backend}', using 'none'"));
+                        Backend::None
                     }
                 };
             }
 
-            base.remote.deadline_minutes = remote.deadline_minutes;
+            // Trust boundary (S-2): the repo layer cannot set ci_remote or
+            // push_mode. The key is ignored with a warning rather than
+            // rejecting the layer — a cloned repo must not redirect pushes,
+            // but a stray restricted key should not discard the repo's own
+            // intercept narrowing.
+            match remote.ci_remote {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'ci_remote' (trust boundary S-2), ignoring".to_string(),
+                ),
+                Some(v) => base.remote.ci_remote = v,
+                None => {}
+            }
+            match remote.push_mode {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'push_mode' (trust boundary S-2), ignoring".to_string(),
+                ),
+                Some(v) => {
+                    base.remote.push_mode = match v.as_str() {
+                        "ref" => PushMode::Ref,
+                        "branch" => PushMode::Branch,
+                        _ => {
+                            warnings.push(format!("unknown push_mode '{v}', using 'ref'"));
+                            PushMode::Ref
+                        }
+                    }
+                }
+                None => {}
+            }
 
-            // Argo config.
+            if let Some(v) = remote.deadline_minutes {
+                base.remote.deadline_minutes = v;
+            }
+
+            // Argo config: key-granular onto whatever a lower layer built.
             if let Some(argo) = remote.argo {
-                base.remote.argo = Some(ArgoConfig {
-                    kubectl_path: argo.kubectl_path,
-                    kubeconfig: Self::expand_home(&argo.kubeconfig),
-                    namespace: argo.namespace,
-                    template: argo.template,
-                    generate_name: argo.generate_name,
-                    builder_image: argo.builder_image,
-                    base_url: argo.base_url,
-                });
+                let mut merged = base.remote.argo.take().unwrap_or_default();
+                if let Some(v) = argo.kubectl_path {
+                    merged.kubectl_path = v;
+                }
+                if let Some(v) = argo.kubeconfig {
+                    merged.kubeconfig = Self::expand_home(&v);
+                }
+                if let Some(v) = argo.namespace {
+                    merged.namespace = v;
+                }
+                if let Some(v) = argo.template {
+                    merged.template = v;
+                }
+                if let Some(v) = argo.generate_name {
+                    merged.generate_name = v;
+                }
+                if let Some(v) = argo.builder_image {
+                    merged.builder_image = Some(v);
+                }
+                if let Some(v) = argo.base_url {
+                    merged.base_url = Some(v);
+                }
+                base.remote.argo = Some(merged);
             }
 
             // Command config - trust boundary applies.
@@ -745,9 +828,10 @@ impl GantryConfig {
     fn to_raw(config: &GantryConfig) -> RawConfig {
         RawConfig {
             local: Some(RawLocal {
-                cpu_quota_pct: config.local.cpu_quota_pct,
-                memory_max: config.local.memory_max.clone(),
-                cap_passthrough: config.local.cap_passthrough,
+                cpu_quota_pct: Some(config.local.cpu_quota_pct),
+                memory_max: Some(config.local.memory_max.clone()),
+                cap_passthrough: Some(config.local.cap_passthrough),
+                unknown: HashMap::new(),
             }),
             tool: config
                 .tools
@@ -756,43 +840,76 @@ impl GantryConfig {
                     (
                         name.clone(),
                         RawTool {
-                            intercept: tool.intercept.clone(),
+                            intercept: Some(tool.intercept.clone()),
                             real_binary: tool
                                 .real_binary
                                 .as_ref()
                                 .map(|p| p.to_string_lossy().to_string()),
+                            unknown: HashMap::new(),
                         },
                     )
                 })
                 .collect(),
             remote: Some(RawRemote {
-                backend: match &config.remote.backend {
+                backend: Some(match &config.remote.backend {
                     Backend::None => "none".to_string(),
                     Backend::Argo => "argo".to_string(),
                     Backend::Command => "command".to_string(),
-                },
-                ci_remote: config.remote.ci_remote.clone(),
-                push_mode: match &config.remote.push_mode {
+                }),
+                ci_remote: Some(config.remote.ci_remote.clone()),
+                push_mode: Some(match &config.remote.push_mode {
                     PushMode::Ref => "ref".to_string(),
                     PushMode::Branch => "branch".to_string(),
-                },
-                deadline_minutes: config.remote.deadline_minutes,
+                }),
+                deadline_minutes: Some(config.remote.deadline_minutes),
                 argo: config.remote.argo.as_ref().map(|a| RawArgo {
-                    kubectl_path: a.kubectl_path.clone(),
-                    kubeconfig: a.kubeconfig.to_string_lossy().to_string(),
-                    namespace: a.namespace.clone(),
-                    template: a.template.clone(),
-                    generate_name: a.generate_name.clone(),
+                    kubectl_path: Some(a.kubectl_path.clone()),
+                    kubeconfig: Some(a.kubeconfig.to_string_lossy().to_string()),
+                    namespace: Some(a.namespace.clone()),
+                    template: Some(a.template.clone()),
+                    generate_name: Some(a.generate_name.clone()),
                     builder_image: a.builder_image.clone(),
                     base_url: a.base_url.clone(),
+                    unknown: HashMap::new(),
                 }),
                 command: config.remote.command.as_ref().map(|c| RawCommand {
                     submit: c.submit.clone(),
                     logs: c.logs.clone(),
                     wait: c.wait.clone(),
+                    unknown: HashMap::new(),
                 }),
+                unknown: HashMap::new(),
             }),
-            _unknown: HashMap::new(),
+            unknown: HashMap::new(),
+        }
+    }
+}
+
+// ============================================================================
+// Unknown-key warnings
+// ============================================================================
+
+/// Emit one warning per unknown key captured by a raw struct's flatten map.
+///
+/// Forward compatibility: keys from a newer config schema (or plain typos)
+/// never fail the load — they are reported and ignored. Keys are sorted so
+/// warning output is deterministic for a given file.
+fn warn_unknown_keys(
+    unknown: &HashMap<String, toml::Value>,
+    section: &str,
+    layer: ConfigLayer,
+    warnings: &mut Vec<String>,
+) {
+    let mut keys: Vec<&String> = unknown.keys().collect();
+    keys.sort();
+    for key in keys {
+        if section.is_empty() {
+            warnings.push(format!("unknown key '{key}' in {} config, ignoring", layer));
+        } else {
+            warnings.push(format!(
+                "unknown key '{section}.{key}' in {} config, ignoring",
+                layer
+            ));
         }
     }
 }
@@ -1312,5 +1429,557 @@ mod tests {
             cfg.real_binary("cargo"),
             Some(&PathBuf::from("/custom/cargo"))
         );
+    }
+
+    // ========================================================================
+    // Three-layer merging end-to-end (bf-37ng)
+    // ========================================================================
+
+    /// Helper: write a layer file and return its path (None = layer absent).
+    fn layer_file(dir: &Path, name: &str, content: &str) -> Option<PathBuf> {
+        if content.is_empty() {
+            return None;
+        }
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        Some(path)
+    }
+
+    #[test]
+    fn layering_composes_across_all_three_layers() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(
+            temp.path(),
+            "system.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 100
+            "#,
+        );
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            memory_max = "12G"
+
+            [tool.cargo]
+            intercept = ["test", "check"]
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [tool.nextest]
+
+            [remote]
+            deadline_minutes = 55
+            "#,
+        );
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        // Keys set by different layers all land: layers compose key by key,
+        // they do not replace each other section by section.
+        assert_eq!(result.config.local.cpu_quota_pct, 100, "system layer");
+        assert_eq!(result.config.local.memory_max, "12G", "user layer");
+        assert_eq!(result.config.remote.deadline_minutes, 55, "repo layer");
+        assert!(result.config.intercepts("cargo", "test"));
+        assert!(result.config.intercepts("cargo", "check"));
+        assert!(result.config.intercepts("nextest", "test"));
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn layering_same_key_repo_beats_user_beats_system() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(
+            temp.path(),
+            "system.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 100
+
+            [remote]
+            ci_remote = "upstream"
+            "#,
+        );
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 150
+
+            [remote]
+            ci_remote = "mirror"
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 175
+            "#,
+        );
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.local.cpu_quota_pct, 175);
+        assert_eq!(result.config.remote.ci_remote, "mirror");
+    }
+
+    #[test]
+    fn layering_absent_middle_layer_is_skipped() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(
+            temp.path(),
+            "system.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 100
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+            deadline_minutes = 50
+            "#,
+        );
+
+        // User layer absent (None): system and repo still compose.
+        let result = Config::load_layers(system.as_deref(), None, repo.as_deref()).unwrap();
+        assert_eq!(result.config.local.cpu_quota_pct, 100);
+        assert_eq!(result.config.remote.deadline_minutes, 50);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn layering_no_layers_yields_tier0_with_no_warnings() {
+        // All layers absent, and paths that simply do not exist.
+        let missing = TempDir::new().unwrap().path().join("nope.toml");
+        for (system, user, repo) in [
+            (None, None, None),
+            (
+                Some(missing.as_path()),
+                Some(missing.as_path()),
+                Some(missing.as_path()),
+            ),
+        ] {
+            let result = Config::load_layers(system, user, repo).unwrap();
+            assert_eq!(result.config, Config::tier_0_defaults());
+            assert!(
+                result.warnings.is_empty(),
+                "warnings: {:?}",
+                result.warnings
+            );
+            assert!(result.broken_banner.is_none());
+        }
+    }
+
+    /// The point of key-granular merging: a repo `[remote]` that touches one
+    /// key must not reset the backend a user layer chose (the old
+    /// section-granular merge clobbered it back to Tier-0's "none").
+    #[test]
+    fn layering_remote_sections_compose_key_by_key() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "argo"
+            deadline_minutes = 10
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+            deadline_minutes = 50
+            "#,
+        );
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.remote.backend, Backend::Argo);
+        assert_eq!(result.config.remote.deadline_minutes, 50);
+    }
+
+    #[test]
+    fn layering_argo_block_composes_across_layers() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            kubectl_path = "/usr/local/bin/kubectl"
+            template = "user-template"
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+
+            [remote.argo]
+            template = "repo-template"
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), repo.as_deref()).unwrap();
+
+        let argo = result.config.remote.argo.as_ref().expect("argo config");
+        assert_eq!(argo.kubectl_path, "/usr/local/bin/kubectl", "user key kept");
+        assert_eq!(argo.template, "repo-template", "repo key wins");
+        assert_eq!(argo.namespace, "argo-workflows", "default fills the rest");
+    }
+
+    #[test]
+    fn layering_tool_config_composes_across_layers() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [tool.cargo]
+            intercept = ["test", "check"]
+            real_binary = "/custom/cargo"
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [tool.cargo]
+            intercept = ["test", "clippy"]
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), repo.as_deref()).unwrap();
+
+        let cargo = result.config.tools.get("cargo").expect("cargo tool");
+        assert_eq!(cargo.intercept, vec!["test", "clippy"], "repo narrows");
+        // real_binary not repeated by the repo layer — the user's choice holds.
+        assert_eq!(cargo.real_binary, Some(PathBuf::from("/custom/cargo")));
+    }
+
+    /// Repo-level narrowing all the way down: an explicit empty intercept
+    /// list disables interception for that tool.
+    #[test]
+    fn layering_explicit_empty_intercept_narrows_tool_to_never() {
+        let temp = TempDir::new().unwrap();
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [tool.cargo]
+            intercept = []
+            "#,
+        );
+
+        let result = Config::load_layers(None, None, repo.as_deref()).unwrap();
+
+        let cargo = result.config.tools.get("cargo").expect("cargo tool");
+        assert!(cargo.intercept.is_empty());
+        assert!(!result.config.intercepts("cargo", "test"));
+    }
+
+    /// Full resolution path, no injected shortcuts: the cwd-style upward walk
+    /// finds the repo root's .gantry.toml from a nested directory, and the
+    /// found file merges under the system layer with the trust boundary.
+    #[test]
+    fn repo_walk_feeds_repo_layer_end_to_end() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().join("walker");
+        let deep = repo_root.join("src").join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir(repo_root.join(".git")).unwrap();
+        fs::write(
+            repo_root.join(".gantry.toml"),
+            r#"
+            [tool.cargo]
+            intercept = ["test", "clippy"]
+            "#,
+        )
+        .unwrap();
+
+        let resolved = Config::repo_config_path_in(&deep).expect("walk finds repo config");
+
+        let result = Config::load_layers(None, None, Some(resolved.as_path())).unwrap();
+        assert!(result.config.intercepts("cargo", "clippy"));
+        assert!(result.config.intercepts("cargo", "test"));
+        assert!(!result.config.intercepts("cargo", "build"));
+    }
+
+    // ========================================================================
+    // Trust boundary (S-2) with warnings
+    // ========================================================================
+
+    /// Restricted keys in `.gantry.toml` are ignored with a loud warning,
+    /// but the rest of the repo layer still applies — a stray `ci_remote`
+    /// must not discard the repo's own intercept narrowing.
+    #[test]
+    fn trust_boundary_repo_restricted_keys_ignored_with_warning() {
+        let temp = TempDir::new().unwrap();
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+            ci_remote = "attacker-controlled"
+            push_mode = "branch"
+
+            [tool.cargo]
+            intercept = ["test", "clippy"]
+            "#,
+        );
+
+        let result = Config::load_layers(None, None, repo.as_deref()).unwrap();
+
+        assert_eq!(
+            result.config.remote.ci_remote, "origin",
+            "ci_remote blocked"
+        );
+        assert_eq!(
+            result.config.remote.push_mode,
+            PushMode::Ref,
+            "push_mode blocked"
+        );
+        assert!(result.config.intercepts("cargo", "clippy"), "rest applies");
+
+        let ci = result
+            .warnings
+            .iter()
+            .any(|w| w.contains("ci_remote") && w.contains("trust boundary"));
+        let push = result
+            .warnings
+            .iter()
+            .any(|w| w.contains("push_mode") && w.contains("trust boundary"));
+        assert!(ci, "ci_remote warning missing: {:?}", result.warnings);
+        assert!(push, "push_mode warning missing: {:?}", result.warnings);
+    }
+
+    /// The boundary is one-way: trusted layers may still set both keys.
+    #[test]
+    fn trust_boundary_trusted_layers_can_set_ci_remote_and_push_mode() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            ci_remote = "upstream"
+            push_mode = "branch"
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        assert_eq!(result.config.remote.ci_remote, "upstream");
+        assert_eq!(result.config.remote.push_mode, PushMode::Branch);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    /// Repo layer restricting the backend to Tier-0 (narrowing) is allowed.
+    #[test]
+    fn trust_boundary_repo_can_narrow_backend_to_none() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "argo"
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+            backend = "none"
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.remote.backend, Backend::None);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    // ========================================================================
+    // Unknown keys — warn, never error
+    // ========================================================================
+
+    #[test]
+    fn unknown_top_level_keys_warn_but_config_loads() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            banana = true
+
+            [other_bogus]
+            key = 1
+
+            [local]
+            cpu_quota_pct = 120
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        // Recognized keys still apply.
+        assert_eq!(result.config.local.cpu_quota_pct, 120);
+
+        let banana = result
+            .warnings
+            .iter()
+            .any(|w| w.contains("unknown key 'banana'") && w.contains("user"));
+        let bogus = result
+            .warnings
+            .iter()
+            .any(|w| w.contains("unknown key 'other_bogus'"));
+        assert!(banana, "banana warning missing: {:?}", result.warnings);
+        assert!(bogus, "other_bogus warning missing: {:?}", result.warnings);
+    }
+
+    #[test]
+    fn unknown_nested_keys_warn_with_section_path() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 120
+            memry_max = "8G"
+
+            [tool.cargo]
+            intercept = ["test"]
+            interceptt = ["chek"]
+
+            [remote]
+            backend = "argo"
+            deadline_minuts = 5
+
+            [remote.argo]
+            namespaces = "wrong"
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        assert_eq!(result.config.local.cpu_quota_pct, 120, "known keys apply");
+        assert_eq!(result.config.remote.backend, Backend::Argo);
+
+        for expected in [
+            "local.memry_max",
+            "tool.cargo.interceptt",
+            "remote.deadline_minuts",
+            "remote.argo.namespaces",
+        ] {
+            let found = result
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("unknown key '{expected}'")));
+            assert!(
+                found,
+                "warning for '{expected}' missing: {:?}",
+                result.warnings
+            );
+        }
+    }
+
+    /// Unknown keys must never fail the load regardless of value shape —
+    /// including TOML datetimes, which is why the flatten maps hold
+    /// `toml::Value` rather than `serde_json::Value`.
+    #[test]
+    fn unknown_keys_with_exotic_values_warn_but_never_error() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            created = 1979-05-27T07:32:00Z
+            tags = ["a", "b"]
+            nested = { x = 1 }
+
+            [local]
+            cap_passthrough = false
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        assert!(!result.config.local.cap_passthrough, "known keys apply");
+        for expected in ["created", "tags", "nested"] {
+            let found = result
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("unknown key '{expected}'")));
+            assert!(
+                found,
+                "warning for '{expected}' missing: {:?}",
+                result.warnings
+            );
+        }
+    }
+
+    /// Warnings come out in a stable order (sorted keys) so logs are
+    /// diffable across runs.
+    #[test]
+    fn unknown_key_warnings_are_deterministic() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            "zebra = 1\napple = 2\nmango = 3\n",
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        let keys: Vec<&str> = result
+            .warnings
+            .iter()
+            .filter_map(|w| {
+                w.split("unknown key '")
+                    .nth(1)
+                    .map(|rest| rest.split('\'').next().unwrap())
+            })
+            .collect();
+        assert_eq!(keys, vec!["apple", "mango", "zebra"]);
     }
 }
