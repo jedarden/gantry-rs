@@ -13,12 +13,13 @@
 // `cargo test` (gantry-275ec80c).
 
 use gantry::backend::command::{CommandBackend, CommandConfig};
-use gantry::backend::{RemoteBackend, RunHandle, RunSpec, Verdict};
+use gantry::backend::{BackendError, RemoteBackend, RunHandle, RunSpec, Verdict};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Write an executable bash script into `dir` and return its path.
 fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -36,6 +37,28 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
 
 fn script_path(p: &Path) -> String {
     p.to_str().expect("temp path is valid utf-8").to_string()
+}
+
+/// Retry a mock-backed call a few times when exec fails with ETXTBSY
+/// ("Text file busy"). Under the parallel test harness, exec of a
+/// freshly-written mock can transiently race a still-open write handle from
+/// another test's fork/exec traffic; the condition clears once every
+/// straggler handle closes. Same treatment as the argo mock-kubectl tests
+/// (gantry-4feeb0f0). Reproduced on the committed version: 1 of 5 back-to-back
+/// `cargo test --test command_backend_integration` runs failed with
+/// "Text file busy (os error 26)" (bf-4ixu). Production exec paths
+/// deliberately do NOT get this — they must surface real spawn errors loudly.
+fn with_exec_retry<T>(mut f: impl FnMut() -> Result<T, BackendError>) -> Result<T, BackendError> {
+    let mut attempt = 0;
+    loop {
+        match f() {
+            Err(e) if attempt < 4 && e.reason.contains("Text file busy") => {
+                attempt += 1;
+                thread::sleep(Duration::from_millis(50 * attempt));
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Mock submit: records its argv (one per line) and emits a handle on stdout.
@@ -136,7 +159,7 @@ fn submit_captures_stdout_as_handle() {
         write_logs_mock(dir.path()),
     );
 
-    let handle = backend.submit(&spec()).expect("submit should succeed");
+    let handle = with_exec_retry(|| backend.submit(&spec())).expect("submit should succeed");
     assert_eq!(handle.handle, "run-1234");
 }
 
@@ -149,7 +172,7 @@ fn submit_substitutes_placeholders_at_argv_level() {
         write_logs_mock(dir.path()),
     );
 
-    backend.submit(&spec()).expect("submit should succeed");
+    with_exec_retry(|| backend.submit(&spec())).expect("submit should succeed");
 
     // "$@" excludes $0, so the record is exactly the three placeholder slots.
     let argv = read_argv_record(dir.path(), "submit-argv.txt");
@@ -174,7 +197,7 @@ fn submit_nonzero_exit_is_an_error() {
         write_logs_mock(dir.path()),
     );
 
-    let err = backend.submit(&spec()).expect_err("submit should fail");
+    let err = with_exec_retry(|| backend.submit(&spec())).expect_err("submit should fail");
     assert!(
         err.reason.contains("submit command failed"),
         "error should attribute the failure to submit, got: {}",
@@ -196,9 +219,7 @@ fn submit_empty_stdout_is_an_error() {
         write_logs_mock(dir.path()),
     );
 
-    let err = backend
-        .submit(&spec())
-        .expect_err("empty handle should fail");
+    let err = with_exec_retry(|| backend.submit(&spec())).expect_err("empty handle should fail");
     assert!(err.reason.contains("empty handle"), "got: {}", err.reason);
 }
 
@@ -211,8 +232,7 @@ fn wait_exit_0_maps_to_pass() {
         write_logs_mock(dir.path()),
     );
 
-    let verdict = backend
-        .wait(&RunHandle::new("run-1"), Instant::now())
+    let verdict = with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), Instant::now()))
         .expect("wait should succeed");
     assert_eq!(verdict, Verdict::Pass);
 }
@@ -226,8 +246,7 @@ fn wait_exit_1_maps_to_test_failure() {
         write_logs_mock(dir.path()),
     );
 
-    let verdict = backend
-        .wait(&RunHandle::new("run-1"), Instant::now())
+    let verdict = with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), Instant::now()))
         .expect("wait should succeed");
     assert_eq!(verdict, Verdict::TestFailure);
 }
@@ -244,8 +263,7 @@ fn wait_exit_2_and_higher_map_to_infra_failure() {
             write_wait_mock(dir.path(), code),
             logs.clone(),
         );
-        let verdict = backend
-            .wait(&RunHandle::new("run-1"), Instant::now())
+        let verdict = with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), Instant::now()))
             .expect("wait should succeed");
         assert_eq!(verdict, Verdict::InfraFailure, "exit {}", code);
     }
@@ -260,8 +278,7 @@ fn wait_receives_substituted_handle() {
         write_logs_mock(dir.path()),
     );
 
-    backend
-        .wait(&RunHandle::new("run-77"), Instant::now())
+    with_exec_retry(|| backend.wait(&RunHandle::new("run-77"), Instant::now()))
         .expect("wait should succeed");
 
     let argv = read_argv_record(dir.path(), "wait-argv-0.txt");
@@ -282,8 +299,7 @@ fn logs_streams_command_stdout_to_writer() {
     );
 
     let mut out: Vec<u8> = Vec::new();
-    backend
-        .stream_logs(&RunHandle::new("run-9"), &mut out)
+    with_exec_retry(|| backend.stream_logs(&RunHandle::new("run-9"), &mut out))
         .expect("stream_logs should succeed");
 
     let text = String::from_utf8(out).expect("log output is utf-8");
@@ -308,10 +324,9 @@ fn round_trip_submit_then_wait_passes() {
         write_logs_mock(dir.path()),
     );
 
-    let handle = backend.submit(&spec()).expect("submit should succeed");
-    let verdict = backend
-        .wait(&handle, Instant::now())
-        .expect("wait should succeed");
+    let handle = with_exec_retry(|| backend.submit(&spec())).expect("submit should succeed");
+    let verdict =
+        with_exec_retry(|| backend.wait(&handle, Instant::now())).expect("wait should succeed");
     assert_eq!(verdict, Verdict::Pass);
 }
 
@@ -324,10 +339,9 @@ fn round_trip_submit_then_wait_fails() {
         write_logs_mock(dir.path()),
     );
 
-    let handle = backend.submit(&spec()).expect("submit should succeed");
-    let verdict = backend
-        .wait(&handle, Instant::now())
-        .expect("wait should succeed");
+    let handle = with_exec_retry(|| backend.submit(&spec())).expect("submit should succeed");
+    let verdict =
+        with_exec_retry(|| backend.wait(&handle, Instant::now())).expect("wait should succeed");
     assert_eq!(verdict, Verdict::TestFailure);
 }
 
