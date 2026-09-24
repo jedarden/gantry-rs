@@ -8,7 +8,8 @@
 // - VerdictJson: versioned verdict.json parsing structure
 // - BackendError: minimal error type for backend operations
 // - RunHandle: opaque handle returned by submit() and consumed by wait()
-// - RemoteBackend trait: submit / stream_logs / wait / describe / cancel
+// - RunStatus: coarse run-state query result (Pending/Running/Completed/Unknown)
+// - RemoteBackend trait: submit / stream_logs / wait / describe / cancel / status
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -145,11 +146,29 @@ impl RunHandle {
     }
 }
 
+/// RunStatus: coarse, non-terminal run state returned by status().
+///
+/// This is a point-in-time snapshot for polling, not a verdict — wait() remains
+/// the authoritative source for the run's outcome. Unknown covers both states
+/// a backend cannot determine (handle not recognized, query unsupported) so
+/// callers can distinguish "still going" from "no answer".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    /// The run is submitted but has not started executing yet.
+    Pending,
+    /// The run is currently executing.
+    Running,
+    /// The run reached a terminal state (see wait() for the verdict).
+    Completed,
+    /// The backend cannot determine the run's state.
+    Unknown,
+}
+
 /// RemoteBackend trait: the interface all remote executors must implement.
 ///
 /// Phase 0.5: only submit() and wait() need real bodies; stream_logs, describe,
-/// and cancel may panic. The command backend implements this trait using hardcoded
-/// argv arrays that invoke a local bash executor.
+/// cancel, and status may panic. The command backend implements this trait using
+/// hardcoded argv arrays that invoke a local bash executor.
 ///
 /// Phase 1a will add streaming, cancellation, and describe support; the Argo
 /// backend will implement the full trait.
@@ -199,6 +218,21 @@ pub trait RemoteBackend {
     fn cancel(&self, h: &RunHandle) -> Result<(), BackendError> {
         let _ = h;
         panic!("cancel is not implemented in Phase 0.5");
+    }
+
+    /// Query the current status of a run without waiting for it to complete.
+    ///
+    /// This is a best-effort point-in-time snapshot — unlike wait() it never
+    /// blocks on the run and returns no verdict. Backends that cannot answer
+    /// should report RunStatus::Unknown rather than error, so polling callers
+    /// treat an unanswerable query as "no news" instead of a hard failure.
+    ///
+    /// Phase 0.5: may panic — this is not implemented in the skeleton.
+    /// Later phases will map backend state onto RunStatus (Argo status.phase,
+    /// command-backend process liveness).
+    fn status(&self, h: &RunHandle) -> Result<RunStatus, BackendError> {
+        let _ = h;
+        panic!("status is not implemented in Phase 0.5");
     }
 }
 
@@ -466,5 +500,15 @@ mod tests {
                 v
             );
         }
+    }
+
+    /// A backend that does not override status() inherits the Phase-0.5 default
+    /// body (same convention as stream_logs/describe/cancel) and keeps compiling
+    /// unchanged until it implements the query.
+    #[test]
+    #[should_panic(expected = "status is not implemented in Phase 0.5")]
+    fn default_status_follows_phase05_panic_convention() {
+        let backend = crate::backend::command::CommandBackend::new();
+        let _ = backend.status(&RunHandle::new("unused"));
     }
 }
