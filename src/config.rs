@@ -325,35 +325,79 @@ impl GantryConfig {
     /// Returns the loaded config, any warnings (e.g., unknown keys), and
     /// an optional broken-config banner if serving from last-known-good.
     pub fn load() -> ConfigLoadResult {
-        let mut warnings = Vec::new();
-        let mut broken_banner = None;
-
-        // Resolve the real layer paths; a layer whose path cannot be
-        // determined is simply absent.
+        // Resolve the real layer and state paths; a path that cannot be
+        // determined is simply absent (state_dir absent disables the LKG
+        // mechanism entirely — the fallback is then always Tier-0).
         let system = Self::system_config_path().ok();
         let user = Self::user_config_path().ok();
         let repo = Self::repo_config_path();
+        let state_dir = Self::state_dir().ok();
+
+        Self::load_with_paths(
+            system.as_deref(),
+            user.as_deref(),
+            repo.as_deref(),
+            state_dir.as_deref(),
+        )
+    }
+
+    /// [`load`](Self::load) with every filesystem location supplied by the
+    /// caller — the testable core of the last-known-good contract (Q-7).
+    ///
+    /// Like [`load_layers`](Self::load_layers) this touches no
+    /// process-global state: `state_dir` holds the LKG snapshot and the
+    /// broken-config marker. Failure posture is never silent and never
+    /// blocking:
+    ///
+    /// - clean load → config served, snapshot refreshed, broken marker
+    ///   cleared (a fix stops the banner and resets escalation);
+    /// - broken config + usable snapshot → snapshot served with a
+    ///   broken-config banner whose run count escalates;
+    /// - broken config, no usable snapshot → Tier-0 defaults, banner still
+    ///   shown, and every degradation reason on stderr.
+    fn load_with_paths(
+        system: Option<&Path>,
+        user: Option<&Path>,
+        repo: Option<&Path>,
+        state_dir: Option<&Path>,
+    ) -> ConfigLoadResult {
+        let mut warnings = Vec::new();
+        let mut broken_banner = None;
 
         // Try loading from layers; if corrupted, use LKG snapshot.
-        let load_result = Self::load_layers(system.as_deref(), user.as_deref(), repo.as_deref());
+        let load_result = Self::load_layers(system, user, repo);
         let config = match load_result {
             Ok(result) => {
                 warnings.extend(result.warnings);
-                // Config parsed successfully - persist as LKG snapshot.
-                let _ = Self::persist_lkg(&result.config);
+                // Config parsed successfully — refresh the LKG snapshot and
+                // retire the banner: the marker must not survive a fix, or a
+                // later incident would inherit the old count and "since".
+                if let Some(dir) = state_dir {
+                    let _ = Self::persist_lkg_in(dir, &result.config);
+                    Self::clear_broken_marker_in(dir);
+                }
                 result.config
             }
             Err(err) => {
                 // Config broken - try LKG snapshot.
                 eprintln!("[gantry] config broken: {}, using last-known-good", err);
-                match Self::load_lkg(&mut warnings, &mut broken_banner) {
-                    Ok(cfg) => cfg,
-                    Err(_) => {
-                        // No LKG - fail open to Tier-0 defaults.
-                        eprintln!("[gantry] no last-known-good snapshot, using Tier-0 defaults");
-                        Self::tier_0_defaults()
+                let lkg = state_dir.and_then(|dir| {
+                    match Self::load_lkg_in(dir, &mut warnings, &mut broken_banner) {
+                        Ok(cfg) => Some(cfg),
+                        Err(e) => {
+                            // The snapshot itself is missing or corrupt — say
+                            // why instead of lumping it in with "no snapshot".
+                            eprintln!("[gantry] last-known-good snapshot unusable: {}", e);
+                            None
+                        }
                     }
-                }
+                });
+                lkg.unwrap_or_else(|| {
+                    // No LKG - fail open to Tier-0 defaults (still bannered —
+                    // the marker was written by load_lkg_in).
+                    eprintln!("[gantry] no usable last-known-good snapshot, using Tier-0 defaults");
+                    Self::tier_0_defaults()
+                })
             }
         };
 
@@ -719,29 +763,28 @@ impl GantryConfig {
     // Last-known-good snapshot operations
     // ============================================================================
 
-    fn lkg_path() -> Result<PathBuf, String> {
-        Self::state_dir().map(|p| p.join("last-known-good.toml"))
+    fn lkg_path_in(state_dir: &Path) -> PathBuf {
+        state_dir.join("last-known-good.toml")
     }
 
-    fn lkg_meta_path() -> Result<PathBuf, String> {
-        Self::state_dir().map(|p| p.join("last-known-good.meta.json"))
+    fn lkg_meta_path_in(state_dir: &Path) -> PathBuf {
+        state_dir.join("last-known-good.meta.json")
     }
 
-    fn broken_marker_path() -> Result<PathBuf, String> {
-        Self::state_dir().map(|p| p.join("broken-config.marker"))
+    fn broken_marker_path_in(state_dir: &Path) -> PathBuf {
+        state_dir.join("broken-config.marker")
     }
 
-    /// Persist the current config as the last-known-good snapshot.
-    fn persist_lkg(config: &GantryConfig) -> Result<(), String> {
-        let state_dir = Self::state_dir()?;
-        fs::create_dir_all(&state_dir).map_err(|e| format!("failed to create state dir: {}", e))?;
+    /// Persist the config as the last-known-good snapshot under `state_dir`.
+    fn persist_lkg_in(state_dir: &Path, config: &GantryConfig) -> Result<(), String> {
+        fs::create_dir_all(state_dir).map_err(|e| format!("failed to create state dir: {}", e))?;
 
         // Serialize config to TOML.
         let toml_content = toml::to_string_pretty(&Self::to_raw(config))
             .map_err(|e| format!("failed to serialize config: {}", e))?;
 
         // Write the snapshot.
-        let lkg_path = Self::lkg_path()?;
+        let lkg_path = Self::lkg_path_in(state_dir);
         fs::write(&lkg_path, toml_content)
             .map_err(|e| format!("failed to write LKG snapshot: {}", e))?;
 
@@ -758,53 +801,72 @@ impl GantryConfig {
         };
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| format!("failed to serialize metadata: {}", e))?;
-        fs::write(Self::lkg_meta_path()?, meta_json)
+        fs::write(Self::lkg_meta_path_in(state_dir), meta_json)
             .map_err(|e| format!("failed to write LKG metadata: {}", e))?;
 
         Ok(())
     }
 
-    /// Load the last-known-good snapshot.
-    fn load_lkg(
+    /// Load the last-known-good snapshot from `state_dir`, maintaining the
+    /// escalating broken-config banner state as a side effect.
+    fn load_lkg_in(
+        state_dir: &Path,
         warnings: &mut Vec<String>,
         broken_banner: &mut Option<BrokenBanner>,
     ) -> Result<GantryConfig, String> {
-        let lkg_path = Self::lkg_path()?;
-        let meta_path = Self::lkg_meta_path()?;
-        let marker_path = Self::broken_marker_path()?;
+        let lkg_path = Self::lkg_path_in(state_dir);
+        let meta_path = Self::lkg_meta_path_in(state_dir);
+        let marker_path = Self::broken_marker_path_in(state_dir);
 
-        // Check for broken-config marker and load banner state.
-        if marker_path.exists() {
-            if let Ok(content) = fs::read_to_string(&marker_path) {
-                if let Ok(marker) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let count = marker["count"].as_u64().unwrap_or(1);
-                    let since_ts = marker["since"].as_u64().unwrap_or(0);
-                    *broken_banner = Some(BrokenBanner {
-                        count: count + 1,
-                        since: SystemTime::UNIX_EPOCH + Duration::from_secs(since_ts),
-                    });
+        // The state dir is normally created by persist_lkg_in on an earlier
+        // clean load — but a config that has never loaded cleanly reaches
+        // here with no state dir, and the marker must land anyway or the
+        // banner can never escalate across runs.
+        let _ = fs::create_dir_all(state_dir);
 
-                    // Update marker with incremented count.
-                    let updated = serde_json::json!({
-                        "count": count + 1,
-                        "since": since_ts,
-                    });
-                    let _ = fs::write(&marker_path, updated.to_string());
+        // Escalating banner state: a fresh corruption starts the count at 1
+        // and stamps "broken since"; every further degraded run increments
+        // the count but keeps the original timestamp. A marker that cannot
+        // be read as {count, since} is treated as a fresh detection and
+        // overwritten — a broken marker must never suppress the banner,
+        // because silence is the one failure mode Q-7 forbids.
+        let banner = match fs::read_to_string(&marker_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|marker| {
+                let count = marker["count"].as_u64()?;
+                let since = marker["since"].as_u64()?;
+                Some((count, since))
+            }) {
+            Some((count, since_ts)) => {
+                let banner = BrokenBanner {
+                    count: count + 1,
+                    since: SystemTime::UNIX_EPOCH + Duration::from_secs(since_ts),
+                };
+
+                // Update marker with incremented count.
+                let updated = serde_json::json!({
+                    "count": banner.count,
+                    "since": since_ts,
+                });
+                let _ = fs::write(&marker_path, updated.to_string());
+                banner
+            }
+            None => {
+                // First detection (or unreadable marker) - create marker.
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let marker = serde_json::json!({ "count": 1, "since": now });
+                let _ = fs::write(&marker_path, marker.to_string());
+                BrokenBanner {
+                    count: 1,
+                    since: SystemTime::UNIX_EPOCH + Duration::from_secs(now),
                 }
             }
-        } else {
-            // First detection - create marker.
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let marker = serde_json::json!({ "count": 1, "since": now });
-            let _ = fs::write(&marker_path, marker.to_string());
-            *broken_banner = Some(BrokenBanner {
-                count: 1,
-                since: SystemTime::UNIX_EPOCH + Duration::from_secs(now),
-            });
-        }
+        };
+        *broken_banner = Some(banner);
 
         // Read and validate metadata.
         let meta_content = fs::read_to_string(&meta_path)
@@ -822,6 +884,16 @@ impl GantryConfig {
         Self::merge_layer(&mut config, &lkg_path, ConfigLayer::Defaults, warnings)?;
 
         Ok(config)
+    }
+
+    /// Remove the broken-config marker after a clean load.
+    ///
+    /// The banner runs "until fixed" (plan Q-7): a config that parses must
+    /// stop the escalation, and the next corruption must start a fresh count
+    /// and "since" rather than inheriting the previous incident's. Best
+    /// effort — failing to remove the marker must never fail the load.
+    fn clear_broken_marker_in(state_dir: &Path) {
+        let _ = fs::remove_file(Self::broken_marker_path_in(state_dir));
     }
 
     /// Convert Config to RawConfig for serialization.
@@ -1981,5 +2053,219 @@ mod tests {
             })
             .collect();
         assert_eq!(keys, vec!["apple", "mango", "zebra"]);
+    }
+
+    // ========================================================================
+    // Last-known-good snapshot + escalating banner (bf-10pd, Q-7)
+    // ========================================================================
+
+    /// Config content that always fails to parse — the corruption fixture.
+    /// Unknown keys would only warn, so a broken config must be a structural
+    /// one.
+    const CORRUPT_TOML: &str = ":: definitely not toml ::";
+
+    /// A healthy user config loads clean and leaves an LKG snapshot behind:
+    /// no banner, and both snapshot files in the state dir.
+    #[test]
+    fn lkg_clean_load_refreshes_snapshot_without_banner() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+        fs::write(
+            &user,
+            r#"
+            [local]
+            cpu_quota_pct = 150
+            memory_max = "12G"
+            "#,
+        )
+        .unwrap();
+
+        let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        assert!(result.broken_banner.is_none(), "clean load: no banner");
+        assert_eq!(result.config.local.cpu_quota_pct, 150);
+        assert!(state.join("last-known-good.toml").exists(), "snapshot");
+        assert!(
+            state.join("last-known-good.meta.json").exists(),
+            "snapshot metadata"
+        );
+        assert!(!state.join("broken-config.marker").exists());
+    }
+
+    /// The Q-7 acceptance pair: a corrupted config serves the persisted
+    /// last-known-good snapshot with a broken-config banner — degraded
+    /// service, but never silence and never a hard failure.
+    #[test]
+    fn lkg_corrupted_config_serves_snapshot_with_banner() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+
+        // First run: healthy config loads clean and (exactly what load()
+        // does on success) leaves a snapshot of itself behind.
+        fs::write(
+            &user,
+            r#"
+            [local]
+            cpu_quota_pct = 150
+            memory_max = "12G"
+            "#,
+        )
+        .unwrap();
+        let good = Config::load_with_paths(None, Some(&user), None, Some(&state));
+        assert!(good.broken_banner.is_none());
+
+        // Second run: the user config has since been corrupted.
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        let degraded = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        // The snapshot is served, not Tier-0 defaults: every value it
+        // captured stays in force.
+        assert_eq!(degraded.config.local.cpu_quota_pct, 150);
+        assert_eq!(degraded.config.local.memory_max, "12G");
+
+        // And the degradation is loud: banner shown, first detection = 1.
+        let banner = degraded.broken_banner.expect("broken banner shown");
+        assert_eq!(banner.count, 1);
+    }
+
+    /// The banner escalates: each consecutive degraded run increments the
+    /// count while "broken since" stays pinned to the first detection.
+    #[test]
+    fn lkg_banner_count_escalates_across_degraded_runs() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+        fs::write(&user, CORRUPT_TOML).unwrap();
+
+        let mut first_since = None;
+        for expected in 1..=3u64 {
+            let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+            let banner = result
+                .broken_banner
+                .unwrap_or_else(|| panic!("run {expected}: banner missing"));
+            assert_eq!(banner.count, expected, "run {expected}");
+            match first_since {
+                None => first_since = Some(banner.since),
+                Some(prev) => assert_eq!(banner.since, prev, "since must not drift"),
+            }
+        }
+    }
+
+    /// With no snapshot on disk, a broken config fails open to Tier-0
+    /// defaults — but still banners (plan Q-7: "plain passthrough + banner
+    /// if no snapshot exists (never silent)").
+    #[test]
+    fn lkg_no_snapshot_falls_back_to_tier0_with_banner() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state"); // never populated
+        let user = temp.path().join("config.toml");
+        fs::write(&user, CORRUPT_TOML).unwrap();
+
+        let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        assert_eq!(result.config, Config::tier_0_defaults());
+        let banner = result
+            .broken_banner
+            .expect("banner even without a snapshot");
+        assert_eq!(banner.count, 1);
+
+        // With no state dir at all there is nowhere to track escalation, so
+        // the banner struct is None — the stderr line is then the only
+        // signal, which is why load_with_paths prints before falling back.
+        let result = Config::load_with_paths(None, Some(&user), None, None);
+        assert_eq!(result.config, Config::tier_0_defaults());
+        assert!(result.broken_banner.is_none());
+    }
+
+    /// A fix stops the banner and resets escalation: the clean load removes
+    /// the marker and refreshes the snapshot, so a later corruption starts a
+    /// fresh count and serves the fixed config — not the pre-fix snapshot.
+    #[test]
+    fn lkg_clean_load_resets_broken_state() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+        let marker = state.join("broken-config.marker");
+
+        // Break, then verify the marker exists (escalation state on disk).
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        let broken = Config::load_with_paths(None, Some(&user), None, Some(&state));
+        assert_eq!(broken.broken_banner.as_ref().unwrap().count, 1);
+        assert!(marker.exists(), "marker written on first detection");
+
+        // Fix: the banner stops and the marker is retired.
+        fs::write(
+            &user,
+            r#"
+            [local]
+            cpu_quota_pct = 90
+            "#,
+        )
+        .unwrap();
+        let fixed = Config::load_with_paths(None, Some(&user), None, Some(&state));
+        assert!(fixed.broken_banner.is_none(), "fix stops the banner");
+        assert!(!marker.exists(), "fix clears the marker");
+
+        // Break again: fresh incident — count restarts at 1, and the
+        // snapshot served is the fixed config (cpu_quota_pct = 90).
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        let again = Config::load_with_paths(None, Some(&user), None, Some(&state));
+        let banner = again.broken_banner.expect("second incident banner");
+        assert_eq!(banner.count, 1, "escalation restarted");
+        assert_eq!(again.config.local.cpu_quota_pct, 90, "refreshed snapshot");
+    }
+
+    /// An unusable snapshot (corrupt metadata) degrades to Tier-0 with a
+    /// banner rather than panicking or serving silence. The marker is still
+    /// written, so repeated runs keep escalating.
+    #[test]
+    fn lkg_unusable_snapshot_degrades_to_tier0_with_banner() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+
+        // Produce a snapshot, then maim its metadata.
+        fs::write(&user, "[local]\ncpu_quota_pct = 150\n").unwrap();
+        Config::load_with_paths(None, Some(&user), None, Some(&state));
+        fs::write(state.join("last-known-good.meta.json"), "{oops").unwrap();
+
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        assert_eq!(result.config, Config::tier_0_defaults());
+        let banner = result.broken_banner.expect("banner on unusable snapshot");
+        assert_eq!(banner.count, 1);
+    }
+
+    /// A corrupt or unreadable marker must not suppress the banner: the run
+    /// is treated as a fresh detection and the marker is rewritten into a
+    /// readable shape so the next run can escalate from it.
+    #[test]
+    fn lkg_corrupt_marker_still_banners_as_fresh_detection() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+
+        // Healthy config -> snapshot; then corrupt both the config and the
+        // escalation marker.
+        fs::write(&user, "[local]\ncpu_quota_pct = 150\n").unwrap();
+        Config::load_with_paths(None, Some(&user), None, Some(&state));
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        fs::write(state.join("broken-config.marker"), "not json {").unwrap();
+
+        let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        // The snapshot is still served and the banner still shown.
+        assert_eq!(result.config.local.cpu_quota_pct, 150);
+        let banner = result.broken_banner.expect("banner despite corrupt marker");
+        assert_eq!(banner.count, 1);
+
+        // The marker was rewritten readably, ready to escalate.
+        let marker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(state.join("broken-config.marker")).unwrap())
+                .expect("marker rewritten as JSON");
+        assert_eq!(marker["count"], 1);
     }
 }
