@@ -10,6 +10,14 @@
 // - wait: polls kubectl get workflow status.phase until terminal or deadline
 // - describe: returns the workflow name/UI URL
 // - cancel: kubectl delete workflow
+//
+// Every blocking kubectl invocation routes through one injectable seam,
+// [`KubectlRunner`] (production: [`ProcessKubectl`], which spawns the real
+// binary; unit tests: an in-memory fake), so submit()'s error paths are
+// unit-testable without a cluster or a kubectl executable — the same funnel
+// pattern the command backend uses for its argv. Only `follow_pod_logs` sits
+// outside the seam: streaming needs live process stdout to copy from as the
+// run progresses, not a captured end-of-run result.
 
 use crate::backend::{BackendError, RemoteBackend, RunSpec, Verdict, VerdictJson};
 use std::io::{Read, Write};
@@ -264,6 +272,134 @@ impl Default for ArgoConfig {
     }
 }
 
+/// The captured result of one kubectl invocation.
+///
+/// The backend only ever asks whether the call succeeded and reads the
+/// captured streams (submit surfaces stderr, status polling parses stdout),
+/// so an exit code plus the two captures is the whole contract — a signal
+/// death (`code: None`) simply never counts as success.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KubectlOutcome {
+    /// Process exit code (`None` = killed by a signal), mirroring
+    /// `std::process::ExitStatus::code()`.
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl KubectlOutcome {
+    /// Whether kubectl exited successfully (exit code 0).
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+impl From<Output> for KubectlOutcome {
+    fn from(output: Output) -> Self {
+        KubectlOutcome {
+            code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
+    }
+}
+
+/// Seam for kubectl process invocation.
+///
+/// Every blocking kubectl call the backend makes (submit's `create -f -`,
+/// `get workflow`, `get pods`, `delete workflow`) funnels through this one
+/// trait, the way the command backend funnels its argv through a single
+/// `run_command` helper. Production injects [`ProcessKubectl`]; unit tests
+/// inject an in-memory fake so submit()'s error paths run without a cluster
+/// or a kubectl binary.
+pub trait KubectlRunner: Send + Sync {
+    /// Run kubectl with `args`, feeding `stdin` to the process when given
+    /// (submit pipes the Workflow manifest into `create -f -`).
+    ///
+    /// A child that exits before reading all of stdin (broken pipe) is not an
+    /// error here: the caller diagnoses it from the returned non-zero status
+    /// and captured stderr. Only spawn and wait failures are Err.
+    fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<KubectlOutcome, BackendError>;
+}
+
+/// Production [`KubectlRunner`]: spawns the configured kubectl binary.
+pub struct ProcessKubectl {
+    kubectl_path: String,
+    kubeconfig: String,
+    namespace: String,
+}
+
+impl ProcessKubectl {
+    /// Build the runner for `config`'s kubectl path, kubeconfig, and namespace.
+    pub fn from_config(config: &ArgoConfig) -> Self {
+        ProcessKubectl {
+            kubectl_path: config.kubectl_path.clone(),
+            kubeconfig: config.kubeconfig.clone(),
+            namespace: config.namespace.clone(),
+        }
+    }
+
+    /// A Command with the connection flags (`--kubeconfig`, `-n`) applied;
+    /// callers add only the subcommand arguments.
+    fn base_command(&self) -> Command {
+        let mut cmd = Command::new(&self.kubectl_path);
+
+        // Add kubeconfig flag if set
+        if !self.kubeconfig.is_empty() {
+            cmd.arg("--kubeconfig").arg(&self.kubeconfig);
+        }
+
+        // Add namespace flag
+        cmd.arg("-n").arg(&self.namespace);
+        cmd
+    }
+}
+
+impl KubectlRunner for ProcessKubectl {
+    fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<KubectlOutcome, BackendError> {
+        let output = match stdin {
+            // No stdin: capture-and-wait in one step.
+            None => self
+                .base_command()
+                .args(args)
+                .output()
+                .map_err(|e| BackendError::new(&format!("failed to run kubectl: {}", e)))?,
+            // Manifest on stdin: spawn with all three pipes, write the
+            // payload, then collect. A broken pipe means kubectl exited
+            // before reading it (e.g. the manifest was rejected client-side)
+            // — fall through so wait_with_output surfaces kubectl's stderr
+            // as the real error instead of masking it.
+            Some(manifest) => {
+                let mut child = self
+                    .base_command()
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| BackendError::new(&format!("failed to spawn kubectl: {}", e)))?;
+
+                if let Some(mut pipe) = child.stdin.take() {
+                    if let Err(e) = pipe.write_all(manifest) {
+                        if e.kind() != std::io::ErrorKind::BrokenPipe {
+                            return Err(BackendError::new(&format!(
+                                "failed to write workflow: {}",
+                                e
+                            )));
+                        }
+                    }
+                    // Dropping `pipe` signals EOF, letting kubectl finish.
+                }
+
+                child
+                    .wait_with_output()
+                    .map_err(|e| BackendError::new(&format!("failed to wait for kubectl: {}", e)))?
+            }
+        };
+        Ok(output.into())
+    }
+}
+
 /// Outcome of bounded pod discovery for log streaming.
 #[derive(Debug, Clone, PartialEq)]
 enum PodDiscovery {
@@ -280,38 +416,33 @@ enum PodDiscovery {
 pub struct ArgoBackend {
     /// Argo-specific configuration.
     config: ArgoConfig,
+    /// The kubectl execution seam: the production binary runner, or a test
+    /// fake when the backend is built through `with_runner`.
+    kubectl: Box<dyn KubectlRunner>,
 }
 
 impl ArgoBackend {
     /// Create a new ArgoBackend with configuration.
     pub fn new(config: ArgoConfig) -> Self {
-        ArgoBackend { config }
+        let kubectl = Box::new(ProcessKubectl::from_config(&config));
+        ArgoBackend { config, kubectl }
     }
 
     /// Create a new ArgoBackend with default config.
     pub fn default_config() -> Self {
-        ArgoBackend {
-            config: ArgoConfig::default(),
-        }
+        ArgoBackend::new(ArgoConfig::default())
     }
 
-    /// Run kubectl with arguments and return output.
-    fn kubectl(&self, args: &[&str]) -> Result<Output, BackendError> {
-        let mut cmd = Command::new(&self.config.kubectl_path);
+    /// Create a new ArgoBackend around an injected kubectl runner (tests
+    /// hand in an in-memory fake; no cluster, no kubectl binary).
+    #[cfg(test)]
+    fn with_runner(config: ArgoConfig, kubectl: Box<dyn KubectlRunner>) -> Self {
+        ArgoBackend { config, kubectl }
+    }
 
-        // Add kubeconfig flag if set
-        if !self.config.kubeconfig.is_empty() {
-            cmd.arg("--kubeconfig").arg(&self.config.kubeconfig);
-        }
-
-        // Add namespace flag
-        cmd.arg("-n").arg(&self.config.namespace);
-
-        // Add the arguments
-        cmd.args(args);
-
-        cmd.output()
-            .map_err(|e| BackendError::new(&format!("failed to run kubectl: {}", e)))
+    /// Run kubectl with arguments and return its captured outcome.
+    fn kubectl(&self, args: &[&str]) -> Result<KubectlOutcome, BackendError> {
+        self.kubectl.run(args, None)
     }
 
     /// Fetch and parse the workflow's `status` stanza.
@@ -325,7 +456,7 @@ impl ArgoBackend {
         workflow_name: &str,
     ) -> Result<Option<workflow::WorkflowStatus>, BackendError> {
         let output = self.kubectl(&["get", "workflow", workflow_name, "-o", "json"])?;
-        if !output.status.success() {
+        if !output.success() {
             return Ok(None);
         }
         let json = String::from_utf8_lossy(&output.stdout);
@@ -394,6 +525,10 @@ impl ArgoBackend {
     /// every line until the run finished, defeating the point of streaming.
     /// kubectl's stderr is drained concurrently (a full stderr pipe would
     /// otherwise deadlock the copy) and reported when the stream fails.
+    ///
+    /// This is the one kubectl invocation deliberately NOT on the
+    /// [`KubectlRunner`] seam: streaming needs live process stdout to copy
+    /// from as the run progresses, not a captured end-of-run result.
     fn follow_pod_logs(&self, pod_name: &str, out: &mut dyn Write) -> Result<(), BackendError> {
         let mut cmd = Command::new(&self.config.kubectl_path);
 
@@ -466,7 +601,7 @@ impl ArgoBackend {
             "json",
         ])?;
 
-        if !output.status.success() {
+        if !output.success() {
             return Ok(None); // No pods found yet
         }
 
@@ -489,8 +624,9 @@ impl ArgoBackend {
 impl RemoteBackend for ArgoBackend {
     /// Submit a workflow to Argo.
     ///
-    /// Builds the Workflow manifest with serde and runs kubectl create -f -.
-    /// The workflow name (stdout) becomes the handle.
+    /// Builds the Workflow manifest with serde and pipes it into
+    /// `kubectl create -f -` through the [`KubectlRunner`] seam. The workflow
+    /// name (stdout) becomes the handle.
     fn submit(&self, spec: &RunSpec) -> Result<crate::backend::RunHandle, BackendError> {
         // Format args as JSON array
         let args_json = serde_json::to_string(&spec.args)
@@ -510,48 +646,14 @@ impl RemoteBackend for ArgoBackend {
         let workflow_json = serde_json::to_string_pretty(&workflow)
             .map_err(|e| BackendError::new(&format!("failed to serialize workflow: {}", e)))?;
 
-        // Submit via kubectl create -f -
-        let mut cmd = Command::new(&self.config.kubectl_path);
+        // Submit via kubectl create -f - (spawn, stdin piping, and the
+        // broken-pipe tolerance all live behind the runner seam)
+        let output = self.kubectl.run(
+            ["create", "-f", "-"].as_slice(),
+            Some(workflow_json.as_bytes()),
+        )?;
 
-        // Add kubeconfig flag if set
-        if !self.config.kubeconfig.is_empty() {
-            cmd.arg("--kubeconfig").arg(&self.config.kubeconfig);
-        }
-
-        // Add namespace flag
-        cmd.arg("-n").arg(&self.config.namespace);
-        cmd.args(["create", "-f", "-"]);
-
-        // Spawn kubectl with stdin piped
-        let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| BackendError::new(&format!("failed to spawn kubectl: {}", e)))?;
-
-        // Write the manifest to kubectl's stdin. A broken pipe means kubectl
-        // exited before reading it (e.g. the manifest was rejected client-side)
-        // — fall through so wait_with_output surfaces kubectl's stderr as the
-        // real error instead of masking it.
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(workflow_json.as_bytes()) {
-                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                    return Err(BackendError::new(&format!(
-                        "failed to write workflow: {}",
-                        e
-                    )));
-                }
-            }
-            // Drop stdin to signal EOF, then wait for kubectl to finish.
-        }
-
-        // Wait for completion and get output
-        let output = child
-            .wait_with_output()
-            .map_err(|e| BackendError::new(&format!("failed to wait for kubectl: {}", e)))?;
-
-        if !output.status.success() {
+        if !output.success() {
             return Err(BackendError::new(&format!(
                 "workflow submission failed: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -724,7 +826,7 @@ impl RemoteBackend for ArgoBackend {
     fn cancel(&self, h: &crate::backend::RunHandle) -> Result<(), BackendError> {
         let output = self.kubectl(&["delete", "workflow", &h.handle])?;
 
-        if !output.status.success() {
+        if !output.success() {
             return Err(BackendError::new(&format!(
                 "failed to cancel workflow: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -1094,6 +1196,104 @@ mod tests {
         }
     }
 
+    // --- the in-memory kubectl fake -----------------------------------------
+
+    use std::sync::{Arc, Mutex};
+
+    /// One recorded kubectl invocation: the subcommand argv (without
+    /// connection flags) and the stdin payload submit piped in, if any.
+    #[derive(Debug, Clone, PartialEq)]
+    struct RecordedCall {
+        args: Vec<String>,
+        stdin: Option<Vec<u8>>,
+    }
+
+    /// An in-memory [`KubectlRunner`] backing `submit()` unit tests: no
+    /// process, no filesystem, no cluster. Serves scripted outcomes in call
+    /// order (the final outcome repeats once the script runs out, so polling
+    /// loops see a steady state instead of running past the script) and
+    /// records every invocation into a shared log the test can read after
+    /// the fake has been moved behind the backend.
+    struct FakeKubectl {
+        outcomes: Mutex<Vec<KubectlOutcome>>,
+        calls: Arc<Mutex<Vec<RecordedCall>>>,
+    }
+
+    impl FakeKubectl {
+        /// Build a fake serving `outcomes`, plus the handle to its call log.
+        fn serving(outcomes: Vec<KubectlOutcome>) -> (Box<Self>, Arc<Mutex<Vec<RecordedCall>>>) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Box::new(FakeKubectl {
+                    outcomes: Mutex::new(outcomes),
+                    calls: Arc::clone(&calls),
+                }),
+                calls,
+            )
+        }
+    }
+
+    impl KubectlRunner for FakeKubectl {
+        fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<KubectlOutcome, BackendError> {
+            self.calls
+                .lock()
+                .expect("fake call log lock")
+                .push(RecordedCall {
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                    stdin: stdin.map(<[u8]>::to_vec),
+                });
+            let mut outcomes = self.outcomes.lock().expect("fake outcomes lock");
+            if outcomes.is_empty() {
+                panic!("fake kubectl ran past its scripted outcomes");
+            }
+            if outcomes.len() > 1 {
+                Ok(outcomes.remove(0))
+            } else {
+                Ok(outcomes[0].clone())
+            }
+        }
+    }
+
+    /// Snapshot a fake's recorded calls for assertions.
+    fn calls_of(calls: &Arc<Mutex<Vec<RecordedCall>>>) -> Vec<RecordedCall> {
+        calls.lock().expect("fake call log lock").clone()
+    }
+
+    /// A successful kubectl outcome carrying `stdout`.
+    fn ok_outcome(stdout: &str) -> KubectlOutcome {
+        KubectlOutcome {
+            code: Some(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    /// A failed kubectl outcome carrying `stderr`.
+    fn failed_outcome(stderr: &str) -> KubectlOutcome {
+        KubectlOutcome {
+            code: Some(1),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// A backend around an injected fake runner with default config.
+    fn backend_with_runner(kubectl: Box<dyn KubectlRunner>) -> ArgoBackend {
+        ArgoBackend::with_runner(ArgoConfig::default(), kubectl)
+    }
+
+    /// The RunSpec every submit test submits.
+    fn submit_spec() -> RunSpec {
+        RunSpec::new(
+            "cargo",
+            "test",
+            vec![],
+            "https://github.com/example/repo",
+            "abc123",
+            "",
+        )
+    }
+
     /// A kubectl binary that cannot be spawned (nonexistent path) is a loud error.
     #[test]
     fn test_submit_kubectl_spawn_failure_is_error() {
@@ -1125,11 +1325,155 @@ mod tests {
         );
     }
 
-    /// A failing kubectl surfaces its stderr as the submit error, not a
-    /// masked "failed to write workflow" (the manifest write may hit a
-    /// broken pipe because kubectl exited before reading stdin).
+    // --- submit() error paths through the in-memory fake --------------------
+    //
+    // The fake exercises the seam contract exactly — argv `create -f -` plus
+    // the manifest on stdin — with no temp files, no exec, and therefore no
+    // ETXTBSY retries.
+
+    /// Happy path through the seam: submit pipes the manifest into
+    /// `create -f -` and parses kubectl's
+    /// `workflow.argoproj.io/<name> created` stdout into a RunHandle carrying
+    /// the generated workflow name.
     #[test]
-    fn test_submit_surfaces_kubectl_stderr_on_failure() {
+    fn submit_yields_run_handle_with_workflow_name() {
+        let (fake, calls) = FakeKubectl::serving(vec![ok_outcome(
+            "workflow.argoproj.io/gantry-abc123 created\n",
+        )]);
+        let backend = backend_with_runner(fake);
+
+        let handle = backend.submit(&submit_spec()).expect("submit must succeed");
+        assert_eq!(handle, RunHandle::new("gantry-abc123"));
+
+        // Exactly one kubectl call, shaped `create -f -` with the manifest
+        // on stdin (never spliced into argv).
+        let log = calls_of(&calls);
+        assert_eq!(log.len(), 1, "submit makes exactly one kubectl call");
+        assert_eq!(log[0].args, vec!["create", "-f", "-"]);
+        let manifest: serde_json::Value = serde_json::from_str(
+            std::str::from_utf8(log[0].stdin.as_deref().expect("manifest on stdin"))
+                .expect("manifest is utf-8"),
+        )
+        .expect("stdin payload is the Workflow manifest JSON");
+        assert_eq!(manifest["metadata"]["generateName"], "gantry-");
+    }
+
+    /// kubectl create exiting non-zero surfaces kubectl's stderr in the
+    /// BackendError — the API server's refusal is the diagnosable event, not
+    /// a generic failure.
+    #[test]
+    fn submit_reports_nonzero_exit_with_stderr() {
+        let (fake, calls) = FakeKubectl::serving(vec![failed_outcome(
+            "Error from server (Forbidden): workflows is forbidden",
+        )]);
+        let backend = backend_with_runner(fake);
+
+        let err = backend
+            .submit(&submit_spec())
+            .expect_err("non-zero kubectl exit must fail submit");
+        assert!(
+            err.reason.contains("workflow submission failed")
+                && err.reason.contains("Error from server (Forbidden)"),
+            "{}",
+            err.reason
+        );
+
+        // The refusal came from the `create -f -` submission call.
+        assert_eq!(calls_of(&calls)[0].args, vec!["create", "-f", "-"]);
+    }
+
+    /// stdout that does not carry the `workflow.argoproj.io/` prefix (e.g. an
+    /// unexpected message) is a loud error, not a garbage handle.
+    #[test]
+    fn test_submit_rejects_stdout_without_workflow_prefix() {
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome("error: unrecognized resource\n")]);
+        let backend = backend_with_runner(fake);
+
+        let err = backend
+            .submit(&submit_spec())
+            .expect_err("submit must fail on unrecognized stdout");
+        assert!(
+            err.reason.contains("missing workflow name"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// A prefix with no name after the slash (`workflow.argoproj.io/` on its
+    /// own) is a loud error, not a garbage handle.
+    #[test]
+    fn test_submit_rejects_bare_prefix_without_name() {
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome("workflow.argoproj.io/\n")]);
+        let backend = backend_with_runner(fake);
+
+        let err = backend
+            .submit(&submit_spec())
+            .expect_err("submit must fail on a nameless workflow prefix");
+        assert!(
+            err.reason.contains("missing workflow name"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// An empty name token followed by the status word (`workflow.argoproj.io/
+    /// created`) is a loud error: taking the first whitespace token would
+    /// otherwise return the status word itself as the handle.
+    #[test]
+    fn test_submit_rejects_empty_name_before_status_word() {
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome("workflow.argoproj.io/ created\n")]);
+        let backend = backend_with_runner(fake);
+
+        let err = backend
+            .submit(&submit_spec())
+            .expect_err("submit must not return the status word as the handle");
+        assert!(
+            err.reason.contains("missing workflow name"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// A runner that cannot execute (spawn failure) propagates its error to
+    /// the caller unchanged — submit adds no masking layer on top.
+    #[test]
+    fn submit_propagates_runner_errors_verbatim() {
+        struct FailingKubectl;
+        impl KubectlRunner for FailingKubectl {
+            fn run(
+                &self,
+                _args: &[&str],
+                _stdin: Option<&[u8]>,
+            ) -> Result<KubectlOutcome, BackendError> {
+                Err(BackendError::new(
+                    "failed to spawn kubectl: no such file or directory",
+                ))
+            }
+        }
+        let backend = backend_with_runner(Box::new(FailingKubectl));
+
+        let err = backend
+            .submit(&submit_spec())
+            .expect_err("a failing runner must fail submit");
+        assert_eq!(
+            err.reason,
+            "failed to spawn kubectl: no such file or directory"
+        );
+    }
+
+    // --- submit() through the production runner (real spawn) ----------------
+    //
+    // The fake cannot cover what lives inside ProcessKubectl: actually
+    // spawning a process, piping stdin into it, and tolerating a child that
+    // exits before reading the manifest. A mock kubectl script exercises
+    // those for real.
+
+    /// A failing kubectl surfaces its stderr as the submit error, not a
+    /// masked "failed to write workflow": the mock exits before reading
+    /// stdin, so the manifest write hits a broken pipe and must fall through
+    /// to the captured stderr.
+    #[test]
+    fn submit_tolerates_kubectl_exiting_before_reading_stdin() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let kubectl = write_mock_kubectl(
             tmp.path(),
@@ -1139,16 +1483,8 @@ mod tests {
             kubectl_path: kubectl.to_string_lossy().into_owned(),
             ..ArgoConfig::default()
         });
-        let spec = RunSpec::new(
-            "cargo",
-            "test",
-            vec![],
-            "https://github.com/example/repo",
-            "abc123",
-            "",
-        );
 
-        let err = with_exec_retry(|| backend.submit(&spec))
+        let err = with_exec_retry(|| backend.submit(&submit_spec()))
             .expect_err("submit must fail when kubectl exits non-zero");
         assert!(
             err.reason.contains("workflow submission failed")
@@ -1210,100 +1546,6 @@ mod tests {
         assert_eq!(value_of("revision"), "abc123");
         assert_eq!(value_of("args-json"), r#"["--nocapture"]"#);
         assert_eq!(value_of("builder-image"), "rust:1.83");
-    }
-
-    /// stdout that does not carry the `workflow.argoproj.io/` prefix (e.g. an
-    /// unexpected message) is a loud error, not a garbage handle.
-    #[test]
-    fn test_submit_rejects_stdout_without_workflow_prefix() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let kubectl = write_mock_kubectl(
-            tmp.path(),
-            "#!/usr/bin/env bash\necho 'error: unrecognized resource'\n",
-        );
-        let backend = ArgoBackend::new(ArgoConfig {
-            kubectl_path: kubectl.to_string_lossy().into_owned(),
-            ..ArgoConfig::default()
-        });
-        let spec = RunSpec::new(
-            "cargo",
-            "test",
-            vec![],
-            "https://github.com/example/repo",
-            "abc123",
-            "",
-        );
-
-        let err = with_exec_retry(|| backend.submit(&spec))
-            .expect_err("submit must fail on unrecognized stdout");
-        assert!(
-            err.reason.contains("missing workflow name"),
-            "{}",
-            err.reason
-        );
-    }
-
-    /// A prefix with no name after the slash (`workflow.argoproj.io/` on its
-    /// own) is a loud error, not a garbage handle.
-    #[test]
-    fn test_submit_rejects_bare_prefix_without_name() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let kubectl = write_mock_kubectl(
-            tmp.path(),
-            "#!/usr/bin/env bash\necho 'workflow.argoproj.io/'\n",
-        );
-        let backend = ArgoBackend::new(ArgoConfig {
-            kubectl_path: kubectl.to_string_lossy().into_owned(),
-            ..ArgoConfig::default()
-        });
-        let spec = RunSpec::new(
-            "cargo",
-            "test",
-            vec![],
-            "https://github.com/example/repo",
-            "abc123",
-            "",
-        );
-
-        let err = with_exec_retry(|| backend.submit(&spec))
-            .expect_err("submit must fail on a nameless workflow prefix");
-        assert!(
-            err.reason.contains("missing workflow name"),
-            "{}",
-            err.reason
-        );
-    }
-
-    /// An empty name token followed by the status word (`workflow.argoproj.io/
-    /// created`) is a loud error: taking the first whitespace token would
-    /// otherwise return the status word itself as the handle.
-    #[test]
-    fn test_submit_rejects_empty_name_before_status_word() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let kubectl = write_mock_kubectl(
-            tmp.path(),
-            "#!/usr/bin/env bash\necho 'workflow.argoproj.io/ created'\n",
-        );
-        let backend = ArgoBackend::new(ArgoConfig {
-            kubectl_path: kubectl.to_string_lossy().into_owned(),
-            ..ArgoConfig::default()
-        });
-        let spec = RunSpec::new(
-            "cargo",
-            "test",
-            vec![],
-            "https://github.com/example/repo",
-            "abc123",
-            "",
-        );
-
-        let err = with_exec_retry(|| backend.submit(&spec))
-            .expect_err("submit must not return the status word as the handle");
-        assert!(
-            err.reason.contains("missing workflow name"),
-            "{}",
-            err.reason
-        );
     }
 
     /// wait() reads status.phase from the nested `status` stanza of the real
