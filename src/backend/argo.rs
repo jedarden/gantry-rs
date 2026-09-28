@@ -467,15 +467,27 @@ impl WorkflowPhase {
 
     /// Phase-only verdict fallback for a terminal phase whose `verdict`
     /// output parameter is absent or unparseable.
+    ///
+    /// Routes through the shared exit-code-only classifier
+    /// ([`VerdictJson::from_exit_code`]) rather than a private ladder: the
+    /// terminal phase pins the exit code the run must have had — Succeeded
+    /// means the suite exited 0, Failed means something exited non-zero (a
+    /// test failure, absent verdict.json's gate attribution) — and the
+    /// classifier applies the Error precedence and exit ladder exactly as a
+    /// parsed document would. The rungs with no test outcome feed the ≥2
+    /// infra bucket: no exit code exists, which IS the infra case.
     fn fallback_verdict(self) -> Verdict {
-        match self {
-            Self::Succeeded => Verdict::Pass,
-            Self::Failed => Verdict::TestFailure,
+        let (phase, exit_code) = match self {
+            Self::Succeeded => ("Succeeded", 0),
+            Self::Failed => ("Failed", 1),
             // The workflow itself broke, so no test result exists to report.
             // (The pending rungs can never reach this terminal fallback; they
             // classify as infra if one ever does.)
-            Self::Pending | Self::Running | Self::Error => Verdict::InfraFailure,
-        }
+            Self::Pending => ("Pending", 2),
+            Self::Running => ("Running", 2),
+            Self::Error => ("Error", 2),
+        };
+        VerdictJson::from_exit_code(phase, exit_code)
     }
 }
 
@@ -861,8 +873,13 @@ impl RemoteBackend for ArgoBackend {
     /// parse.
     ///
     /// Within a terminal phase the `verdict` output parameter (verdict.json)
-    /// decides the verdict; absent or unparseable, the phase itself
-    /// classifies (Succeeded → Pass, Failed → TestFailure, Error →
+    /// decides the verdict. All three shapes of "no usable verdict.json" —
+    /// the parameter absent, malformed JSON, an unsupported schema_version —
+    /// degrade through one shared exit-code-only path
+    /// ([`VerdictJson::from_exit_code`]): the parameter absent degrades
+    /// silently, while a parse failure first surfaces its typed
+    /// [`BackendError`] on stderr. Either way the terminal phase classifies
+    /// the run (Succeeded → Pass, Failed → TestFailure, Error →
     /// InfraFailure). status.phase remains the authoritative terminal signal.
     /// Attributions gate failures to "[gantry] gate:" in output.
     fn wait(
@@ -908,13 +925,20 @@ impl RemoteBackend for ArgoBackend {
                         return Ok(verdict);
                     }
                     Err(e) => {
-                        // Fall back to exit code if verdict.json parsing fails
+                        // The typed parse error (malformed JSON, unsupported
+                        // schema_version) is reported, not raised: an unusable
+                        // document is a degradation, not a wait failure.
                         eprintln!("[gantry] failed to parse verdict.json: {}", e);
                     }
                 }
             }
+            // No `verdict` parameter at all lands here without a whisper —
+            // absence is the silent shape of the degradation.
 
-            // Fall back to the phase ladder itself for the verdict.
+            // Every shape of "no usable verdict.json" converges on the shared
+            // exit-code-only classifier ([`VerdictJson::from_exit_code`], via
+            // [`WorkflowPhase::fallback_verdict`]) — the same ladder a parsed
+            // document runs, fed only what the terminal phase can vouch for.
             return Ok(phase.fallback_verdict());
         }
     }
@@ -1919,7 +1943,8 @@ mod tests {
 
     /// Phase-only fallback verdicts: Succeeded is a Pass, Failed is a
     /// TestFailure, and Error is an InfraFailure (the workflow itself broke,
-    /// so no test result exists).
+    /// so no test result exists). The pending rungs classify as infra too,
+    /// should one ever reach this terminal fallback.
     #[test]
     fn workflow_phase_fallback_verdicts_map_terminal_rungs() {
         assert_eq!(WorkflowPhase::Succeeded.fallback_verdict(), Verdict::Pass);
@@ -1930,6 +1955,14 @@ mod tests {
         let error_verdict = WorkflowPhase::Error.fallback_verdict();
         assert_eq!(error_verdict, Verdict::InfraFailure);
         assert!(error_verdict.is_infra_failure());
+        assert_eq!(
+            WorkflowPhase::Pending.fallback_verdict(),
+            Verdict::InfraFailure
+        );
+        assert_eq!(
+            WorkflowPhase::Running.fallback_verdict(),
+            Verdict::InfraFailure
+        );
     }
 
     /// The full pending ladder: a workflow that reports Pending, then
@@ -1976,6 +2009,80 @@ mod tests {
             .wait(&handle, Instant::now() + Duration::from_secs(30))
             .expect("wait must classify the terminal Failed phase");
         assert_eq!(verdict, Verdict::TestFailure);
+    }
+
+    /// A malformed `verdict` output parameter degrades through the shared
+    /// exit-code-only path — the typed parse error is not a wait error, and
+    /// the terminal phase classifies the run (Succeeded ⇒ Pass).
+    #[test]
+    fn wait_malformed_verdict_param_degrades_to_exit_code_only() {
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json_with_verdict(
+            "Succeeded",
+            "{not json",
+        ))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("malformed verdict.json must degrade, not fail the wait");
+        assert_eq!(verdict, Verdict::Pass);
+    }
+
+    /// A `verdict` output parameter carrying a schema_version this parser
+    /// does not know degrades through the same path: typed BackendError from
+    /// parse, then the phase classifies — the unusable document's own exit
+    /// code must never leak into the verdict.
+    #[test]
+    fn wait_unsupported_schema_version_degrades_to_exit_code_only() {
+        // Claims exit 1 — but a document this parser rejects is not
+        // interpreted at all: the Succeeded phase decides, and that is Pass.
+        let future = r#"{"schema_version": 2, "phase": "Succeeded", "exit_code": 1}"#;
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json_with_verdict(
+            "Succeeded",
+            future,
+        ))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("unsupported schema must degrade, not fail the wait");
+        assert_eq!(verdict, Verdict::Pass);
+    }
+
+    /// The degradation matrix at the wait() level: for every shape of "no
+    /// usable verdict.json" (parameter absent, malformed JSON, empty string,
+    /// unsupported schema_version) the terminal phase alone decides —
+    /// Succeeded → Pass, Failed → TestFailure, Error → InfraFailure. All
+    /// three shapes funnel through one shared path
+    /// ([`VerdictJson::from_exit_code`]).
+    #[test]
+    fn wait_degradation_shapes_all_land_on_the_phase_ladder() {
+        let shapes: Vec<Option<String>> = vec![
+            None,
+            Some("{not json".to_string()),
+            Some(String::new()),
+            Some(r#"{"schema_version": 2, "phase": "Succeeded", "exit_code": 1}"#.to_string()),
+        ];
+        for shape in &shapes {
+            let status_for = |terminal: &str| match shape {
+                None => status_json(terminal),
+                Some(value) => status_json_with_verdict(terminal, value),
+            };
+            let wait = |terminal: &str| -> Verdict {
+                let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_for(terminal))]);
+                backend_with_runner(fake)
+                    .wait(
+                        &RunHandle::new("gantry-abc123"),
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                    .expect("degradation must return a verdict, not an error")
+            };
+            assert_eq!(wait("Succeeded"), Verdict::Pass, "shape {shape:?}");
+            assert_eq!(wait("Failed"), Verdict::TestFailure, "shape {shape:?}");
+            assert_eq!(wait("Error"), Verdict::InfraFailure, "shape {shape:?}");
+        }
     }
 
     /// Deadline expiry during polling: a workflow that stays Running forever

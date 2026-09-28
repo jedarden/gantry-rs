@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendError, Verdict};
 
+/// The only verdict.json schema_version this build knows (Phase 1a).
+const SCHEMA_VERSION: u32 = 1;
+
 /// FailureClass: detailed failure classification from verdict.json.
 ///
 /// Derived from cargo's stable `--message-format json` stream in the remote
@@ -129,7 +132,7 @@ impl VerdictJson {
             .map_err(|e| BackendError::new(&format!("failed to parse verdict.json: {}", e)))?;
 
         // Validate schema version (Phase 1a only supports version 1)
-        if parsed.schema_version != 1 {
+        if parsed.schema_version != SCHEMA_VERSION {
             return Err(BackendError::new(&format!(
                 "unsupported verdict.json schema version: {}",
                 parsed.schema_version
@@ -137,6 +140,33 @@ impl VerdictJson {
         }
 
         Ok(parsed)
+    }
+
+    /// Exit-code-only classification for a run whose verdict.json is missing
+    /// or unusable: the workflow phase plus the best-known exit code, through
+    /// the same ladder a parsed document goes through.
+    ///
+    /// This is the single degradation path for all three shapes of "no usable
+    /// verdict.json" — the `verdict` output parameter absent entirely, its
+    /// JSON malformed, or its `schema_version` newer than [`VerdictJson::parse`]
+    /// knows. The latter two surface as a typed [`BackendError`] from parse —
+    /// never a panic — and the caller degrades here. The degradation knows
+    /// only what a missing document can still vouch for, so it classifies as
+    /// if (phase, exit_code) were the whole document: a workflow that itself
+    /// errored is [`Verdict::InfraFailure`] no matter what an exit code claims
+    /// (no suite ever ran), and otherwise the plain exit-code ladder decides.
+    /// No oom/deadline signal and no gate attribution is assumed, because
+    /// none is known.
+    pub fn from_exit_code(phase: &str, exit_code: i32) -> Verdict {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            phase: phase.to_string(),
+            exit_code,
+            oom: false,
+            deadline_exceeded: false,
+            failure_class: None,
+        }
+        .to_verdict()
     }
 
     /// Check if this verdict represents a gate failure.
@@ -504,6 +534,101 @@ mod tests {
         }"#;
         assert_eq!(Verdict::interpret(0, Some(future)), Verdict::Pass);
         assert_eq!(Verdict::interpret(1, Some(future)), Verdict::TestFailure);
+    }
+
+    // --- the exit-code-only classifier (VerdictJson::from_exit_code) ---------
+
+    /// The classifier IS the document ladder: it must return exactly what a
+    /// minimal schema-1 document carrying only (phase, exit_code) returns
+    /// from to_verdict — the structural pin that the fallback and the parse
+    /// path share one implementation.
+    #[test]
+    fn from_exit_code_is_the_minimal_document_ladder() {
+        for phase in ["Succeeded", "Failed", "Error", "Pending", "Running", ""] {
+            for code in [0, 1, 2, 137, -1] {
+                let doc = VerdictJson {
+                    schema_version: SCHEMA_VERSION,
+                    phase: phase.to_string(),
+                    exit_code: code,
+                    oom: false,
+                    deadline_exceeded: false,
+                    failure_class: None,
+                };
+                assert_eq!(
+                    VerdictJson::from_exit_code(phase, code),
+                    doc.to_verdict(),
+                    "phase {phase:?}, exit {code}"
+                );
+            }
+        }
+    }
+
+    /// A workflow that itself errored is InfraFailure regardless of the exit
+    /// code — no suite ever ran, so an exit code claims nothing.
+    #[test]
+    fn from_exit_code_error_phase_outranks_the_exit_code() {
+        for code in [0, 1, 2, 137, -1] {
+            let verdict = VerdictJson::from_exit_code("Error", code);
+            assert_eq!(verdict, Verdict::InfraFailure, "Error phase, exit {code}");
+            assert!(verdict.is_infra_failure());
+        }
+    }
+
+    /// Away from the Error rung the classifier is exactly the phase-less
+    /// exit-code ladder — the two entry points must not drift.
+    #[test]
+    fn from_exit_code_matches_the_phase_less_ladder_off_the_error_rung() {
+        for phase in ["Succeeded", "Failed", "Pending", "Running", ""] {
+            for code in -500..=500 {
+                assert_eq!(
+                    VerdictJson::from_exit_code(phase, code),
+                    Verdict::from_exit_code(code),
+                    "phase {phase:?}, exit {code}"
+                );
+            }
+        }
+    }
+
+    /// The Error rung is the one place the phase-aware classifier may disagree
+    /// with [`Verdict::interpret`]'s phase-less degradation: interpret has no
+    /// phase to consult, so an Error-phase run with a passing exit code reads
+    /// Pass there, while this classifier reads InfraFailure — no suite ever
+    /// ran, so the exit code claims nothing. Pinning the divergence keeps it
+    /// a decision rather than an accident.
+    #[test]
+    fn from_exit_code_error_rung_is_the_one_divergence_from_interpret() {
+        for code in [0, 1, 2, 137, -1] {
+            assert_eq!(
+                Verdict::interpret(code, None),
+                Verdict::from_exit_code(code),
+                "interpret is phase-less: exit {code}"
+            );
+            assert_eq!(
+                VerdictJson::from_exit_code("Error", code),
+                Verdict::InfraFailure,
+                "the classifier knows the phase: exit {code}"
+            );
+        }
+    }
+
+    /// The pinned pairings the Argo fallback feeds it: Succeeded ⇒ exit 0 ⇒
+    /// Pass, Failed ⇒ exit 1 ⇒ TestFailure, and the rungs with no test
+    /// outcome (exit code unknown, fed as the ≥2 infra bucket) ⇒
+    /// InfraFailure.
+    #[test]
+    fn from_exit_code_classifies_the_argo_fallback_pairings() {
+        assert_eq!(VerdictJson::from_exit_code("Succeeded", 0), Verdict::Pass);
+        assert_eq!(
+            VerdictJson::from_exit_code("Failed", 1),
+            Verdict::TestFailure
+        );
+        for phase in ["Pending", "Running", "Error"] {
+            assert_eq!(
+                VerdictJson::from_exit_code(phase, 2),
+                Verdict::InfraFailure,
+                "phase {phase:?}"
+            );
+        }
     }
 
     // --- property tests ------------------------------------------------------
