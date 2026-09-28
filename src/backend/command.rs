@@ -512,6 +512,13 @@ esac
     }
 
     #[test]
+    fn substitute_multiple_distinct_placeholders_in_one_arg() {
+        let argv = vec!["{repo}@{rev}#{handle}".to_string()];
+        let out = substitute_placeholders(&argv, "file:///r", "abc123", "", Some("h-7"));
+        assert_eq!(out, vec!["file:///r@abc123#h-7"]);
+    }
+
+    #[test]
     fn substitute_without_placeholders_leaves_argv_unchanged() {
         let argv = vec!["ci".to_string(), "--flag".to_string(), "value".to_string()];
         let out = substitute_placeholders(&argv, "r", "v", "a", Some("h"));
