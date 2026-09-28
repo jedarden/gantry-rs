@@ -180,7 +180,17 @@ impl CommandBackend {
         Command::new(cmd)
             .args(args)
             .output()
-            .map_err(|e| BackendError::new(&format!("failed to run command: {}", e)))
+            .map_err(|e| match e.kind() {
+                // NotFound means the configured program itself is missing —
+                // say so by name so the user can fix their argv, instead of
+                // burying it in an io-error string.
+                std::io::ErrorKind::NotFound => {
+                    BackendError::new(&format!("command not found: {}", cmd))
+                }
+                // Everything else (permission denied, ...) keeps the
+                // descriptive form: program name plus the underlying io error.
+                _ => BackendError::new(&format!("failed to run command {}: {}", cmd, e)),
+            })
     }
 
     /// Format args as JSON array.
@@ -775,6 +785,160 @@ esac
         assert!(
             result.unwrap_err().reason.contains("status command failed"),
             "error should name the probe failure"
+        );
+    }
+
+    // --- spawn-failure error handling (run_command) ---------------------------
+
+    #[test]
+    fn run_command_missing_program_names_it_in_error() {
+        // NotFound from the spawn itself must name the missing program so the
+        // user can fix their configured argv, not just echo an io error.
+        let backend = CommandBackend::with_config(CommandConfig {
+            submit: vec!["gantry-no-such-binary-4f2a".to_string()],
+            logs: vec![],
+            wait: vec![],
+            status: None,
+        });
+
+        let err = backend
+            .submit(&RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                "file:///repo/pass",
+                "abc123",
+                "",
+            ))
+            .expect_err("missing program must Err");
+        assert!(
+            err.reason.contains("command not found"),
+            "error should say command not found, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("gantry-no-such-binary-4f2a"),
+            "error should name the missing program, got: {}",
+            err.reason
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_non_not_found_failure_names_program_and_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("spawn-denied");
+
+        // A file that exists but carries no execute bit: the spawn fails with
+        // PermissionDenied (even for root — execve needs at least one x bit),
+        // which must stay a descriptive error naming both the program and the
+        // underlying io error.
+        let path = write_script(temp_dir.path(), "not-executable", "exit 0\n");
+        let mut perm = fs::metadata(&path).unwrap().permissions();
+        perm.set_mode(0o644);
+        fs::set_permissions(&path, perm).expect("clear exec bit");
+
+        let backend = CommandBackend::with_config(CommandConfig {
+            submit: vec![path.to_string_lossy().to_string()],
+            logs: vec![],
+            wait: vec![],
+            status: None,
+        });
+
+        let err = backend
+            .submit(&RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                "file:///repo/pass",
+                "abc123",
+                "",
+            ))
+            .expect_err("non-executable program must Err");
+        assert!(
+            err.reason.contains("failed to run command"),
+            "error should be the descriptive spawn failure, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("not-executable"),
+            "error should name the program, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("denied") || err.reason.contains("Denied"),
+            "error should include the underlying io error, got: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn submit_nonzero_exit_returns_err_with_stderr() {
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("submit-fail");
+
+        let failing = write_script(
+            temp_dir.path(),
+            "submit-fail",
+            "echo 'queue rejected the run' >&2\nexit 4\n",
+        );
+        let backend = CommandBackend::with_config(CommandConfig {
+            submit: vec![failing.to_string_lossy().to_string()],
+            logs: vec![],
+            wait: vec![],
+            status: None,
+        });
+
+        let err = backend
+            .submit(&RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                "file:///repo/pass",
+                "abc123",
+                "",
+            ))
+            .expect_err("non-zero submit exit must Err");
+        assert!(
+            err.reason.contains("submit command failed"),
+            "error should name the submit failure, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("queue rejected the run"),
+            "error should carry the stderr text, got: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn submit_zero_exit_with_empty_stdout_returns_empty_handle_error() {
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("submit-empty");
+
+        let quiet = write_script(temp_dir.path(), "submit-empty", "exit 0\n");
+        let backend = CommandBackend::with_config(CommandConfig {
+            submit: vec![quiet.to_string_lossy().to_string()],
+            logs: vec![],
+            wait: vec![],
+            status: None,
+        });
+
+        let err = backend
+            .submit(&RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                "file:///repo/pass",
+                "abc123",
+                "",
+            ))
+            .expect_err("empty handle must Err");
+        assert!(
+            err.reason.contains("empty handle"),
+            "error should be the empty-handle error, got: {}",
+            err.reason
         );
     }
 }
