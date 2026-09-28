@@ -2,13 +2,15 @@
 
 **Transparent offload shim for expensive `cargo` commands.** (Binary name: `gantry`.) A gantry crane moves cargo containers between ship and shore; `gantry` moves `cargo` workloads between your machine and a remote executor — without the caller (human or AI agent) having to know it exists.
 
-You (or your coding agent) run plain `cargo test`. A PATH shim intercepts it, checks that the repo is clean and pushable, ships the exact commit to a remote executor (Argo Workflows, SSH host, or any command-template backend), streams the logs back, and returns the real exit code. If anything about the repo state or the backend makes remote execution unsafe or impossible, it degrades — loudly, never silently — to a resource-capped local run (cgroup CPU/memory limits), so a runaway test suite can never take down the shared box.
+You (or your coding agent) run plain `cargo test`. A PATH shim intercepts it, checks that the repo is clean and pushable, ships the exact commit to a remote executor (Argo Workflows, SSH host, or any command-template backend), streams the logs back, and returns the real exit code. If anything about the repo state or the backend makes remote execution unsafe or impossible, the design is to degrade — loudly, never silently — to a resource-capped local run (cgroup CPU/memory limits), so a runaway test suite can never take down the shared box. That local fallback is not implemented yet (see Status): today an ineligible run stops loudly with a non-zero exit instead of running anything.
 
 Extraction of a battle-tested in-house pair of bash scripts (`~/.local/bin/cargo` + `cargo-remote`) into a standalone, configurable, publishable tool: single static binary, curl-pipe installer, `doctor` command, transparent to agents.
 
 ## Status
 
-**Phase 0.5 (walking skeleton) and most of Phase 1a (core loop, hardened) are implemented** — shim dispatch, hardcoded/layered config with last-known-good fallback, GitGate, RunLog (write-ahead run records + orphan detection), doctor core, RefPusher (epoch-ref push), and both the local-command and Argo backends with a full verdict ladder. See [`docs/plan/plan.md`](docs/plan/plan.md) for the phase breakdown and what's still open (Phase 1b onward).
+**Early development — not yet usable as your `cargo` shim; do not install it on PATH.** Phase 0.5 (walking skeleton) and most of Phase 1a (core loop) are implemented and the test suite is green: shim dispatch, hardcoded/layered config with last-known-good fallback, GitGate with reasons, RunLog (write-ahead run records + orphan detection), doctor core, RefPusher (epoch-ref push), and both the local-command and Argo backends with a full verdict ladder. Passthrough works when the shim is a copied binary — non-intercepted subcommands and `GANTRY_LOCAL=1` exec the real `cargo` transparently — but the plan's symlinked-shim shape (`[shim dir]/cargo ──symlink──► gantry`) is still broken for passthrough.
+
+**The resource-capped local fallback does not exist yet.** When the GitGate finds remote execution ineligible (no configured `origin`, dirty tree, non-git directory), an intercepted `cargo test` exits non-zero **without running any tests** — it does not degrade to a local run. In a clean git repo with no `origin`, for example, it prints `ineligible: remote 'origin' is not configured`, records `verdict: Ineligible`, and exits 1. The local-execution tail of Phase 1a, then Phase 1b onward, are still open; see [`docs/plan/plan.md`](docs/plan/plan.md) for the phase breakdown.
 
 ## Structure
 
