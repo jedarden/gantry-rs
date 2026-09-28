@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::PathBuf;
 
 /// Verdict: the terminal classification of a run (plan §"Data models", "Verdict semantics").
 ///
@@ -417,8 +418,10 @@ impl VerdictJson {
 
 /// RunSpec: the specification of a run to submit to the remote backend.
 ///
-/// Phase 0.5: minimal struct with repo URL, SHA, and args.
-/// Phase 1a will expand this to include tool, subcommand, cwd_rel, and more.
+/// All six fields are plan-mandated (plan §"Data models" → RunSpec). `cwd_rel`
+/// is the caller's directory relative to the repo root; remote executors `cd`
+/// into it before running the argv, so workspace-member invocations behave
+/// identically remote and local.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunSpec {
     /// Tool to run (e.g., "cargo", "pytest").
@@ -432,11 +435,14 @@ pub struct RunSpec {
     /// Commit SHA to run (the content the executor checks out).
     pub sha: String,
     /// Working directory relative to repo root (e.g., "", "crates/foo").
-    pub cwd_rel: String,
+    pub cwd_rel: PathBuf,
 }
 
 impl RunSpec {
     /// Create a new RunSpec.
+    ///
+    /// `cwd_rel` takes a string path relative to the repo root ("" = root) and
+    /// is stored as a `PathBuf`, per plan §"Data models".
     pub fn new(
         tool: &str,
         subcommand: &str,
@@ -451,7 +457,7 @@ impl RunSpec {
             args,
             repo_url: repo_url.to_string(),
             sha: sha.to_string(),
-            cwd_rel: cwd_rel.to_string(),
+            cwd_rel: PathBuf::from(cwd_rel),
         }
     }
 }
@@ -595,7 +601,7 @@ mod tests {
         assert_eq!(spec.args, args);
         assert_eq!(spec.repo_url, "file:///tmp/repo");
         assert_eq!(spec.sha, "0123456789abcdef");
-        assert_eq!(spec.cwd_rel, "crates/foo");
+        assert_eq!(spec.cwd_rel, PathBuf::from("crates/foo"));
     }
 
     #[test]
