@@ -91,14 +91,17 @@ fn main() -> ExitCode {
 
 /// Cargo tool profile: the transparent shim path.
 ///
-/// Phase 0.5 behavior (bf-2w7):
+/// Dispatch for an intercepted subcommand (plan §flow "shim & dispatcher"):
 /// - If GANTRY_LOCAL=1 is set → passthrough (fast path).
 /// - If the subcommand is not intercepted → passthrough (fast path).
-/// - No remote offload yet — that lands in Phase 1a (bf-2w8 and children).
+/// - Otherwise, `backend = "none"` → Tier-0 local execution with the full
+///   RunLog treatment ([`decision::run_tier0`]).
+/// - Otherwise → the remote decision pipeline ([`decision::run_remote`]).
 ///
-/// The fast path delegates to `shim::passthrough`, which resolves the real
-/// cargo binary (self-recursion guard included) and execs it with argv[1..]
-/// forwarded byte-exact. Exit code fidelity is guaranteed (INV-3).
+/// The passthrough arm delegates to `shim::passthrough`, which resolves the
+/// real cargo binary (self-recursion guard included) and execs it with
+/// argv[1..] forwarded byte-exact. Exit code fidelity is guaranteed (INV-3)
+/// on every arm via [`exit_code_from`].
 fn run_cargo_profile(argv: &[String]) -> ExitCode {
     let load_result = config::Config::load();
     let cfg = load_result.config;
@@ -126,27 +129,39 @@ fn run_cargo_profile(argv: &[String]) -> ExitCode {
     // through to passthrough.
     let subcommand = argv.get(1).map(|s| s.as_str()).unwrap_or("");
 
-    // Phase 0.5: if the subcommand is not intercepted (or forced local), run the
-    // passthrough fast path. No remote path exists yet — the decision engine,
-    // GitGate, RefPusher, and backend all land in later children.
+    // If the subcommand is not intercepted (or forced local), run the
+    // passthrough fast path — the silent arm, Tier-0 or not.
     if force_local || !cfg.intercepts("cargo", subcommand) {
         shim::passthrough(&cfg, argv)
+    } else if cfg.remote.backend == config::Backend::None {
+        // Tier-0 (zero-config default): interception still applies, but nothing
+        // goes remote (plan §"Tier-0") — the run executes locally with the full
+        // RunLog treatment and the tier noted at most once per hour.
+        let repo_url = get_repo_url();
+        let sha = get_current_sha();
+        let args = &argv[1..]; // Skip argv[0] (cargo)
+
+        exit_code_from(decision::run_tier0(&cfg, &repo_url, &sha, args))
     } else {
-        // Intercepted subcommand without GANTRY_LOCAL=1. Run the decision pipeline
+        // Intercepted subcommand with a remote backend. Run the decision pipeline
         // to determine if we should execute remotely and get the verdict.
         let repo_url = get_repo_url();
         let sha = get_current_sha();
         let args = &argv[1..]; // Skip argv[0] (cargo)
 
-        let exit_code = decision::run_remote(&cfg, &repo_url, &sha, args);
-        // Convert i32 to u8 for ExitCode (clamp to 0-255 range)
-        let exit_code_u8 = if exit_code < 0 {
-            0
-        } else {
-            (exit_code & 0xFF) as u8
-        };
-        ExitCode::from(exit_code_u8)
+        exit_code_from(decision::run_remote(&cfg, &repo_url, &sha, args))
     }
+}
+
+/// Convert an i32 exit code to an [`ExitCode`] (clamped to the 0-255 range an
+/// ExitCode can carry).
+fn exit_code_from(exit_code: i32) -> ExitCode {
+    let exit_code_u8 = if exit_code < 0 {
+        0
+    } else {
+        (exit_code & 0xFF) as u8
+    };
+    ExitCode::from(exit_code_u8)
 }
 
 /// Management CLI: explicit `gantry version` / `gantry help` commands.

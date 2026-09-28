@@ -453,6 +453,24 @@ pub enum Verdict {
     Superseded,
 }
 
+/// Human-readable verdict names for the `[gantry] verdict: …` trailer line.
+/// Deliberately CamelCase — this is the transcript/`gantry why` spelling; the
+/// serialized record keeps serde's snake_case (`"test_failure"`), and the two
+/// are not meant to match.
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Verdict::Pass => "Pass",
+            Verdict::TestFailure => "TestFailure",
+            Verdict::GateFailure => "GateFailure",
+            Verdict::InfraFailure => "InfraFailure",
+            Verdict::Cancelled => "Cancelled",
+            Verdict::Superseded => "Superseded",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Where the run actually executed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
