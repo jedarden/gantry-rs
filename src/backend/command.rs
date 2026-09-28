@@ -332,20 +332,26 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     // Serialize tests that use filesystem
     static FS_MUTEX: Mutex<()> = Mutex::new(());
 
     // A simple test executor that:
-    // - On submit: writes "handle-<subcommand>" to stdout (subcommand becomes the handle)
-    // - On wait: exits 0 if handle contains "pass", exits 1 otherwise
+    // - On submit: writes "handle-<repo path tail>" to stdout and exits 0
+    //   immediately — the run itself is NOT performed here
+    // - On logs: writes deterministic log lines keyed on the handle
+    // - On wait: performs the run, whose exit code is driven by the handle:
+    //     "handle-exit-<N>" -> exit N   (any code, e.g. 0, 1, 2, 70)
+    //     contains "pass"   -> exit 0
+    //     anything else     -> exit 1
     fn create_test_executor(dir: &std::path::Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         let mut file = fs::File::create(&path).expect("create test executor");
         writeln!(
             file,
             r#"#!/usr/bin/env bash
-# Minimal test executor for Phase 0.5 skeleton tests
+# Minimal test executor for backend tests
 
 case "$1" in
     submit)
@@ -355,9 +361,18 @@ case "$1" in
         echo "handle-$handle"
         exit 0
         ;;
+    logs)
+        # Deterministic multi-line content keyed on the handle ($2) so
+        # stream_logs tests can assert the exact captured stdout.
+        echo "log line for $2"
+        echo "second log line for $2"
+        exit 0
+        ;;
     wait)
-        # Exit 0 if handle contains "pass", exit 1 otherwise
-        if [[ "$2" == *"pass"* ]]; then
+        # Handle-driven exit code covering the full verdict ladder.
+        if [[ "$2" =~ exit-([0-9]+) ]]; then
+            exit "${{BASH_REMATCH[1]}}"
+        elif [[ "$2" == *"pass"* ]]; then
             exit 0
         else
             exit 1
@@ -486,6 +501,118 @@ esac
             Verdict::TestFailure,
             "round-trip should return TestFailure"
         );
+    }
+
+    #[test]
+    fn test_command_backend_submit_returns_without_blocking_on_the_run() {
+        // submit() must return once the submit command finishes — the run
+        // itself is wait()'s business. The executor here proves it both ways:
+        // its wait subcommand is what performs the run, takes RUN_SECONDS,
+        // and leaves a marker behind. If submit() had blocked on (or itself
+        // executed) the run, the marker would exist when submit returned and
+        // submit would have cost RUN_SECONDS — both asserted against below.
+        const RUN_SECONDS: u64 = 2;
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("submit-nonblocking");
+
+        let marker = temp_dir.path().join("run-started-marker");
+        let executor = write_script(
+            temp_dir.path(),
+            "test-executor",
+            &format!(
+                r#"case "$1" in
+    submit)
+        echo "handle-run-1"
+        exit 0
+        ;;
+    wait)
+        # The run itself: marks that it ran, then takes RUN_SECONDS.
+        touch "{}"
+        sleep {RUN_SECONDS}
+        exit 0
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        exit 1
+        ;;
+esac
+"#,
+                marker.display()
+            ),
+        );
+
+        let backend = CommandBackend::with_executor(executor.to_str().unwrap());
+        let spec = RunSpec::new("cargo", "test", vec![], "file:///repo/run", "abc123", "");
+
+        let start = Instant::now();
+        let handle = backend.submit(&spec).expect("submit should succeed");
+        let submit_elapsed = start.elapsed();
+
+        assert!(
+            !marker.exists(),
+            "submit returned but the run already executed — submit must not run the run"
+        );
+        assert!(
+            submit_elapsed < Duration::from_secs(RUN_SECONDS),
+            "submit must not block on the {RUN_SECONDS}s run, took {submit_elapsed:?}"
+        );
+
+        // wait() is what actually performs the run and decides the verdict.
+        let start = Instant::now();
+        let verdict = backend
+            .wait(&handle, Instant::now())
+            .expect("wait should succeed");
+        let wait_elapsed = start.elapsed();
+
+        assert_eq!(
+            verdict,
+            Verdict::Pass,
+            "the run's exit code (decided by wait) is the verdict"
+        );
+        assert!(marker.exists(), "wait should have executed the run");
+        assert!(
+            wait_elapsed >= Duration::from_secs(RUN_SECONDS),
+            "wait should take the run's full {RUN_SECONDS}s, took {wait_elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_command_backend_submit_then_wait_round_trip_infra_failure() {
+        // The bottom rung of the ladder through the real CommandBackend path:
+        // a run exiting 2 — and any higher code — is InfraFailure, not
+        // TestFailure. The handle carries the exit code ("handle-exit-<N>")
+        // and the executor's wait subcommand exits with exactly that code.
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("round-trip-infra");
+        let executor = create_test_executor(temp_dir.path(), "test-executor");
+
+        let backend = CommandBackend::with_executor(executor.to_str().unwrap());
+
+        for repo_tail in ["exit-2", "exit-70"] {
+            let spec = RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                &format!("file:///repo/{repo_tail}"),
+                "abc123",
+                "",
+            );
+            let handle = backend.submit(&spec).expect("submit should succeed");
+            assert_eq!(
+                handle.handle,
+                format!("handle-{repo_tail}"),
+                "handle should carry the exit-code driver from the spec"
+            );
+
+            let verdict = backend
+                .wait(&handle, Instant::now())
+                .expect("wait should succeed");
+            assert_eq!(
+                verdict,
+                Verdict::InfraFailure,
+                "run exit code driven by '{repo_tail}' must map to InfraFailure"
+            );
+        }
     }
 
     // --- placeholder substitution (bf-3rer) ---
@@ -849,13 +976,30 @@ esac
     }
 
     #[test]
-    fn test_command_backend_stream_logs_works() {
-        let backend = CommandBackend::new();
-        let handle = RunHandle::new("test");
+    fn test_command_backend_stream_logs_writes_executor_stdout_to_writer() {
+        // Real executor path: the logs subcommand of the executor writes two
+        // known lines on stdout; stream_logs must copy them byte-exact into
+        // the writer, with the {handle} placeholder substituted.
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("stream-logs");
+        let executor = create_test_executor(temp_dir.path(), "test-executor");
+
+        let backend = CommandBackend::with_executor(executor.to_str().unwrap());
+        let handle = RunHandle::new("handle-abc123");
         let mut out = Vec::new();
-        // This will fail to run the command, but it won't panic
+
         let result = backend.stream_logs(&handle, &mut out);
-        assert!(result.is_err() || result.is_ok()); // Just verify it doesn't panic
+
+        assert!(
+            result.is_ok(),
+            "stream_logs should succeed, got: {:?}",
+            result
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "log line for handle-abc123\nsecond log line for handle-abc123\n",
+            "captured stdout must equal what the executor's logs subcommand wrote"
+        );
     }
 
     #[test]
