@@ -8,6 +8,8 @@
 // - submit: builds Workflow manifest with serde, runs kubectl create -f -
 // - stream_logs: kubectl logs -f on the workflow's pod
 // - wait: polls kubectl get workflow status.phase until terminal or deadline
+// - status: one-shot status.phase → RunStatus snapshot (never blocks, never
+//   errors on an unanswerable query)
 // - describe: returns the workflow name/UI URL
 // - cancel: kubectl delete workflow
 //
@@ -19,7 +21,7 @@
 // outside the seam: streaming needs live process stdout to copy from as the
 // run progresses, not a captured end-of-run result.
 
-use crate::backend::{BackendError, RemoteBackend, RunSpec, Verdict, VerdictJson};
+use crate::backend::{BackendError, RemoteBackend, RunSpec, RunStatus, Verdict, VerdictJson};
 use std::io::{Read, Write};
 use std::process::{Command, Output};
 use std::thread;
@@ -976,6 +978,34 @@ impl RemoteBackend for ArgoBackend {
         }
 
         Ok(())
+    }
+
+    /// Query the workflow's current state without waiting for it.
+    ///
+    /// One `get workflow -o json` through the same plumbing wait() polls,
+    /// with `status.phase` mapped onto the coarse [`RunStatus`] ladder:
+    /// Pending and Running are themselves, all three terminal rungs
+    /// (Succeeded / Failed / Error) are Completed.
+    ///
+    /// Every shape of "no answer" — the workflow object not retrievable yet,
+    /// no `status` stanza, no phase value, an unrecognized phase string, a
+    /// malformed object — is [`RunStatus::Unknown`], never an error: this is
+    /// a point-in-time snapshot, so an unanswerable query is "no news" for a
+    /// polling caller (plan §argo's degrade-gracefully stance). That is a
+    /// deliberate softening of wait(), where the same unrecognized phase is
+    /// a loud error — a poller that must eventually return a verdict cannot
+    /// afford to wait forever, while a status poller loses nothing by
+    /// trying again later.
+    fn status(&self, h: &crate::backend::RunHandle) -> Result<RunStatus, BackendError> {
+        Ok(match self.workflow_phase(&h.handle) {
+            Ok(Some(WorkflowPhase::Pending)) => RunStatus::Pending,
+            Ok(Some(WorkflowPhase::Running)) => RunStatus::Running,
+            Ok(Some(phase)) if phase.is_terminal() => RunStatus::Completed,
+            // No retrievable status (`Ok(None)`), an unrecognized phase
+            // string, a malformed document, or a failed kubectl (`Err`):
+            // Unknown — the query has no answer, not a failure.
+            _ => RunStatus::Unknown,
+        })
     }
 }
 
@@ -2167,6 +2197,111 @@ mod tests {
             1,
             "wait must not retry after a malformed status document"
         );
+    }
+
+    // --- status() ------------------------------------------------------------
+
+    /// The known phase ladder maps onto the coarse RunStatus rung for rung:
+    /// Pending and Running are themselves, and all three terminal rungs are
+    /// Completed (which verdict follows is wait()'s job, not status's).
+    #[test]
+    fn status_maps_known_phase_ladder_onto_run_status() {
+        let cases = [
+            ("Pending", RunStatus::Pending),
+            ("Running", RunStatus::Running),
+            ("Succeeded", RunStatus::Completed),
+            ("Failed", RunStatus::Completed),
+            ("Error", RunStatus::Completed),
+        ];
+        for (phase, expected) in cases {
+            let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json(phase))]);
+            let backend = backend_with_runner(fake);
+
+            let status = backend
+                .status(&RunHandle::new("gantry-abc123"))
+                .unwrap_or_else(|e| panic!("known phase {phase} must answer, not error: {e}"));
+            assert_eq!(status, expected, "phase {phase}");
+        }
+    }
+
+    /// The phase-less pending shapes (no `status` stanza at all, or a bare
+    /// one the controller has not filled in) give a point-in-time query
+    /// nothing to read: Unknown — not an error, and not Pending (status has
+    /// no pending/serving distinction to defend the way wait() does).
+    #[test]
+    fn status_maps_missing_phase_shapes_to_unknown() {
+        for body in [r#"{}"#, r#"{"status":{}}"#] {
+            let (fake, _) = FakeKubectl::serving(vec![ok_outcome(body)]);
+            let backend = backend_with_runner(fake);
+
+            let status = backend
+                .status(&RunHandle::new("gantry-abc123"))
+                .expect("a missing phase must degrade, never error");
+            assert_eq!(status, RunStatus::Unknown, "body {body}");
+        }
+    }
+
+    /// An unrecognized phase string is Unknown, not an error — the deliberate
+    /// contrast with wait(), where the same string errors loudly (a waiter
+    /// cannot afford to poll forever; a status poller just retries). The
+    /// answer comes from the same single `get workflow -o json` poll the
+    /// verdict path uses, with no retry.
+    #[test]
+    fn status_maps_unknown_phase_to_unknown_not_error() {
+        let (fake, calls) = FakeKubectl::serving(vec![ok_outcome(&status_json("Zombie"))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let status = backend
+            .status(&handle)
+            .expect("an unknown phase must degrade to Unknown, not error");
+        assert_eq!(status, RunStatus::Unknown);
+
+        let log = calls_of(&calls);
+        assert_eq!(log.len(), 1, "status must not retry");
+        assert_eq!(
+            log[0].args,
+            vec!["get", "workflow", "gantry-abc123", "-o", "json"]
+        );
+    }
+
+    /// Every unanswerable query degrades to Unknown rather than erroring:
+    /// kubectl exiting non-zero (transient API failure, RBAC, the workflow
+    /// not created yet), a runner that cannot spawn, and a malformed status
+    /// document. A status snapshot that cannot be taken is "no news".
+    #[test]
+    fn status_maps_unanswerable_queries_to_unknown() {
+        // kubectl exits non-zero.
+        let (fake, _) = FakeKubectl::serving(vec![failed_outcome("Error from server: timeout")]);
+        let status = backend_with_runner(fake)
+            .status(&RunHandle::new("gantry-abc123"))
+            .expect("a failed query must degrade to Unknown, not error");
+        assert_eq!(status, RunStatus::Unknown);
+
+        // The runner itself cannot execute.
+        struct FailingKubectl;
+        impl KubectlRunner for FailingKubectl {
+            fn run(
+                &self,
+                _args: &[&str],
+                _stdin: Option<&[u8]>,
+            ) -> Result<KubectlOutcome, BackendError> {
+                Err(BackendError::new(
+                    "failed to spawn kubectl: no such file or directory",
+                ))
+            }
+        }
+        let status = backend_with_runner(Box::new(FailingKubectl))
+            .status(&RunHandle::new("gantry-abc123"))
+            .expect("a spawn failure must degrade to Unknown, not error");
+        assert_eq!(status, RunStatus::Unknown);
+
+        // A malformed status document.
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome(r#"{"status":{"phase":"Succeeded"#)]);
+        let status = backend_with_runner(fake)
+            .status(&RunHandle::new("gantry-abc123"))
+            .expect("a malformed document must degrade to Unknown, not error");
+        assert_eq!(status, RunStatus::Unknown);
     }
 
     /// stream_logs discovers the workflow's pod and pipes its logs to the
