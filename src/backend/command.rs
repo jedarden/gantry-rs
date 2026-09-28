@@ -570,6 +570,203 @@ esac
     }
 
     #[test]
+    fn substitute_each_placeholder_binds_to_its_own_value() {
+        // Per-placeholder isolation for {repo} {rev} {args_json} {handle}:
+        // each placeholder in its own argv slot must bind to its own value and
+        // only its own — no cross-wiring between neighbouring config fields.
+        // All four values are distinct so a swap or bleed cannot pass.
+        let cases: &[(&str, &str)] = &[
+            ("{repo}", "REPO-VAL"),
+            ("{rev}", "REV-VAL"),
+            ("{args_json}", "ARGS-VAL"),
+            ("{handle}", "HANDLE-VAL"),
+        ];
+        for (placeholder, expected) in cases {
+            let argv = vec![placeholder.to_string()];
+            let out = substitute_placeholders(
+                &argv,
+                "REPO-VAL",
+                "REV-VAL",
+                "ARGS-VAL",
+                Some("HANDLE-VAL"),
+            );
+            assert_eq!(
+                out,
+                vec![expected.to_string()],
+                "placeholder {} must bind to its own value",
+                placeholder
+            );
+        }
+    }
+
+    #[test]
+    fn substitute_shell_metacharacters_stay_one_argv_element() {
+        // S-4, proven at the substitution level: substituted values are argv
+        // DATA, never shell INPUT. Every character a shell would act on —
+        // quotes, $, backticks, spaces, ; — must stay inside its original
+        // single argv slot byte-exact. No splicing, no quoting, no
+        // interpolation, no element growth.
+        let repo = "file:///ho;st 'sq' \"dq\"";
+        let rev = "abc123;`git rev-parse` '$SHA'";
+        let args_json = "[\"test -- --nocapture\", \"; rm -rf /tmp/x\", \"`whoami` $USER\"]";
+        let handle = "h;'\"$(`id`) y";
+
+        let argv = vec![
+            "run".to_string(),
+            "{repo}".to_string(),
+            "{rev}".to_string(),
+            "{args_json}".to_string(),
+            "{handle}".to_string(),
+            "x{repo};y".to_string(),
+        ];
+        let out = substitute_placeholders(&argv, repo, rev, args_json, Some(handle));
+
+        // Element count is unchanged: substitution split nothing into extra argv.
+        assert_eq!(
+            out.len(),
+            argv.len(),
+            "substitution must not splice a value into more argv elements"
+        );
+        assert_eq!(out[1], repo);
+        assert_eq!(out[2], rev);
+        assert_eq!(out[3], args_json);
+        assert_eq!(out[4], handle);
+        assert_eq!(out[5], format!("x{repo};y"), "embedded placeholder too");
+    }
+
+    // --- S-4 end-to-end: substituted argv through a real process spawn -------
+
+    /// A script that prints the number of arguments it received, then every
+    /// argument verbatim, one per line — the argv ground truth behind the
+    /// end-to-end "single element" assertions below. Any splicing, quoting, or
+    /// shell interpolation upstream would grow the count and fragment lines.
+    fn write_arg_echo_script(dir: &std::path::Path, name: &str) -> PathBuf {
+        write_script(
+            dir,
+            name,
+            "echo \"$#\"\nfor arg in \"$@\"; do echo \"$arg\"; done\n",
+        )
+    }
+
+    #[test]
+    fn submit_spawn_delivers_metacharacter_values_as_one_element_each() {
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("meta-spawn");
+
+        // End-to-end S-4: the substituted argv goes through a real process
+        // spawn with no shell in between, so metacharacter-laden values must
+        // arrive byte-exact and unsplit — proven by the executor's own
+        // argument count, not assumed from the implementation.
+        let echo_argv = write_arg_echo_script(temp_dir.path(), "echo-argv");
+
+        let repo = "file:///ho;st 'sq' \"dq\"";
+        let rev = "abc123;`rev-parse` '$SHA'";
+        let args = vec![
+            "test".to_string(),
+            "--".to_string(),
+            "weird arg;'`$quoted".to_string(),
+        ];
+        let args_json = serde_json::to_string(&args).expect("args are JSON-serializable");
+
+        let backend = CommandBackend::with_config(CommandConfig {
+            submit: vec![
+                echo_argv.to_string_lossy().to_string(),
+                "{repo}".to_string(),
+                "{rev}".to_string(),
+                "{args_json}".to_string(),
+            ],
+            logs: vec![],
+            wait: vec![],
+            status: None,
+        });
+
+        let handle = backend
+            .submit(&RunSpec::new("cargo", "test", args, repo, rev, ""))
+            .expect("submit should run the echo executor");
+
+        // The handle is the executor's stdout: the count line, then one line
+        // per argv element (trimmed only at the outer edges by submit()).
+        let lines: Vec<&str> = handle.handle.lines().collect();
+        assert_eq!(
+            lines.len(),
+            4,
+            "executor must see exactly 3 argv elements, saw: {:?}",
+            lines
+        );
+        assert_eq!(lines[0], "3", "metacharacter values must not split");
+        assert_eq!(lines[1], repo);
+        assert_eq!(lines[2], rev);
+        assert_eq!(lines[3], args_json);
+    }
+
+    #[test]
+    fn stream_logs_delivers_handle_as_one_element() {
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("logs-handle");
+
+        let echo_argv = write_arg_echo_script(temp_dir.path(), "echo-argv");
+        let backend = CommandBackend::with_config(CommandConfig {
+            submit: vec![],
+            logs: vec![
+                echo_argv.to_string_lossy().to_string(),
+                "{handle}".to_string(),
+            ],
+            wait: vec![],
+            status: None,
+        });
+
+        let handle = RunHandle::new("run;'`$9 y");
+        let mut out = Vec::new();
+        backend
+            .stream_logs(&handle, &mut out)
+            .expect("stream_logs should run the echo executor");
+
+        let lines: Vec<String> = String::from_utf8_lossy(&out)
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(lines.len(), 2, "handle must arrive as exactly one element");
+        assert_eq!(lines[0], "1");
+        assert_eq!(lines[1], handle.handle);
+    }
+
+    #[test]
+    fn wait_delivers_handle_as_exactly_one_element() {
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("wait-handle");
+
+        // The executor exits 0 (Verdict::Pass) only when $1 — the substituted
+        // handle — equals the expected literal carried in the template itself
+        // as $2 ($0 is the script itself). A spliced, quoted, or interpolated
+        // handle fails the compare and lands on Verdict::TestFailure instead.
+        let compare = write_script(
+            temp_dir.path(),
+            "compare-handle",
+            "if [ \"$1\" = \"$2\" ]; then exit 0; else exit 1; fi\n",
+        );
+        let expected = "run;'`$9 y";
+        let backend = CommandBackend::with_config(CommandConfig {
+            submit: vec![],
+            logs: vec![],
+            wait: vec![
+                compare.to_string_lossy().to_string(),
+                "{handle}".to_string(),
+                expected.to_string(),
+            ],
+            status: None,
+        });
+
+        let verdict = backend
+            .wait(&RunHandle::new(expected), Instant::now())
+            .expect("wait should run the compare executor");
+        assert_eq!(
+            verdict,
+            Verdict::Pass,
+            "handle must arrive intact as one argv element"
+        );
+    }
+
+    #[test]
     fn test_format_args_json_simple() {
         let args = vec![
             "test".to_string(),
@@ -938,6 +1135,90 @@ esac
         assert!(
             err.reason.contains("empty handle"),
             "error should be the empty-handle error, got: {}",
+            err.reason
+        );
+    }
+
+    // --- empty configured argv yields BackendError, never a panic -----------
+    //
+    // Every config field is user-supplied, so each entry point must treat an
+    // empty template as a configuration error surfaced through BackendError —
+    // these tests fail on a panic just as hard as on a wrong return.
+
+    fn empty_config() -> CommandConfig {
+        CommandConfig {
+            submit: vec![],
+            logs: vec![],
+            wait: vec![],
+            status: None,
+        }
+    }
+
+    #[test]
+    fn empty_submit_argv_yields_backend_error_not_panic() {
+        let backend = CommandBackend::with_config(empty_config());
+
+        let err = backend
+            .submit(&RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                "file:///repo/pass",
+                "abc123",
+                "",
+            ))
+            .expect_err("empty submit argv must Err");
+        assert!(
+            err.reason.contains("argv is empty"),
+            "error should name the empty argv, got: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn empty_wait_argv_yields_backend_error_not_panic() {
+        let backend = CommandBackend::with_config(empty_config());
+
+        let err = backend
+            .wait(&RunHandle::new("run-1"), Instant::now())
+            .expect_err("empty wait argv must Err");
+        assert!(
+            err.reason.contains("argv is empty"),
+            "error should name the empty argv, got: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn empty_logs_argv_yields_backend_error_not_panic() {
+        let backend = CommandBackend::with_config(empty_config());
+
+        let mut out = Vec::new();
+        let err = backend
+            .stream_logs(&RunHandle::new("run-1"), &mut out)
+            .expect_err("empty logs argv must Err");
+        assert!(
+            err.reason.contains("argv is empty"),
+            "error should name the empty argv, got: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn empty_status_argv_yields_backend_error_not_panic() {
+        // Some(vec![]) passes the "no status step" guard — a configured-but-
+        // empty status argv must still surface as an error, not a panic.
+        let backend = CommandBackend::with_config(CommandConfig {
+            status: Some(vec![]),
+            ..empty_config()
+        });
+
+        let err = backend
+            .status(&RunHandle::new("run-1"))
+            .expect_err("empty status argv must Err");
+        assert!(
+            err.reason.contains("argv is empty"),
+            "error should name the empty argv, got: {}",
             err.reason
         );
     }
