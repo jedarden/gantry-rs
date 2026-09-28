@@ -352,8 +352,7 @@ mod tests {
             r#"{"schema_version": 1}"#, // phase and exit_code are required
         ];
         for doc in broken {
-            let err =
-                VerdictJson::parse(doc).expect_err(&format!("{doc:?} must be rejected"));
+            let err = VerdictJson::parse(doc).expect_err(&format!("{doc:?} must be rejected"));
             assert!(
                 err.reason.starts_with("failed to parse verdict.json"),
                 "{doc:?}: wrong error: {}",

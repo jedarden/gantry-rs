@@ -7,6 +7,6 @@ pub mod refs;
 pub mod runlog;
 pub mod shim;
 pub mod state;
-pub mod verdict;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod verdict;

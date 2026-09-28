@@ -484,5 +484,4 @@ mod tests {
         let backend = SkeletonBackend;
         let _ = backend.status(&RunHandle::new("unused"));
     }
-
 }
