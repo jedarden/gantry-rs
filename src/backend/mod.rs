@@ -684,6 +684,24 @@ mod tests {
         }
     }
 
+    /// FailureClass serde roundtrip: the kebab-case wire names survive
+    /// serialize -> deserialize as the identity for every variant.
+    #[test]
+    fn failure_class_serde_round_trip_is_identity() {
+        for class in [
+            FailureClass::CompileError,
+            FailureClass::TestFailure,
+            FailureClass::Doctest,
+            FailureClass::HarnessPanic,
+            FailureClass::GateFailure,
+        ] {
+            let serialized = serde_json::to_string(&class).expect("serialize");
+            let round: FailureClass =
+                serde_json::from_str(&serialized).unwrap_or_else(|e| panic!("{serialized}: {e}"));
+            assert_eq!(round, class, "round trip broke {serialized}");
+        }
+    }
+
     /// The lenient parser and the derived serde names must accept exactly the
     /// same strings — this is the guard against the two paths drifting.
     #[test]
@@ -762,6 +780,51 @@ mod tests {
         assert_eq!(vj.to_verdict(), Verdict::Pass);
     }
 
+    /// A complete schema-1 payload parses field-for-field: every documented
+    /// field lands in the struct with the value the producer wrote.
+    #[test]
+    fn parse_accepts_complete_schema_one_payload() {
+        let doc = r#"{
+            "schema_version": 1,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": false,
+            "failure_class": "test-failure"
+        }"#;
+        let vj = VerdictJson::parse(doc).expect("complete document must parse");
+        assert_eq!(vj.schema_version, 1);
+        assert_eq!(vj.phase, "Failed");
+        assert_eq!(vj.exit_code, 1);
+        assert!(!vj.oom);
+        assert!(!vj.deadline_exceeded);
+        assert_eq!(vj.failure_class, Some(FailureClass::TestFailure));
+        assert_eq!(vj.to_verdict(), Verdict::TestFailure);
+    }
+
+    /// Malformed JSON is Err (naming the document), not a panic or a guess —
+    /// the exit-code degradation happens in the caller (`Verdict::interpret`).
+    #[test]
+    fn parse_rejects_malformed_json() {
+        let broken = [
+            "{not json",
+            "",
+            "[]",
+            "null",
+            r#"{"schema_version": 1,}"#,
+            r#"{"schema_version": 1}"#, // phase and exit_code are required
+        ];
+        for doc in broken {
+            let err =
+                VerdictJson::parse(doc).expect_err(&format!("{doc:?} must be rejected"));
+            assert!(
+                err.reason.starts_with("failed to parse verdict.json"),
+                "{doc:?}: wrong error: {}",
+                err.reason
+            );
+        }
+    }
+
     /// Unknown fields from a future schema version are ignored, wherever they
     /// appear in the document.
     #[test]
@@ -827,6 +890,39 @@ mod tests {
         assert_eq!(verdict, Verdict::GateFailure);
         assert!(!verdict.is_infra_failure());
         assert!(verdict.has_test_result());
+    }
+
+    /// The exit-code ladder inside to_verdict: with no infra signals and no
+    /// gate attribution, the exit code alone decides — including the >=2
+    /// bucket, which stays InfraFailure with an otherwise-clean document.
+    #[test]
+    fn to_verdict_exit_code_ladder_without_infra_signals() {
+        let pass = VerdictJson::parse(&verdict_doc("Succeeded", 0, false, false, None))
+            .expect("pass document must parse");
+        assert_eq!(pass.to_verdict(), Verdict::Pass);
+
+        let failed = VerdictJson::parse(&verdict_doc("Failed", 1, false, false, None))
+            .expect("test-failure document must parse");
+        assert_eq!(failed.to_verdict(), Verdict::TestFailure);
+
+        for code in [2, 3, 101, 137, 255, -1] {
+            let vj = VerdictJson::parse(&verdict_doc("Failed", code, false, false, None))
+                .unwrap_or_else(|e| panic!("exit {code} must parse: {e}"));
+            assert_eq!(vj.to_verdict(), Verdict::InfraFailure, "exit {code}");
+        }
+    }
+
+    /// Each infra signal on its own outranks a passing exit code: oom and
+    /// deadline_exceeded must each turn an exit-0 document into InfraFailure.
+    #[test]
+    fn each_infra_signal_outranks_a_passing_exit_code() {
+        let oom = VerdictJson::parse(&verdict_doc("Failed", 0, true, false, None))
+            .expect("oom document must parse");
+        assert_eq!(oom.to_verdict(), Verdict::InfraFailure);
+
+        let deadline = VerdictJson::parse(&verdict_doc("Succeeded", 0, false, true, None))
+            .expect("deadline document must parse");
+        assert_eq!(deadline.to_verdict(), Verdict::InfraFailure);
     }
 
     // --- the degradation contract (absent verdict.json) ---------------------
