@@ -3,6 +3,7 @@ pub mod config;
 pub mod decision;
 pub mod doctor;
 pub mod gate;
+pub mod local; // plan Component 6: LocalExecutor — scope, slice, fallback semaphore
 pub mod refs;
 pub mod runlog;
 pub mod shim;

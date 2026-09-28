@@ -10,11 +10,26 @@ license = "MIT OR Apache-2.0"
 name = "gantry"
 path = "src/main.rs"
 
+# AS-3 stampede harness (plan §6, bf-299): a custom-harness binary, not a
+# #[test] file — the 20 fallback invocations must be 20 real *processes* for
+# the flock semantics under test to be the production ones, and the harness
+# re-executes itself as the workers and as each run's payload (scenarios:
+# 20-way serialization, the EC-01 two-worktree variant, and SIGKILLed slot
+# holders releasing their slots in the kernel).
+[[test]]
+name = "stampede"
+path = "tests/stampede/stampede.rs"
+harness = false
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 dirs = "5"
+
+# flock(2) for the fallback admission semaphore (src/local.rs, plan Component 6).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

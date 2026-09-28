@@ -41,6 +41,16 @@ pub struct GantryConfig {
 /// [`GantryConfig`], matching the plan and bead naming.
 pub type Config = GantryConfig;
 
+/// Default concurrent capped local *fallback* runs per box (plan Component 6
+/// "fallback admission semaphore"). The kernel-enforced pool itself lives in
+/// [`crate::local`]; this is the configured size of the pool.
+pub const DEFAULT_FALLBACK_SLOTS: u32 = 3;
+
+/// Default bounded wait for a fallback slot, in seconds (plan Component 6).
+/// One hour — above the 40-minute default remote deadline, so a fallback
+/// storm of typical suites drains before a waiter abandons the queue.
+pub const DEFAULT_FALLBACK_WAIT_SECS: u64 = 3600;
+
 /// Local execution resource limits.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalConfig {
@@ -50,6 +60,15 @@ pub struct LocalConfig {
     pub memory_max: String,
     /// Apply cgroup cap to passthrough invocations (default: true).
     pub cap_passthrough: bool,
+    /// Concurrent capped local *fallback* runs allowed (plan Component 6:
+    /// the fallback admission semaphore's slot count, enforced by
+    /// `crate::local`). Default 3. A remote outage under a fleet degrades as
+    /// a serialized trickle, not a stampede.
+    pub fallback_slots: u32,
+    /// Bounded wait for a fallback slot, in seconds (default 3600). Past the
+    /// bound the run proceeds without a slot — loudly — because a verdict
+    /// (INV-1) outranks the admission cap.
+    pub fallback_wait_secs: u64,
 }
 
 /// Tool-specific configuration (e.g., cargo).
@@ -209,6 +228,8 @@ struct RawLocal {
     cpu_quota_pct: Option<u8>,
     memory_max: Option<String>,
     cap_passthrough: Option<bool>,
+    fallback_slots: Option<u32>,
+    fallback_wait_secs: Option<u64>,
     #[serde(flatten)]
     unknown: HashMap<String, toml::Value>,
 }
@@ -454,12 +475,18 @@ impl GantryConfig {
     ///
     /// This is the behavior when no config file exists or when the system
     /// has no valid config at all. Gantry becomes a pure local cap-wrapper.
-    fn tier_0_defaults() -> Self {
+    ///
+    /// Public because the Tier-0 baseline is a documented surface, not an
+    /// internal default: the stampede harness (tests/stampede/) and the
+    /// upcoming `gantry quickcheck` build on exactly these defaults.
+    pub fn tier_0_defaults() -> Self {
         GantryConfig {
             local: LocalConfig {
                 cpu_quota_pct: 200,
                 memory_max: "6G".to_string(),
                 cap_passthrough: true,
+                fallback_slots: DEFAULT_FALLBACK_SLOTS,
+                fallback_wait_secs: DEFAULT_FALLBACK_WAIT_SECS,
             },
             tools: {
                 let mut map = HashMap::new();
@@ -541,6 +568,36 @@ impl GantryConfig {
             }
             if let Some(v) = local.cap_passthrough {
                 base.local.cap_passthrough = v;
+            }
+
+            // The fallback-semaphore keys are box-overload protection (plan
+            // Component 6): a cloned repo must not be able to raise the slot
+            // count, zero it out, or shrink the bounded wait into a no-op any
+            // more than it may redirect pushes. Same treatment as the other
+            // S-2 keys — warn and ignore rather than reject the layer, so a
+            // stray key never discards the repo's own intercept narrowing.
+            // A non-repo layer setting 0 would deadlock every fallback, so
+            // zero is invalid from any layer.
+            match local.fallback_slots {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'fallback_slots' (trust boundary S-2), ignoring"
+                        .to_string(),
+                ),
+                Some(0) => {
+                    warnings.push("local.fallback_slots must be at least 1; ignoring".to_string())
+                }
+                Some(v) => base.local.fallback_slots = v,
+                None => {}
+            }
+            match local.fallback_wait_secs {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'fallback_wait_secs' (trust boundary S-2), ignoring"
+                        .to_string(),
+                ),
+                Some(0) => warnings
+                    .push("local.fallback_wait_secs must be at least 1; ignoring".to_string()),
+                Some(v) => base.local.fallback_wait_secs = v,
+                None => {}
             }
         }
 
@@ -903,6 +960,8 @@ impl GantryConfig {
                 cpu_quota_pct: Some(config.local.cpu_quota_pct),
                 memory_max: Some(config.local.memory_max.clone()),
                 cap_passthrough: Some(config.local.cap_passthrough),
+                fallback_slots: Some(config.local.fallback_slots),
+                fallback_wait_secs: Some(config.local.fallback_wait_secs),
                 unknown: HashMap::new(),
             }),
             tool: config
@@ -1010,6 +1069,8 @@ mod tests {
         assert_eq!(cfg.local.cpu_quota_pct, 200);
         assert_eq!(cfg.local.memory_max, "6G");
         assert!(cfg.local.cap_passthrough);
+        assert_eq!(cfg.local.fallback_slots, DEFAULT_FALLBACK_SLOTS);
+        assert_eq!(cfg.local.fallback_wait_secs, DEFAULT_FALLBACK_WAIT_SECS);
         assert!(cfg.intercepts("cargo", "test"));
     }
 
@@ -1566,6 +1627,173 @@ mod tests {
             "warnings: {:?}",
             result.warnings
         );
+    }
+
+    // ========================================================================
+    // Fallback admission semaphore config (plan Component 6, bf-299)
+    // ========================================================================
+
+    #[test]
+    fn fallback_semaphore_keys_merge_from_user_layer() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            fallback_slots = 5
+            fallback_wait_secs = 600
+            "#,
+        );
+        let repo = layer_file(temp.path(), "repo.toml", "");
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.local.fallback_slots, 5);
+        assert_eq!(result.config.local.fallback_wait_secs, 600);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn repo_layer_cannot_touch_fallback_semaphore_keys() {
+        // Box-overload protection is not the cloned repo's to weaken: raising
+        // slots or zeroing the bounded wait from the repo layer is the same
+        // class of overreach as redirecting pushes (S-2).
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            fallback_slots = 3
+            fallback_wait_secs = 3600
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [local]
+            fallback_slots = 1000
+            fallback_wait_secs = 1
+
+            [tool.cargo]
+            intercept = ["test", "check"]
+            "#,
+        );
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(
+            result.config.local.fallback_slots, 3,
+            "repo layer must not raise the slot count"
+        );
+        assert_eq!(
+            result.config.local.fallback_wait_secs, 3600,
+            "repo layer must not shrink the bounded wait"
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.contains("fallback_slots")),
+            "a warning must name the ignored key: {:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("fallback_wait_secs")),
+            "a warning must name the ignored key: {:?}",
+            result.warnings
+        );
+        // The stray restricted key must not discard the repo's own narrowing.
+        assert!(result.config.intercepts("cargo", "check"));
+    }
+
+    #[test]
+    fn zero_fallback_values_are_rejected_from_any_layer() {
+        // fallback_slots = 0 could never admit anyone; fallback_wait_secs = 0
+        // would make the bounded wait a no-op. Both are invalid everywhere.
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(
+            temp.path(),
+            "system.toml",
+            r#"
+            [local]
+            fallback_slots = 0
+            fallback_wait_secs = 0
+            "#,
+        );
+        let user = layer_file(temp.path(), "user.toml", "");
+        let repo = layer_file(temp.path(), "repo.toml", "");
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.local.fallback_slots, DEFAULT_FALLBACK_SLOTS);
+        assert_eq!(
+            result.config.local.fallback_wait_secs,
+            DEFAULT_FALLBACK_WAIT_SECS
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.contains("fallback_slots")),
+            "warnings: {:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("fallback_wait_secs")),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn fallback_semaphore_keys_round_trip_through_the_lkg_snapshot() {
+        // The LKG path serializes via to_raw and reparses via merge_layer; a
+        // key missing from either side would silently reset to the default
+        // exactly when the config is broken — the worst moment to lose a cap.
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            fallback_slots = 7
+            fallback_wait_secs = 1200
+            "#,
+        );
+        let repo = layer_file(temp.path(), "repo.toml", "");
+
+        let loaded =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        let raw = Config::to_raw(&loaded.config);
+        let serialized = toml::to_string_pretty(&raw).unwrap();
+        let mut reparsed = Config::tier_0_defaults();
+        let mut warnings = Vec::new();
+        let snapshot = temp.path().join("snapshot.toml");
+        fs::write(&snapshot, serialized).unwrap();
+        Config::merge_layer(
+            &mut reparsed,
+            &snapshot,
+            ConfigLayer::Defaults,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(reparsed.local.fallback_slots, 7);
+        assert_eq!(reparsed.local.fallback_wait_secs, 1200);
     }
 
     #[test]
