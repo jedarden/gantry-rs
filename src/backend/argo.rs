@@ -412,6 +412,73 @@ enum PodDiscovery {
     PodGone,
 }
 
+/// The `status.phase` ladder of an Argo Workflow, classified for polling.
+///
+/// status.phase is the authoritative terminal signal (plan §"argo"): the
+/// `verdict` output parameter refines the classification *within* a terminal
+/// rung but never moves the workflow between rungs. Every value kubectl can
+/// serve is either a known pending rung, a known terminal rung, or a loud
+/// error — a phase string gantry does not recognize must not read as "keep
+/// waiting", or a controller speaking an unexpected phase would poll forever
+/// exactly when something has gone wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowPhase {
+    /// Submitted but not yet executing (controller queue or pod scheduling).
+    Pending,
+    /// Currently executing.
+    Running,
+    /// Finished: the suite ran and passed.
+    Succeeded,
+    /// Finished: the suite ran and failed.
+    Failed,
+    /// Finished broken: the workflow itself failed (template not found,
+    /// controller error) — no test result exists.
+    Error,
+}
+
+impl WorkflowPhase {
+    /// Classify one observed `status.phase` value.
+    ///
+    /// `Ok(None)` covers the two pending shapes that carry no phase value at
+    /// all: the `status` stanza is absent entirely (the controller has not
+    /// reconciled the workflow yet) or present but phase-less. An
+    /// unrecognized string is a loud error naming the value, never a silent
+    /// retry.
+    fn parse(phase: Option<&str>) -> Result<Option<Self>, BackendError> {
+        match phase {
+            None | Some("") => Ok(None),
+            Some("Pending") => Ok(Some(Self::Pending)),
+            Some("Running") => Ok(Some(Self::Running)),
+            Some("Succeeded") => Ok(Some(Self::Succeeded)),
+            Some("Failed") => Ok(Some(Self::Failed)),
+            Some("Error") => Ok(Some(Self::Error)),
+            Some(unknown) => Err(BackendError::new(&format!(
+                "unknown workflow status phase: {:?}",
+                unknown
+            ))),
+        }
+    }
+
+    /// Whether the workflow has finished (Succeeded / Failed / Error);
+    /// Pending and Running (and the phase-less pending shapes) have not.
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Error)
+    }
+
+    /// Phase-only verdict fallback for a terminal phase whose `verdict`
+    /// output parameter is absent or unparseable.
+    fn fallback_verdict(self) -> Verdict {
+        match self {
+            Self::Succeeded => Verdict::Pass,
+            Self::Failed => Verdict::TestFailure,
+            // The workflow itself broke, so no test result exists to report.
+            // (The pending rungs can never reach this terminal fallback; they
+            // classify as infra if one ever does.)
+            Self::Pending | Self::Running | Self::Error => Verdict::InfraFailure,
+        }
+    }
+}
+
 /// The Argo Workflows backend implementation.
 pub struct ArgoBackend {
     /// Argo-specific configuration.
@@ -419,13 +486,24 @@ pub struct ArgoBackend {
     /// The kubectl execution seam: the production binary runner, or a test
     /// fake when the backend is built through `with_runner`.
     kubectl: Box<dyn KubectlRunner>,
+    /// Poll interval while waiting for a terminal phase. Production value:
+    /// [`STATUS_POLL`]; tests shorten it so polling scenarios stay fast.
+    status_poll: Duration,
+    /// Poll interval while discovering the workflow's log pod. Production
+    /// value: [`POD_DISCOVERY_POLL`]; tests shorten it.
+    discovery_poll: Duration,
 }
 
 impl ArgoBackend {
     /// Create a new ArgoBackend with configuration.
     pub fn new(config: ArgoConfig) -> Self {
         let kubectl = Box::new(ProcessKubectl::from_config(&config));
-        ArgoBackend { config, kubectl }
+        ArgoBackend {
+            config,
+            kubectl,
+            status_poll: STATUS_POLL,
+            discovery_poll: POD_DISCOVERY_POLL,
+        }
     }
 
     /// Create a new ArgoBackend with default config.
@@ -435,9 +513,18 @@ impl ArgoBackend {
 
     /// Create a new ArgoBackend around an injected kubectl runner (tests
     /// hand in an in-memory fake; no cluster, no kubectl binary).
+    ///
+    /// Poll intervals default fast (1ms) so wait()/discovery loops exercising
+    /// several rungs stay fast; a test that needs to observe cadence
+    /// overrides the `status_poll`/`discovery_poll` fields directly.
     #[cfg(test)]
     fn with_runner(config: ArgoConfig, kubectl: Box<dyn KubectlRunner>) -> Self {
-        ArgoBackend { config, kubectl }
+        ArgoBackend {
+            config,
+            kubectl,
+            status_poll: Duration::from_millis(1),
+            discovery_poll: Duration::from_millis(1),
+        }
     }
 
     /// Run kubectl with arguments and return its captured outcome.
@@ -465,13 +552,18 @@ impl ArgoBackend {
         Ok(obj.status)
     }
 
-    /// Whether the workflow has reached a terminal phase
-    /// (Succeeded / Failed / Error).
-    fn workflow_is_terminal(&self, workflow_name: &str) -> Result<bool, BackendError> {
-        Ok(self
-            .workflow_status(workflow_name)?
-            .and_then(|status| status.phase)
-            .is_some_and(|phase| matches!(phase.as_str(), "Succeeded" | "Failed" | "Error")))
+    /// Fetch the workflow and classify its `status.phase` on the ladder.
+    ///
+    /// `Ok(None)` = the workflow object is not retrievable yet (transient
+    /// kubectl failure, or the controller has not created/reconciled it) —
+    /// pending for callers that poll. A malformed object and an unrecognized
+    /// phase string are loud errors from [`Self::workflow_status`] and
+    /// [`WorkflowPhase::parse`] respectively.
+    fn workflow_phase(&self, workflow_name: &str) -> Result<Option<WorkflowPhase>, BackendError> {
+        match self.workflow_status(workflow_name)? {
+            None => Ok(None),
+            Some(status) => WorkflowPhase::parse(status.phase.as_deref()),
+        }
     }
 
     /// Read one output parameter's value from the workflow's status.
@@ -486,35 +578,47 @@ impl ArgoBackend {
             .and_then(|status| status.output_parameter(wanted).map(str::to_string)))
     }
 
-    /// Discover the pod to stream logs from, retrying until `timeout`.
+    /// Discover the pod to stream logs from, bounded by `timeout`.
+    ///
+    /// The loop is deadline-aware: it converts `timeout` into a deadline up
+    /// front, re-checks it before every poll, and clamps each sleep to the
+    /// time remaining — so it can never loop or sleep past the budget. Expiry
+    /// is a loud [`BackendError`], not a hang.
     ///
     /// Returns [`PodDiscovery::PodGone`] as soon as the workflow itself goes
     /// terminal with no pod ever observed: podGC (`OnPodCompletion`) deletes
     /// the pod the moment the run finishes, so a fast run goes straight from
     /// "no pod" to a terminal workflow — waiting out the full timeout would
     /// idle five minutes on every quick run before the output-parameter
-    /// fallback could fire. A workflow that never schedules still expires as
-    /// a loud error, not a hang.
+    /// fallback could fire. An unrecognized phase string errors immediately
+    /// rather than counting as "not terminal yet".
     fn discover_pod_or_terminal(
         &self,
         workflow_name: &str,
         timeout: Duration,
     ) -> Result<PodDiscovery, BackendError> {
-        let start = Instant::now();
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(pod) = self.discover_pod(workflow_name)? {
                 return Ok(PodDiscovery::Pod(pod));
             }
-            if self.workflow_is_terminal(workflow_name)? {
+            if self
+                .workflow_phase(workflow_name)?
+                .is_some_and(WorkflowPhase::is_terminal)
+            {
                 return Ok(PodDiscovery::PodGone);
             }
-            if start.elapsed() >= timeout {
+            // Never sleep past the discovery deadline: the clamp bounds this
+            // iteration, and zero remaining ends the loop here.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(BackendError::new(&format!(
-                    "no pod found for workflow {} within {:?}",
+                    "pod discovery deadline exceeded: no pod found for workflow {} \
+                     within {:?}",
                     workflow_name, timeout
                 )));
             }
-            thread::sleep(POD_DISCOVERY_POLL);
+            thread::sleep(self.discovery_poll.min(remaining));
         }
     }
 
@@ -742,8 +846,24 @@ impl RemoteBackend for ArgoBackend {
 
     /// Wait for the workflow to complete and return its verdict.
     ///
-    /// Polls kubectl get workflow status.phase until terminal or deadline.
-    /// Reads verdict.json from the `verdict` output parameter if available.
+    /// Polls `kubectl get workflow -o json` until `status.phase` reaches a
+    /// terminal rung or the deadline expires, whichever comes first. The loop
+    /// is deadline-aware in both directions: it re-checks the deadline before
+    /// every poll, and each pending sleep is clamped to the time remaining —
+    /// wait() can never loop (or sleep) past its deadline. Expiry is a loud
+    /// [`BackendError`], which the caller classifies as InfraFailure.
+    ///
+    /// The phase ladder is explicit ([`WorkflowPhase`]): no status / bare
+    /// status / Pending / Running are pending; Succeeded / Failed / Error are
+    /// terminal; any other phase string is a loud error rather than a silent
+    /// retry. Malformed workflow JSON is likewise a loud error from
+    /// [`Self::workflow_status`] — gantry never guesses at a status it cannot
+    /// parse.
+    ///
+    /// Within a terminal phase the `verdict` output parameter (verdict.json)
+    /// decides the verdict; absent or unparseable, the phase itself
+    /// classifies (Succeeded → Pass, Failed → TestFailure, Error →
+    /// InfraFailure). status.phase remains the authoritative terminal signal.
     /// Attributions gate failures to "[gantry] gate:" in output.
     fn wait(
         &self,
@@ -751,53 +871,51 @@ impl RemoteBackend for ArgoBackend {
         deadline: Instant,
     ) -> Result<Verdict, BackendError> {
         loop {
-            // Check deadline
-            if Instant::now() > deadline {
-                return Err(BackendError::new("workflow deadline exceeded"));
+            // Deadline first: no poll, sleep, or verdict may happen past it.
+            if Instant::now() >= deadline {
+                return Err(BackendError::new(&format!(
+                    "workflow {} deadline exceeded while polling status.phase",
+                    h.handle
+                )));
             }
 
             // The `status` stanza is absent until the controller first
             // reconciles the workflow (and may be phase-less right after) —
-            // both are pending, not errors.
-            let Some(status) = self.workflow_status(&h.handle)? else {
-                thread::sleep(STATUS_POLL);
+            // both are pending, not errors. A malformed object or an
+            // unrecognized phase errors loudly instead of retrying.
+            let status = self.workflow_status(&h.handle)?;
+            let phase = WorkflowPhase::parse(status.as_ref().and_then(|s| s.phase.as_deref()))?;
+
+            let Some(phase) = phase.filter(|p| p.is_terminal()) else {
+                // Pending shape: sleep until the next poll, but never past
+                // the deadline — the clamp guarantees the next loop-top check
+                // lands on time.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(self.status_poll.min(remaining));
                 continue;
             };
 
-            // Check if terminal phase
-            match status.phase.as_deref() {
-                Some("Succeeded" | "Failed" | "Error") => {
-                    // Terminal phase - try to read verdict.json from the
-                    // workflow's `verdict` output parameter.
-                    if let Some(value) = status.output_parameter("verdict") {
-                        match VerdictJson::parse(value) {
-                            Ok(vj) => {
-                                let verdict = vj.to_verdict();
-                                // Attributions for gate failures
-                                if verdict == Verdict::GateFailure {
-                                    eprintln!("[gantry] gate: quality gate failed");
-                                }
-                                return Ok(verdict);
-                            }
-                            Err(e) => {
-                                // Fall back to exit code if verdict.json parsing fails
-                                eprintln!("[gantry] failed to parse verdict.json: {}", e);
-                            }
+            // Terminal - try to read verdict.json from the workflow's
+            // `verdict` output parameter.
+            if let Some(value) = status.as_ref().and_then(|s| s.output_parameter("verdict")) {
+                match VerdictJson::parse(value) {
+                    Ok(vj) => {
+                        let verdict = vj.to_verdict();
+                        // Attributions for gate failures
+                        if verdict == Verdict::GateFailure {
+                            eprintln!("[gantry] gate: quality gate failed");
                         }
+                        return Ok(verdict);
                     }
-
-                    // Fall back to phase-based classification
-                    return Ok(match status.phase.as_deref() {
-                        Some("Succeeded") => Verdict::Pass,
-                        Some("Failed") => Verdict::TestFailure,
-                        _ => Verdict::InfraFailure,
-                    });
-                }
-                _ => {
-                    // Not terminal - sleep and retry
-                    thread::sleep(STATUS_POLL);
+                    Err(e) => {
+                        // Fall back to exit code if verdict.json parsing fails
+                        eprintln!("[gantry] failed to parse verdict.json: {}", e);
+                    }
                 }
             }
+
+            // Fall back to the phase ladder itself for the verdict.
+            return Ok(phase.fallback_verdict());
         }
     }
 
@@ -1716,6 +1834,232 @@ mod tests {
             with_exec_retry(|| backend.wait(&handle, Instant::now() + Duration::from_secs(5)))
                 .expect("wait must return on terminal phase");
         assert_eq!(verdict, Verdict::InfraFailure);
+    }
+
+    // --- the status.phase ladder --------------------------------------------
+    //
+    // These go through the in-memory fake: polling loops run many kubectl
+    // calls, and the fake scripts them in call order with no temp files and
+    // no ETXTBSY retries. with_runner's fast poll intervals keep multi-rung
+    // scenarios in milliseconds.
+
+    /// A workflow object carrying only `status.phase`.
+    fn status_json(phase: &str) -> String {
+        serde_json::json!({ "status": { "phase": phase } }).to_string()
+    }
+
+    /// A workflow object carrying `status.phase` and a `verdict` output
+    /// parameter (the verdict.json the remote template exports).
+    fn status_json_with_verdict(phase: &str, verdict: &str) -> String {
+        serde_json::json!({
+            "status": {
+                "phase": phase,
+                "outputs": {
+                    "parameters": [ { "name": "verdict", "value": verdict } ]
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// The schema-1 verdict.json for a passing run.
+    fn passing_verdict_json() -> String {
+        r#"{"schema_version":1,"phase":"Succeeded","exit_code":0,"oom":false,"deadline_exceeded":false}"#
+            .to_string()
+    }
+
+    /// The full phase ladder parses rung by rung: the two phase-less pending
+    /// shapes read as no-phase-yet, Pending and Running are known-pending,
+    /// Succeeded/Failed/Error are known-terminal, and anything else is a
+    /// loud error rather than a silent "keep waiting".
+    #[test]
+    fn workflow_phase_ladder_classifies_every_status_value() {
+        // Phase-less pending shapes.
+        assert_eq!(WorkflowPhase::parse(None), Ok(None));
+        assert_eq!(WorkflowPhase::parse(Some("")), Ok(None));
+        // Known-pending rungs.
+        assert_eq!(
+            WorkflowPhase::parse(Some("Pending")),
+            Ok(Some(WorkflowPhase::Pending))
+        );
+        assert_eq!(
+            WorkflowPhase::parse(Some("Running")),
+            Ok(Some(WorkflowPhase::Running))
+        );
+        // Known-terminal rungs.
+        assert_eq!(
+            WorkflowPhase::parse(Some("Succeeded")),
+            Ok(Some(WorkflowPhase::Succeeded))
+        );
+        assert_eq!(
+            WorkflowPhase::parse(Some("Failed")),
+            Ok(Some(WorkflowPhase::Failed))
+        );
+        assert_eq!(
+            WorkflowPhase::parse(Some("Error")),
+            Ok(Some(WorkflowPhase::Error))
+        );
+
+        // Terminality splits exactly at the three terminal rungs.
+        assert!(!WorkflowPhase::Pending.is_terminal());
+        assert!(!WorkflowPhase::Running.is_terminal());
+        assert!(WorkflowPhase::Succeeded.is_terminal());
+        assert!(WorkflowPhase::Failed.is_terminal());
+        assert!(WorkflowPhase::Error.is_terminal());
+
+        // An unrecognized phase string names itself in the error — it must
+        // never classify as pending (that would poll forever).
+        let err = WorkflowPhase::parse(Some("Zombie")).expect_err("unknown phase must error");
+        assert!(
+            err.reason.contains("unknown workflow status phase") && err.reason.contains("Zombie"),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// Phase-only fallback verdicts: Succeeded is a Pass, Failed is a
+    /// TestFailure, and Error is an InfraFailure (the workflow itself broke,
+    /// so no test result exists).
+    #[test]
+    fn workflow_phase_fallback_verdicts_map_terminal_rungs() {
+        assert_eq!(WorkflowPhase::Succeeded.fallback_verdict(), Verdict::Pass);
+        assert_eq!(
+            WorkflowPhase::Failed.fallback_verdict(),
+            Verdict::TestFailure
+        );
+        let error_verdict = WorkflowPhase::Error.fallback_verdict();
+        assert_eq!(error_verdict, Verdict::InfraFailure);
+        assert!(error_verdict.is_infra_failure());
+    }
+
+    /// The full pending ladder: a workflow that reports Pending, then
+    /// Running, then Succeeded with a verdict.json walks every pending rung
+    /// and lands on Pass — one kubectl poll per rung.
+    #[test]
+    fn wait_walks_pending_running_succeeded_to_pass() {
+        let (fake, calls) = FakeKubectl::serving(vec![
+            ok_outcome(&status_json("Pending")),
+            ok_outcome(&status_json("Running")),
+            ok_outcome(&status_json_with_verdict(
+                "Succeeded",
+                &passing_verdict_json(),
+            )),
+        ]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("wait must walk the ladder to a verdict");
+        assert_eq!(verdict, Verdict::Pass);
+
+        // One `get workflow -o json` poll per observed rung.
+        let log = calls_of(&calls);
+        assert_eq!(log.len(), 3, "one poll per rung, got {:?}", log.len());
+        for call in &log {
+            assert_eq!(
+                call.args,
+                vec!["get", "workflow", "gantry-abc123", "-o", "json"]
+            );
+        }
+    }
+
+    /// A terminal Failed phase with no `verdict` output parameter falls back
+    /// to the phase ladder: TestFailure — tests ran and failed.
+    #[test]
+    fn wait_failed_phase_without_verdict_param_is_test_failure() {
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json("Failed"))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("wait must classify the terminal Failed phase");
+        assert_eq!(verdict, Verdict::TestFailure);
+    }
+
+    /// Deadline expiry during polling: a workflow that stays Running forever
+    /// must surface a loud deadline error at the deadline — not loop
+    /// past it. The poll interval is set far larger than the remaining
+    /// budget, so a correct implementation clamps the pending sleep to the
+    /// deadline and returns immediately after the first poll; an
+    /// implementation that sleeps the full interval first would blow the
+    /// elapsed bound.
+    #[test]
+    fn wait_deadline_exceeded_during_polling_errors_not_loops() {
+        // The final outcome repeats forever: the workflow never completes.
+        let (fake, calls) = FakeKubectl::serving(vec![ok_outcome(&status_json("Running"))]);
+        let mut backend = backend_with_runner(fake);
+        backend.status_poll = Duration::from_secs(10);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let start = Instant::now();
+        let err = backend
+            .wait(&handle, start + Duration::from_millis(150))
+            .expect_err("wait must fail once the deadline passes mid-poll");
+        let elapsed = start.elapsed();
+
+        assert!(err.reason.contains("deadline"), "{}", err.reason);
+        // The clamp: the pending sleep was cut to the ~150ms remaining, so
+        // the full 10s interval never ran.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "wait slept past its deadline: {:?}",
+            elapsed
+        );
+        // Exactly one poll happened: the clamped sleep lands at (or past)
+        // the deadline, so the loop errors before a second kubectl call.
+        assert_eq!(calls_of(&calls).len(), 1, "wait polled past its deadline");
+    }
+
+    /// An unrecognized phase string is a loud error naming the value — not a
+    /// silent retry that polls until the deadline.
+    #[test]
+    fn wait_unknown_phase_is_loud_error_not_silent_retry() {
+        let (fake, calls) = FakeKubectl::serving(vec![ok_outcome(&status_json("Zombie"))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        // The deadline is far away: the error must come from the ladder, not
+        // from expiry.
+        let err = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(30))
+            .expect_err("an unknown phase must error instead of polling");
+        assert!(
+            err.reason.contains("unknown workflow status phase") && err.reason.contains("Zombie"),
+            "{}",
+            err.reason
+        );
+        assert_eq!(
+            calls_of(&calls).len(),
+            1,
+            "wait must not retry after an unknown phase"
+        );
+    }
+
+    /// Malformed JSON from `kubectl get workflow -o json` is a loud error on
+    /// the first occurrence — never a silent retry (gantry never guesses at
+    /// a status it cannot parse).
+    #[test]
+    fn wait_malformed_workflow_json_is_error_not_retry() {
+        let (fake, calls) =
+            FakeKubectl::serving(vec![ok_outcome(r#"{"status":{"phase":"Succeeded""#)]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(30))
+            .expect_err("malformed workflow JSON must error instead of retrying");
+        assert!(
+            err.reason.contains("failed to parse workflow status"),
+            "{}",
+            err.reason
+        );
+        assert_eq!(
+            calls_of(&calls).len(),
+            1,
+            "wait must not retry after a malformed status document"
+        );
     }
 
     /// stream_logs discovers the workflow's pod and pipes its logs to the
