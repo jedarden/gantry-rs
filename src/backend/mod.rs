@@ -5,6 +5,7 @@
 // This module defines:
 // - Verdict: the full verdict ladder (Pass/TestFailure/GateFailure/InfraFailure/Cancelled/Superseded)
 // - BackendError: minimal error type for backend operations
+// - BackendResult: Result alias used by every RemoteBackend method signature
 // - RunHandle: opaque handle returned by submit() and consumed by wait()
 // - RunStatus: coarse run-state query result (Pending/Running/Completed/Unknown)
 // - RemoteBackend trait: submit / stream_logs / wait / describe / cancel / status
@@ -144,6 +145,14 @@ impl fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// BackendResult: the Result alias behind every RemoteBackend method.
+///
+/// Defined once so trait signatures, implementations, and call sites agree on
+/// the error channel ([`BackendError`]) without re-spelling the full Result
+/// type. Type aliases are transparent — an implementation may write the
+/// expanded `Result<T, BackendError>` and still be a valid trait impl.
+pub type BackendResult<T> = Result<T, BackendError>;
+
 /// RunHandle: opaque handle returned by submit() and consumed by wait().
 ///
 /// Phase 0.5: the handle is the stdout of the submit command (a string identifier
@@ -201,13 +210,13 @@ pub trait RemoteBackend {
     ///
     /// Phase 0.5: submit runs the configured submit argv and captures its stdout
     /// as the handle. Failure (argv not found, non-zero exit) returns Err.
-    fn submit(&self, spec: &RunSpec) -> Result<RunHandle, BackendError>;
+    fn submit(&self, spec: &RunSpec) -> BackendResult<RunHandle>;
 
     /// Stream logs from the remote run to a writer (best-effort).
     ///
     /// Phase 0.5: may panic — this is not implemented in the skeleton.
     /// Phase 1a will implement this for both command and Argo backends.
-    fn stream_logs(&self, h: &RunHandle, out: &mut dyn std::io::Write) -> Result<(), BackendError> {
+    fn stream_logs(&self, h: &RunHandle, out: &mut dyn std::io::Write) -> BackendResult<()> {
         let _ = (h, out);
         panic!("stream_logs is not implemented in Phase 0.5");
     }
@@ -219,7 +228,7 @@ pub trait RemoteBackend {
     ///
     /// Phase 0.5: wait runs the configured wait argv with the handle and maps
     /// the exit code to a Verdict using the minimal ladder.
-    fn wait(&self, h: &RunHandle, deadline: std::time::Instant) -> Result<Verdict, BackendError>;
+    fn wait(&self, h: &RunHandle, deadline: std::time::Instant) -> BackendResult<Verdict>;
 
     /// Describe a run for human consumption (e.g., a URL to view logs).
     ///
@@ -236,7 +245,7 @@ pub trait RemoteBackend {
     /// Phase 0.5: may panic — this is not implemented in the skeleton.
     /// Phase 1a will implement cancellation for both backends (kubectl delete
     /// for Argo, a cancel argv for command templates).
-    fn cancel(&self, h: &RunHandle) -> Result<(), BackendError> {
+    fn cancel(&self, h: &RunHandle) -> BackendResult<()> {
         let _ = h;
         panic!("cancel is not implemented in Phase 0.5");
     }
@@ -251,7 +260,7 @@ pub trait RemoteBackend {
     /// Phase 0.5: may panic — this is not implemented in the skeleton.
     /// Later phases will map backend state onto RunStatus (Argo status.phase,
     /// command-backend process liveness).
-    fn status(&self, h: &RunHandle) -> Result<RunStatus, BackendError> {
+    fn status(&self, h: &RunHandle) -> BackendResult<RunStatus> {
         let _ = h;
         panic!("status is not implemented in Phase 0.5");
     }
@@ -465,15 +474,11 @@ mod tests {
     struct SkeletonBackend;
 
     impl RemoteBackend for SkeletonBackend {
-        fn submit(&self, _spec: &RunSpec) -> Result<RunHandle, BackendError> {
+        fn submit(&self, _spec: &RunSpec) -> BackendResult<RunHandle> {
             Err(BackendError::new("skeleton backend submits nothing"))
         }
 
-        fn wait(
-            &self,
-            _h: &RunHandle,
-            _deadline: std::time::Instant,
-        ) -> Result<Verdict, BackendError> {
+        fn wait(&self, _h: &RunHandle, _deadline: std::time::Instant) -> BackendResult<Verdict> {
             Err(BackendError::new("skeleton backend waits on nothing"))
         }
     }
@@ -483,5 +488,127 @@ mod tests {
     fn default_status_follows_phase05_panic_convention() {
         let backend = SkeletonBackend;
         let _ = backend.status(&RunHandle::new("unused"));
+    }
+
+    /// A stub that answers from the handle string alone: submit() encodes the
+    /// spec's sha into the handle, and status()/wait() consume it. Holds no
+    /// state and touches no filesystem or environment, so the tests below are
+    /// safe under parallel execution.
+    struct StubBackend;
+
+    impl StubBackend {
+        fn run_spec(sha: &str) -> RunSpec {
+            RunSpec::new("cargo", "test", vec![], "file:///tmp/gantry-stub", sha, "")
+        }
+
+        fn deadline_ahead() -> std::time::Instant {
+            std::time::Instant::now() + std::time::Duration::from_secs(60)
+        }
+    }
+
+    impl RemoteBackend for StubBackend {
+        fn submit(&self, spec: &RunSpec) -> BackendResult<RunHandle> {
+            Ok(RunHandle::new(&format!("stub-{}", spec.sha)))
+        }
+
+        fn status(&self, h: &RunHandle) -> BackendResult<RunStatus> {
+            match h.handle.as_str() {
+                "stub-pass" | "stub-fail" => Ok(RunStatus::Running),
+                other => Err(BackendError::new(&format!("unknown handle {other:?}"))),
+            }
+        }
+
+        fn wait(&self, h: &RunHandle, deadline: std::time::Instant) -> BackendResult<Verdict> {
+            if std::time::Instant::now() > deadline {
+                return Err(BackendError::new("deadline passed"));
+            }
+            match h.handle.as_str() {
+                "stub-pass" => Ok(Verdict::Pass),
+                "stub-fail" => Ok(Verdict::TestFailure),
+                other => Err(BackendError::new(&format!("unknown handle {other:?}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn backend_result_alias_is_transparent_with_result() {
+        // Compile-level contract: a BackendResult flows into and out of
+        // positions expecting the spelled-out Result type unchanged.
+        fn take_result(r: Result<Verdict, BackendError>) -> BackendResult<Verdict> {
+            r
+        }
+        let alias: BackendResult<Verdict> = Ok(Verdict::Pass);
+        assert_eq!(take_result(alias), Ok(Verdict::Pass));
+
+        let err: BackendResult<Verdict> = Err(BackendError::new("no run"));
+        assert_eq!(
+            take_result(err).err().map(|e| e.reason),
+            Some("no run".to_string())
+        );
+    }
+
+    #[test]
+    fn dyn_backend_submit_returns_a_run_handle() {
+        let backend: &dyn RemoteBackend = &StubBackend;
+        let h = backend
+            .submit(&StubBackend::run_spec("pass"))
+            .expect("stub submit succeeds");
+        assert_eq!(
+            h.handle, "stub-pass",
+            "handle carries the submitted sha for status()/wait() to consume"
+        );
+    }
+
+    #[test]
+    fn dyn_backend_status_consumes_the_handle() {
+        let backend: Box<dyn RemoteBackend> = Box::new(StubBackend);
+        let h = backend
+            .submit(&StubBackend::run_spec("pass"))
+            .expect("submit");
+        assert_eq!(
+            backend.status(&h).expect("status"),
+            RunStatus::Running,
+            "submitted run reports Running"
+        );
+
+        // A handle the backend did not issue is an Err, not a fabricated state.
+        let err = backend
+            .status(&RunHandle::new("stub-never-submitted"))
+            .expect_err("unknown handle errors");
+        assert!(
+            err.reason.contains("unknown handle"),
+            "unexpected error: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn dyn_backend_wait_consumes_the_handle_and_yields_the_verdict() {
+        let backend: &dyn RemoteBackend = &StubBackend;
+        let deadline = StubBackend::deadline_ahead();
+
+        let h = backend
+            .submit(&StubBackend::run_spec("pass"))
+            .expect("submit");
+        assert_eq!(backend.wait(&h, deadline).expect("wait"), Verdict::Pass);
+
+        let h = backend
+            .submit(&StubBackend::run_spec("fail"))
+            .expect("submit");
+        assert_eq!(
+            backend.wait(&h, deadline).expect("wait"),
+            Verdict::TestFailure
+        );
+    }
+
+    #[test]
+    fn dyn_backend_wait_honours_an_elapsed_deadline() {
+        let backend: &dyn RemoteBackend = &StubBackend;
+        let h = backend
+            .submit(&StubBackend::run_spec("pass"))
+            .expect("submit");
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let err = backend.wait(&h, past).expect_err("elapsed deadline errors");
+        assert_eq!(err.reason, "deadline passed");
     }
 }
