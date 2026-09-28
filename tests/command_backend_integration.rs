@@ -123,6 +123,7 @@ fn backend_with(submit: PathBuf, wait: PathBuf, logs: PathBuf) -> CommandBackend
         ],
         logs: vec![script_path(&logs), "{handle}".to_string()],
         wait: vec![script_path(&wait), "{handle}".to_string()],
+        status: None,
     })
 }
 
@@ -358,6 +359,7 @@ fn empty_submit_argv_is_an_error() {
             script_path(&write_wait_mock(dir.path(), 0)),
             "{handle}".to_string(),
         ],
+        status: None,
     });
 
     let err = backend.submit(&spec()).expect_err("empty argv should fail");

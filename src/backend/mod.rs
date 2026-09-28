@@ -612,11 +612,29 @@ mod tests {
 
     /// A backend that does not override status() inherits the Phase-0.5 default
     /// body (same convention as stream_logs/describe/cancel) and keeps compiling
-    /// unchanged until it implements the query.
+    /// unchanged until it implements the query. SkeletonBackend implements only
+    /// the two required methods, so every default — status included — is the
+    /// inherited body.
+    struct SkeletonBackend;
+
+    impl RemoteBackend for SkeletonBackend {
+        fn submit(&self, _spec: &RunSpec) -> Result<RunHandle, BackendError> {
+            Err(BackendError::new("skeleton backend submits nothing"))
+        }
+
+        fn wait(
+            &self,
+            _h: &RunHandle,
+            _deadline: std::time::Instant,
+        ) -> Result<Verdict, BackendError> {
+            Err(BackendError::new("skeleton backend waits on nothing"))
+        }
+    }
+
     #[test]
     #[should_panic(expected = "status is not implemented in Phase 0.5")]
     fn default_status_follows_phase05_panic_convention() {
-        let backend = crate::backend::command::CommandBackend::new();
+        let backend = SkeletonBackend;
         let _ = backend.status(&RunHandle::new("unused"));
     }
 
