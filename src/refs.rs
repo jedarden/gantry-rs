@@ -233,6 +233,23 @@ impl RefPusher {
         }
     }
 
+    /// The ref name a real [`RefPusher::push`] would use for `sha` right now,
+    /// without pushing anything.
+    ///
+    /// `gantry explain` must answer with the *exact* ref (plan §"CLI surface":
+    /// "gates, backend, exact ref — no network"), so the dry run resolves its
+    /// name through this function rather than re-spelling the format: when the
+    /// naming scheme changes, the explanation changes with it. The epoch
+    /// prefix is unix seconds at naming time, so the answer is exact up to the
+    /// second the hypothetical run starts — the same second-vs-start skew a
+    /// real run has between naming and pushing.
+    pub fn ref_name_for(config: &Config, sha: &str) -> String {
+        match &config.remote.push_mode {
+            PushMode::Ref => format!("refs/gantry/{}-{sha}", Self::epoch_now()),
+            PushMode::Branch => format!("refs/heads/gantry/{sha}"),
+        }
+    }
+
     /// Mark a lease as terminal (run completed).
     ///
     /// Called when a run finishes (pass, fail, gate_failure, etc.). The ref

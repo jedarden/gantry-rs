@@ -199,6 +199,88 @@ impl RunLog {
         Ok(orphans)
     }
 
+    /// Read the whole ledger as paired runs, oldest entry first.
+    ///
+    /// This is the read side of the write-ahead ledger — the source `gantry
+    /// why` replays the last run from and `gantry status` lists recent and
+    /// in-flight runs from. Every intent is paired with the newest verdict
+    /// carrying its `run_id`; an intent with no verdict is an in-flight or
+    /// lost run (what [`RunLog::find_orphans`] reports for doctor).
+    ///
+    /// Corrupt lines (a torn final line after a crash mid-write, a truncated
+    /// record from a full disk) are skipped and counted rather than fatal: a
+    /// damaged ledger must not brick the diagnostics that exist to explain
+    /// damaged runs. This is deliberately more forgiving than
+    /// [`RunLog::find_orphans`], which hard-errors — doctor must not bless a
+    /// ledger it only half understood, while `why`/`status` degrade to
+    /// answering from the records that did parse. Verdicts whose `run_id`
+    /// matches no intent (the degenerate ineligible path in the decision
+    /// engine writes one) have no run to attach to and are counted in
+    /// [`Ledger::unmatched_verdicts`].
+    pub fn read_entries(&self) -> Result<Ledger, RunLogError> {
+        let mut ledger = Ledger {
+            entries: Vec::new(),
+            skipped_lines: 0,
+            unmatched_verdicts: 0,
+        };
+
+        if !self.log_path.exists() {
+            // No log file = no runs; an empty ledger is not an error.
+            return Ok(ledger);
+        }
+
+        let content =
+            std::fs::read_to_string(&self.log_path).map_err(|e| RunLogError::CannotReadLog {
+                path: self.log_path.clone(),
+                source: e,
+            })?;
+
+        for line in content.lines() {
+            if line.is_empty() {
+                continue;
+            }
+
+            // Classify by the record discriminator before typed parsing so an
+            // unknown or missing `rec` degrades to a skipped line instead of
+            // a parse error shaped like a panic.
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+                ledger.skipped_lines += 1;
+                continue;
+            };
+
+            match rec.get("rec").and_then(|v| v.as_str()) {
+                Some("intent") => match serde_json::from_str::<IntentRecord>(line) {
+                    Ok(intent) => ledger.entries.push(RunEntry {
+                        intent,
+                        verdict: None,
+                    }),
+                    Err(_) => ledger.skipped_lines += 1,
+                },
+                Some("verdict") => match serde_json::from_str::<VerdictRecord>(line) {
+                    Ok(verdict) => {
+                        // Newest intent wins: run_ids are minted per-invocation,
+                        // so a match is unique in practice, and a duplicate would
+                        // mean a replayed id — pairing with the latest keeps the
+                        // last-run view consistent with the append-only tail.
+                        let matched = ledger
+                            .entries
+                            .iter_mut()
+                            .rev()
+                            .find(|entry| entry.intent.run_id == verdict.run_id);
+                        match matched {
+                            Some(entry) => entry.verdict = Some(verdict),
+                            None => ledger.unmatched_verdicts += 1,
+                        }
+                    }
+                    Err(_) => ledger.skipped_lines += 1,
+                },
+                _ => ledger.skipped_lines += 1,
+            }
+        }
+
+        Ok(ledger)
+    }
+
     /// Get the path to the runlog file (for display/debugging).
     pub fn path(&self) -> &Path {
         &self.log_path
@@ -436,7 +518,7 @@ impl VerdictRecord {
 /// Verdict: the terminal classification of a run.
 ///
 /// Must match the backend::Verdict enum for consistency.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// The remote ran the suite and it passed.
@@ -454,7 +536,7 @@ pub enum Verdict {
 }
 
 /// Where the run actually executed.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RanLocation {
     /// Ran on remote backend.
@@ -466,7 +548,7 @@ pub enum RanLocation {
 }
 
 /// Duration breakdown (milliseconds) for performance visibility.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Durations {
     /// Time spent in GitGate checks.
     pub gate: u64,
@@ -490,6 +572,33 @@ pub struct OrphanedRun {
     pub intent: IntentRecord,
     /// When the orphan was detected (not necessarily when it happened).
     pub orphaned_at: SystemTime,
+}
+
+/// One logical run as read back from the ledger: the write-ahead OPEN intent
+/// plus its terminal verdict when one landed. This is the unit `gantry why`
+/// replays and `gantry status` lists.
+#[derive(Debug, Clone)]
+pub struct RunEntry {
+    /// The OPEN intent written before dispatch (all gate inputs captured).
+    pub intent: IntentRecord,
+    /// The terminal verdict, `None` while the run is in flight — or forever,
+    /// when the process was killed mid-run (an orphan doctor reports).
+    pub verdict: Option<VerdictRecord>,
+}
+
+/// The result of reading the whole ledger ([`RunLog::read_entries`]).
+#[derive(Debug, Clone, Default)]
+pub struct Ledger {
+    /// Paired runs in file order (oldest first). File order is arrival
+    /// order: runs.jsonl is append-only with O_APPEND single-line writes.
+    pub entries: Vec<RunEntry>,
+    /// Lines that could not be parsed and were skipped (torn final line,
+    /// truncated record). Diagnostics answer from the records that parsed.
+    pub skipped_lines: usize,
+    /// Verdict records whose `run_id` matched no intent (the degenerate
+    /// ineligible path writes one). Nothing to attach them to; counted so
+    /// the number stays visible instead of silently dropped.
+    pub unmatched_verdicts: usize,
 }
 
 /// Error type for RunLog operations.
@@ -793,5 +902,140 @@ mod tests {
         // The orphan should have all the original intent data for replay
         assert_eq!(orphans[0].intent.args.len(), 3);
         assert_eq!(orphans[0].intent.args[0], "test");
+    }
+
+    /// A reusable remote-run intent (the AS-2 shape: intercepted cargo test).
+    fn test_intent() -> IntentRecord {
+        IntentRecord::new(
+            "cargo".to_string(),
+            vec!["test".to_string()],
+            "https://github.com/example/repo".to_string(),
+            "abc123".to_string(),
+            PathBuf::from("."),
+            GateInputs {
+                worktree: true,
+                head: true,
+                remote: true,
+                clean: true,
+            },
+            Decision::Remote,
+            String::new(),
+            "command".to_string(),
+        )
+    }
+
+    #[test]
+    fn read_entries_pairs_intents_with_their_verdicts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runlog = RunLog {
+            log_path: temp_dir.path().join("runs.jsonl"),
+        };
+
+        let intent = test_intent();
+        let verdict = VerdictRecord::new(
+            intent.run_id.clone(),
+            Verdict::TestFailure,
+            RanLocation::Remote,
+            1,
+            "gantry-x7k2p".to_string(),
+            None,
+        );
+        runlog.open_intent(&intent).unwrap();
+        runlog.close_verdict(&verdict).unwrap();
+
+        let ledger = runlog.read_entries().unwrap();
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.skipped_lines, 0);
+        assert_eq!(ledger.unmatched_verdicts, 0);
+
+        let entry = &ledger.entries[0];
+        assert_eq!(entry.intent.run_id, intent.run_id);
+        let verdict = entry.verdict.as_ref().expect("verdict must be paired");
+        assert_eq!(verdict.verdict, Verdict::TestFailure);
+        assert_eq!(verdict.ran, RanLocation::Remote);
+    }
+
+    #[test]
+    fn read_entries_reports_unpaired_intents_as_verdictless() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runlog = RunLog {
+            log_path: temp_dir.path().join("runs.jsonl"),
+        };
+        runlog.open_intent(&test_intent()).unwrap();
+
+        let ledger = runlog.read_entries().unwrap();
+        assert_eq!(ledger.entries.len(), 1);
+        assert!(ledger.entries[0].verdict.is_none());
+    }
+
+    #[test]
+    fn read_entries_skips_corrupt_lines_without_failing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_path = temp_dir.path().join("runs.jsonl");
+
+        let intent = test_intent();
+        let good = serde_json::to_string(&intent).unwrap();
+        // A torn final line (crash mid-write) and a mid-file truncated record.
+        let torn = format!("{}trunc", &good[..good.len() - 20]);
+        std::fs::write(&log_path, format!("{{not json at all\n{torn}\n{good}\n\n")).unwrap();
+
+        let runlog = RunLog { log_path };
+        let ledger = runlog.read_entries().unwrap();
+
+        assert_eq!(ledger.entries.len(), 1, "the good record must survive");
+        assert_eq!(ledger.skipped_lines, 2, "both bad lines are counted");
+    }
+
+    #[test]
+    fn read_entries_counts_verdicts_with_no_intent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runlog = RunLog {
+            log_path: temp_dir.path().join("runs.jsonl"),
+        };
+
+        // The degenerate ineligible path writes a verdict with the stand-in
+        // id "ineligible" and no intent record at all (decision.rs).
+        let stray = VerdictRecord::new(
+            "ineligible".to_string(),
+            Verdict::InfraFailure,
+            RanLocation::Local,
+            1,
+            "local".to_string(),
+            None,
+        );
+        runlog.close_verdict(&stray).unwrap();
+
+        let ledger = runlog.read_entries().unwrap();
+        assert!(ledger.entries.is_empty());
+        assert_eq!(ledger.unmatched_verdicts, 1);
+    }
+
+    #[test]
+    fn read_entries_on_a_missing_ledger_is_an_empty_ledger() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runlog = RunLog {
+            log_path: temp_dir.path().join("does-not-exist.jsonl"),
+        };
+        let ledger = runlog.read_entries().unwrap();
+        assert!(ledger.entries.is_empty());
+        assert_eq!(ledger.skipped_lines, 0);
+    }
+
+    #[test]
+    fn read_entries_orders_runs_oldest_first() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runlog = RunLog {
+            log_path: temp_dir.path().join("runs.jsonl"),
+        };
+
+        let first = test_intent();
+        let second = test_intent();
+        runlog.open_intent(&first).unwrap();
+        runlog.open_intent(&second).unwrap();
+
+        let ledger = runlog.read_entries().unwrap();
+        assert_eq!(ledger.entries.len(), 2);
+        assert_eq!(ledger.entries[0].intent.run_id, first.run_id);
+        assert_eq!(ledger.entries[1].intent.run_id, second.run_id);
     }
 }

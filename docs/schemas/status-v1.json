@@ -1,0 +1,238 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "gantry status --json (schema v1)",
+  "description": "Recent and in-flight runs from the write-ahead ledger (runs.jsonl). Published per plan 'Versioning & compatibility': additive fields are free, consumers ignore unknown ones, and removing or retyping a field is a major bump (a new file, status-v2.json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "runlog_path", "total_entries", "in_flight", "recent", "skipped_lines", "unmatched_verdicts"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "runlog_path": {
+      "type": "string",
+      "description": "Absolute path of the ledger the answer was read from."
+    },
+    "total_entries": {
+      "type": "integer",
+      "description": "Paired runs in the ledger (in-flight and completed together)."
+    },
+    "in_flight": {
+      "type": "array",
+      "description": "Runs with an intent but no verdict yet, newest first — in flight right now, or lost (gantry doctor distinguishes).",
+      "items": {
+        "$comment": "Same run shape as why-v1.json; duplicated inline because the published schemas are standalone files.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "ts", "tool", "args", "repo", "sha", "cwd_rel", "gate", "decision", "reason", "backend", "verdict", "orphaned"],
+        "properties": {
+          "run_id": {
+            "type": "string"
+          },
+          "ts": {
+            "type": "integer"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "repo": {
+            "type": "string"
+          },
+          "sha": {
+            "type": "string"
+          },
+          "cwd_rel": {
+            "type": "string"
+          },
+          "gate": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["worktree", "head", "remote", "clean"],
+            "properties": {
+              "worktree": {
+                "type": "boolean"
+              },
+              "head": {
+                "type": "boolean"
+              },
+              "remote": {
+                "type": "boolean"
+              },
+              "clean": {
+                "type": "boolean"
+              }
+            }
+          },
+          "decision": {
+            "enum": ["remote", "local"]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "backend": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["verdict", "ran", "exit_code", "handle"],
+            "properties": {
+              "verdict": {
+                "enum": ["pass", "test_failure", "gate_failure", "infra_failure", "cancelled", "superseded"]
+              },
+              "ran": {
+                "enum": ["remote", "local", "local_after_infra"]
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "handle": {
+                "type": "string"
+              },
+              "durations_ms": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["gate", "push", "queue", "run"],
+                "properties": {
+                  "gate": {
+                    "type": "integer"
+                  },
+                  "push": {
+                    "type": "integer"
+                  },
+                  "queue": {
+                    "type": "integer"
+                  },
+                  "run": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          },
+          "orphaned": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "recent": {
+      "type": "array",
+      "description": "The most recent completed runs, newest first, up to the --limit count (default 10).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "ts", "tool", "args", "repo", "sha", "cwd_rel", "gate", "decision", "reason", "backend", "verdict", "orphaned"],
+        "properties": {
+          "run_id": {
+            "type": "string"
+          },
+          "ts": {
+            "type": "integer"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "repo": {
+            "type": "string"
+          },
+          "sha": {
+            "type": "string"
+          },
+          "cwd_rel": {
+            "type": "string"
+          },
+          "gate": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["worktree", "head", "remote", "clean"],
+            "properties": {
+              "worktree": {
+                "type": "boolean"
+              },
+              "head": {
+                "type": "boolean"
+              },
+              "remote": {
+                "type": "boolean"
+              },
+              "clean": {
+                "type": "boolean"
+              }
+            }
+          },
+          "decision": {
+            "enum": ["remote", "local"]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "backend": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["verdict", "ran", "exit_code", "handle"],
+            "properties": {
+              "verdict": {
+                "enum": ["pass", "test_failure", "gate_failure", "infra_failure", "cancelled", "superseded"]
+              },
+              "ran": {
+                "enum": ["remote", "local", "local_after_infra"]
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "handle": {
+                "type": "string"
+              },
+              "durations_ms": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["gate", "push", "queue", "run"],
+                "properties": {
+                  "gate": {
+                    "type": "integer"
+                  },
+                  "push": {
+                    "type": "integer"
+                  },
+                  "queue": {
+                    "type": "integer"
+                  },
+                  "run": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          },
+          "orphaned": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "skipped_lines": {
+      "type": "integer",
+      "description": "Unparseable ledger lines skipped (torn final line, truncated record)."
+    },
+    "unmatched_verdicts": {
+      "type": "integer",
+      "description": "Verdict records whose run_id matched no intent."
+    }
+  }
+}

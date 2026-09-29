@@ -188,6 +188,31 @@ fn head_resolves_in(dir: &Path) -> Result<bool, String> {
     Ok(output.status.success())
 }
 
+/// Get the commit SHA that `HEAD` resolves to.
+///
+/// Runs `git rev-parse HEAD` and returns the full object name. `gantry
+/// explain` uses this to name the exact epoch ref a real run would push —
+/// the dry run must be able to answer "which commit exactly". Errors when
+/// HEAD does not resolve (unborn repo); callers in the explain path surface
+/// the error as the reason the command would run locally.
+pub fn head_sha() -> Result<String, String> {
+    head_sha_in(Path::new("."))
+}
+
+/// [`head_sha`], run against an explicit repository directory.
+fn head_sha_in(dir: &Path) -> Result<String, String> {
+    let output = git_output(dir, &["rev-parse", "HEAD"])?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Check whether a configured remote exists.
 ///
 /// Runs `git remote get-url <ci_remote>` and returns true iff it succeeds.

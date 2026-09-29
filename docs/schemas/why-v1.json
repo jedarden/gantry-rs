@@ -1,0 +1,157 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "gantry why --json (schema v1)",
+  "description": "Replay of the last run's gate/decision trace from the write-ahead ledger (runs.jsonl). Published per plan 'Versioning & compatibility': additive fields are free, consumers ignore unknown ones, and removing or retyping a field is a major bump (a new file, why-v2.json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "found", "run", "ledger", "runlog_path"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "found": {
+      "type": "boolean",
+      "description": "True when the ledger holds at least one run; false (with run: null) on an empty or missing ledger."
+    },
+    "run": {
+      "type": ["object", "null"],
+      "description": "The most recent run: the write-ahead OPEN intent plus its terminal verdict when one landed. null when found is false.",
+      "additionalProperties": false,
+      "required": ["run_id", "ts", "tool", "args", "repo", "sha", "cwd_rel", "gate", "decision", "reason", "backend", "verdict", "orphaned"],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "ts": {
+          "type": "integer",
+          "description": "Unix milliseconds when the intent was written (run start)."
+        },
+        "tool": {
+          "type": "string",
+          "description": "Tool profile, e.g. \"cargo\"."
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The intercepted argv tail, subcommand first."
+        },
+        "repo": {
+          "type": "string",
+          "description": "Repository URL as recorded (credentials stripped)."
+        },
+        "sha": {
+          "type": "string",
+          "description": "Commit sha the run was for."
+        },
+        "cwd_rel": {
+          "type": "string",
+          "description": "Caller's directory relative to the repo root."
+        },
+        "gate": {
+          "type": "object",
+          "description": "GitGate inputs as captured at decision time.",
+          "additionalProperties": false,
+          "required": ["worktree", "head", "remote", "clean"],
+          "properties": {
+            "worktree": {
+              "type": "boolean"
+            },
+            "head": {
+              "type": "boolean"
+            },
+            "remote": {
+              "type": "boolean"
+            },
+            "clean": {
+              "type": "boolean"
+            }
+          }
+        },
+        "decision": {
+          "enum": ["remote", "local"],
+          "description": "Where the run was sent."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the decision was made; empty on the eligible-remote path."
+        },
+        "backend": {
+          "type": "string",
+          "description": "Backend chosen (\"argo\" / \"command\" / \"none\")."
+        },
+        "verdict": {
+          "type": ["object", "null"],
+          "description": "Terminal verdict; null while the run is in flight or lost. Agents branch on verdict.verdict (the AS-2 failure class) without parsing logs.",
+          "additionalProperties": false,
+          "required": ["verdict", "ran", "exit_code", "handle"],
+          "properties": {
+            "verdict": {
+              "enum": ["pass", "test_failure", "gate_failure", "infra_failure", "cancelled", "superseded"]
+            },
+            "ran": {
+              "enum": ["remote", "local", "local_after_infra"]
+            },
+            "exit_code": {
+              "type": "integer",
+              "description": "The faithful exit code the caller saw."
+            },
+            "handle": {
+              "type": "string",
+              "description": "Backend handle (workflow name, \"local\", ...)."
+            },
+            "durations_ms": {
+              "type": "object",
+              "description": "Duration breakdown; absent when the pipeline recorded none.",
+              "additionalProperties": false,
+              "required": ["gate", "push", "queue", "run"],
+              "properties": {
+                "gate": {
+                  "type": "integer"
+                },
+                "push": {
+                  "type": "integer"
+                },
+                "queue": {
+                  "type": "integer"
+                },
+                "run": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "orphaned": {
+          "type": "boolean",
+          "description": "True when the intent never got a verdict: in flight, or a lost run (gantry doctor reports the latter)."
+        }
+      }
+    },
+    "ledger": {
+      "type": "object",
+      "description": "Health of the ledger the answer was read from.",
+      "additionalProperties": false,
+      "required": ["entries", "skipped_lines", "unmatched_verdicts"],
+      "properties": {
+        "entries": {
+          "type": "integer",
+          "description": "Paired runs read from the ledger."
+        },
+        "skipped_lines": {
+          "type": "integer",
+          "description": "Unparseable lines skipped (torn final line, truncated record) — diagnostics answer from what parsed."
+        },
+        "unmatched_verdicts": {
+          "type": "integer",
+          "description": "Verdict records whose run_id matched no intent."
+        }
+      }
+    },
+    "runlog_path": {
+      "type": "string",
+      "description": "Absolute path of the ledger the answer was read from."
+    }
+  }
+}

@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod cli; // plan module layout: management-CLI diagnostics — why / explain / status, --json with schema_version
 pub mod config;
 pub mod decision;
 pub mod doctor;
