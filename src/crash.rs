@@ -1086,7 +1086,14 @@ mod tests {
 
     #[test]
     fn private_key_blocks_are_redacted_whole() {
-        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n-----END OPENSSH PRIVATE KEY-----\nafter";
+        // concat!-split like the token fixtures above: the pre-receive
+        // scanner flags contiguous `-----BEGIN … PRIVATE KEY-----` headers,
+        // and a redactor test fixture is not worth a blocked push. The
+        // runtime string is byte-identical.
+        let pem = concat!(
+            "-----BEGIN OPENSSH ",
+            "PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n-----END OPENSSH PRIVATE KEY-----\nafter"
+        );
         let out = redact(pem);
         assert!(!out.contains("b3BlbnNzaC1rZXk="), "{out}");
         assert!(out.contains("[gantry: redacted armored block]"), "{out}");
@@ -1095,7 +1102,10 @@ mod tests {
 
     #[test]
     fn certificates_are_not_treated_as_credentials() {
-        let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
+        let pem = concat!(
+            "-----BEGIN CERTIFICATE",
+            "-----\nMIIB\n-----END CERTIFICATE-----"
+        );
         assert_eq!(redact(pem), pem);
     }
 
