@@ -261,6 +261,12 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
         // exits 0 iff every required check passed.
         "quickcheck" => gantry::quickcheck::run(),
 
+        // report: print or package the REDACTED crash bundle a recorded
+        // InfraFailure wrote under the state dir (plan Component 7, bf-3mc).
+        // Exit codes are cli_report's: 0 found, 1 missing bundle/state dir,
+        // 2 usage error — same convention as the unknown-command arm below.
+        "report" => ExitCode::from(gantry::crash::cli_report(&argv[2..]) as u8),
+
         // Unknown command: print a hint and exit 2 (conventional for CLI misuse).
         _ => {
             eprintln!("gantry: unknown command '{subcommand}'");
@@ -303,6 +309,8 @@ fn print_usage() {
     println!("  gantry doctor --e2e Run end-to-end canary test");
     println!("  gantry doctor --drill Run fault-injection fire drill");
     println!("  gantry quickcheck   30s no-backend sanity: shim, cap, git");
+    println!("  gantry report <id>  Print a run's REDACTED crash bundle");
+    println!("                      (--package <dir> copies it out)");
     println!();
     println!("Cargo tool profile:");
     println!("  cargo test          Run cargo test (passthrough in Phase 0.5)");
