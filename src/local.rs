@@ -1,10 +1,11 @@
-// gantry — LocalExecutor: the fallback admission semaphore (plan Component 6).
+// gantry — LocalExecutor: slice placement, scope caps, the fallback admission
+// semaphore, and agent-priority queueing (plan Component 6).
 //
-// Phase 1b (bf-299). When a remote run degrades to a capped local fallback —
-// an infra failure on push, submit, or wait — it must not stampede the box
-// together with every other fallback from the same outage. Each fallback run
-// first acquires one of a fixed pool of `flock`-held token files (default 3
-// concurrent per box), queueing loudly while it waits:
+// Phase 1b (bf-299, bf-xj0). When a remote run degrades to a capped local
+// fallback — an infra failure on push, submit, or wait — it must not stampede
+// the box together with every other fallback from the same outage. Each
+// fallback run first acquires one of a fixed pool of `flock`-held token files
+// (default 3 concurrent per box), queueing loudly while it waits:
 //
 //     [gantry] waiting for local slot (4 ahead)
 //
@@ -18,12 +19,22 @@
 // - **Tickets** (`tickets/ticket-<n>`) are the order: each waiting run mints
 //   a monotonic ticket under a brief `queue.lock` and holds that ticket's
 //   `LOCK_EX` while it waits. Holding the ticket proves the waiter is alive
-//   and keeps every later arrival behind it — strict FIFO, one contender at
-//   a time, no thundering herd on a freed slot. The ticket is released the
+//   and keeps every later arrival behind it — FIFO, one contender per class
+//   at a time, no thundering herd on a freed slot. The ticket is released the
 //   instant its run acquires a slot: from then on the slot flock proves
 //   liveness, and a holder that kept its ticket would count as "ahead" of
 //   every waiter — serializing the pool down to a single run no matter how
 //   many slots it has.
+//
+// **Priority (bf-xj0):** `GANTRY_AGENT=1` marks an invocation as an agent
+// (the env convention, deliberately not TTY sniffing — tmux-hosted agents
+// have TTYs), and agents queue *behind* interactive runs: an interactive
+// waiter counts only live interactive tickets as "ahead", while an agent
+// counts every live ticket. Humans first, then agents in FIFO order among
+// themselves, with a triage tag on the agent's queue line. Continuous
+// interactive arrivals can hold an agent behind them indefinitely — the
+// bounded wait is the tripwire: past `fallback_wait_secs` the agent proceeds
+// without a slot, loudly, because INV-1 (a real verdict) outranks the cap.
 //
 // A ticket or slot whose holder dies (including SIGKILL) has its lock
 // released by the kernel: the next scanner acquires the dead ticket, sees it
@@ -37,8 +48,8 @@
 // The wait is bounded (`fallback_wait_secs`, default one hour): past the
 // bound the run proceeds WITHOUT a slot. INV-1 — every invocation ends in a
 // real verdict — outranks the admission cap, the per-run cgroup cap still
-// applies to the unqueued run, and the boxwide `gantry.slice` sum cap
-// (bf-xj0) is the total-load backstop. The timeout is loud, never silent.
+// applies to the unqueued run, and the boxwide `gantry.slice` sum cap is the
+// total-load backstop. The timeout is loud, never silent.
 //
 // Degradations, both deliberate:
 // - EC-08: if the state dir is unusable, the fallback runs without a slot,
@@ -50,14 +61,55 @@
 //
 // Scope note: the semaphore bounds *fallback* runs only. Tier-0 and
 // kill-switch local runs are the caller's explicit choice of local mode, not
-// degradations, and do not queue. The `GANTRY_AGENT` humans-first ordering
-// (plan Component 6, bf-xj0) changes only who counts as "head of queue";
-// the slot and ticket mechanics here are its substrate.
+// degradations, and do not queue. Slice placement (`gantry.slice`, below)
+// applies to gantry's two capped local tails — the Tier-0/local-mode
+// execution (decision.rs `execute_locally`) and the infra fallback
+// (`run_fallback` here). The passthrough fast path (`GANTRY_LOCAL=1`, and
+// every non-intercepted invocation) stays a plain spawn: its INV-4 budget is
+// under 5 ms — no room for the manager probe — and an explicit
+// `GANTRY_LOCAL=1` is the operator bypassing gantry, not asking to be
+// capped by it.
+//
+// ----------------------------------------------------------------------------
+//
+// The boxwide slice (bf-xj0): every gantry-spawned local run lands in one
+// systemd user slice, `gantry.slice`, carrying the box-level *sum* cap
+// (`local.slice_cpu_quota_pct` / `local.slice_memory_max`, default 12 CPU /
+// 32G) alongside the per-run caps — the semaphore bounds the count of
+// fallbacks, the per-run scope properties bound each run, and the slice
+// bounds the total, so 20 × "200%/6G each" can no longer add up past the
+// machine. Gantry provisions the slice unit itself (idempotently, under the
+// user's systemd config dir, then `daemon-reload`) and launches every local
+// run through:
+//
+//     systemd-run --scope --user --slice=gantry.slice \
+//         -p CPUQuota={cpu_quota_pct}% -p MemoryMax={memory_max} \
+//         -p MemorySwapMax=0 -q -- <real> <args…>
+//
+// (the plan §6 capping line plus `--slice`). `--scope` keeps the child a
+// direct descendant whose exit status systemd-run propagates, so exit-code
+// fidelity (INV-3) survives the wrapper.
+//
+// Degrade is clean and loud, once per process: no systemd (macOS), no user
+// manager (containers, CI), or a slice unit the manager cannot see — gantry
+// verifies the provisioned unit is actually loaded before trusting it — and
+// every local run falls back to a plain spawn with a single `[gantry] note:`
+// line. Risk R5 posture: degrade with documentation, never block; the
+// semaphore and the bounded wait still apply on the fallback path.
+//
+// Known sharp edge, documented rather than hidden: `systemd-run --scope`
+// reports both "suite failed" and "scope could not be created" as a non-zero
+// exit. The one-time probe plus the loaded-unit verification make that a
+// mid-flight rarity (manager restart between probe and spawn); a plain-spawn
+// re-try on failure would double-run real suites, so it is deliberately not
+// attempted.
 
 use crate::config::Config;
 use crate::runlog::{Durations, RanLocation, RunLog, Verdict, VerdictRecord};
 use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 /// Poll cadence for the queue: start responsive, back off to a calm idle.
@@ -122,6 +174,382 @@ fn lock_exclusive_blocking(file: &File) {
 /// Non-Unix degrade for the blocking lock (see [`try_lock_exclusive`]).
 #[cfg(not(unix))]
 fn lock_exclusive_blocking(_file: &File) {}
+
+// ============================================================================
+// Queue priority (plan Component 6: GANTRY_AGENT humans-first ordering)
+// ============================================================================
+
+/// Which side of the humans-first ordering a run queues on.
+///
+/// `GANTRY_AGENT=1` (the env convention — deliberately not TTY sniffing,
+/// since tmux-hosted agents have TTYs) marks an invocation as an agent.
+/// Every future submission gate inherits the same two-class ordering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueClass {
+    /// A human is waiting. Never queued behind an agent.
+    Interactive,
+    /// A machine is waiting (`GANTRY_AGENT=1`). Queued behind every live
+    /// ticket — humans first — but FIFO among agents.
+    Agent,
+}
+
+impl QueueClass {
+    /// Classify an invocation from the `GANTRY_AGENT` environment variable.
+    ///
+    /// `1` (and the conventional truthy spellings, case-insensitive) mark an
+    /// agent; unset, empty, or anything else is interactive — a stray value
+    /// must never demote a human behind machines.
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var("GANTRY_AGENT").ok().as_deref())
+    }
+
+    /// [`Self::from_env`] over a supplied value — the pure, testable core.
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(v) if matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on") => {
+                QueueClass::Agent
+            }
+            _ => QueueClass::Interactive,
+        }
+    }
+
+    /// The marker minted into a ticket file so another waiter — which cannot
+    /// see this process's environment — can classify it.
+    fn marker(self) -> &'static str {
+        match self {
+            QueueClass::Interactive => "interactive",
+            QueueClass::Agent => "agent",
+        }
+    }
+
+    /// Recover the class written by [`Self::marker`]. Unreadable or
+    /// unrecognized content (a pre-priority ticket, a truncated write) reads
+    /// as [`QueueClass::Interactive`]: the conservative reading keeps the
+    /// pre-priority FIFO behavior for anything this version did not mint.
+    fn from_marker(text: &str) -> Self {
+        // Exact match: the minted marker is the bare word (no padding, no
+        // newline — `write_all(marker())`), so anything else, whitespace
+        // included, is a damaged write and reads conservative-interactive.
+        match text {
+            "agent" => QueueClass::Agent,
+            _ => QueueClass::Interactive,
+        }
+    }
+}
+
+// ============================================================================
+// Boxwide slice placement (plan Component 6)
+// ============================================================================
+
+/// The single systemd user slice every gantry-spawned local run lands in
+/// (plan Component 6). The slice unit carries the box-level *sum* cap —
+/// `local.slice_cpu_quota_pct` / `local.slice_memory_max` — so the total load
+/// of all gantry runs stays inside it no matter how many per-run scopes nest
+/// beneath.
+pub const SLICE_NAME: &str = "gantry.slice";
+
+/// How the next local child is spawned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// Wrap the child in `systemd-run --scope --user --slice=gantry.slice …`:
+    /// the per-run caps (`local.cpu_quota_pct` / `local.memory_max` /
+    /// `MemorySwapMax=0`) apply to the scope, and the slice's sum cap bounds
+    /// the total across every concurrent gantry run.
+    Slice,
+    /// Plain spawn — the slice is disabled, unavailable (no systemd, no user
+    /// manager), or its unit would not load (module docs, risk R5).
+    Plain,
+}
+
+/// The slice unit file for a given box-level sum cap (pure, pinned by test).
+///
+/// Resource-control directives only — a slice has no process of its own.
+/// Accounting is switched on explicitly so the caps are enforced, not merely
+/// observed; the leading comment marks the file gantry-managed so a human
+/// reading `~/.config/systemd/user/` knows where it came from and that
+/// rewriting it is safe (the next gantry run rewrites it back).
+fn slice_unit_content(cpu_quota_pct: u32, memory_max: &str) -> String {
+    format!(
+        "# Managed by gantry — rewritten when the configured cap changes.\n\
+         [Slice]\n\
+         CPUAccounting=true\n\
+         MemoryAccounting=true\n\
+         CPUQuota={cpu_quota_pct}%\n\
+         MemoryMax={memory_max}\n"
+    )
+}
+
+/// Build the plan §6 launch line — the per-run capping command extended with
+/// `--slice=gantry.slice` (pure, pinned by test):
+///
+/// ```text
+/// systemd-run --scope --user --slice=gantry.slice \
+///     -p CPUQuota={per-run}% -p MemoryMax={per-run} -p MemorySwapMax=0 -q -- \
+///     <real> <args…>
+/// ```
+///
+/// `--scope` (not `--exec`/a transient service) keeps the child a direct
+/// descendant whose exit status systemd-run waits for and propagates, so
+/// exit-code fidelity (INV-3) survives the wrapper. `-q` drops systemd-run's
+/// own "Running scope as unit…" chatter so the transcript carries gantry's
+/// lines, not the wrapper's. argv travels as an array end to end — never
+/// shell-interpolated (S-4, INV-5).
+fn slice_launch_command(
+    systemd_run: &Path,
+    real: &Path,
+    args: &[String],
+    cpu_quota_pct: u32,
+    memory_max: &str,
+) -> Command {
+    let mut cmd = Command::new(systemd_run);
+    cmd.arg("--scope")
+        .arg("--user")
+        .arg(format!("--slice={SLICE_NAME}"))
+        .args([
+            "-p".to_string(),
+            format!("CPUQuota={cpu_quota_pct}%"),
+            "-p".to_string(),
+            format!("MemoryMax={memory_max}"),
+            "-p".to_string(),
+            "MemorySwapMax=0".to_string(),
+            "-q".to_string(),
+            "--".to_string(),
+        ])
+        .arg(real)
+        .args(args);
+    cmd
+}
+
+/// The user systemd unit directory (`$XDG_CONFIG_HOME/systemd/user`, default
+/// `~/.config/systemd/user`) — where the slice unit is provisioned.
+fn user_unit_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("systemd").join("user"))
+}
+
+/// Find an executable `name` in a PATH-style string. Pure over the supplied
+/// value: the production caller passes `$PATH`, tests pass their own — no
+/// process-environment mutation in tests.
+#[cfg(unix)]
+fn find_executable_in_path(path_var: &str, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in path_var.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(name);
+        if let Ok(meta) = fs::metadata(&candidate) {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn find_executable_in_path(path_var: &str, name: &str) -> Option<PathBuf> {
+    for dir in path_var.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(name);
+        if fs::metadata(&candidate)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Install the slice unit iff its content differs from what is on disk — a
+/// warm box never rewrites the file, so it never pays the daemon-reload that
+/// a write requires. Returns whether the file was (re)written.
+fn write_unit_if_changed(unit_dir: &Path, content: &str) -> std::io::Result<bool> {
+    let unit_path = unit_dir.join(SLICE_NAME);
+    if fs::read_to_string(&unit_path).unwrap_or_default() == content {
+        return Ok(false);
+    }
+    fs::create_dir_all(unit_dir)?;
+    fs::write(&unit_path, content)?;
+    Ok(true)
+}
+
+/// One `systemctl --user <args>` invocation: `Ok(())` on success, the trimmed
+/// stderr in the error otherwise (loud-degrade material).
+fn systemctl_user(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .map_err(|e| format!("systemctl --user {} failed: {e}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "systemctl --user {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// Ask the user manager whether [`SLICE_NAME`] is actually loaded — the
+/// loaded-unit verification that makes provisioning trustworthy: a unit file
+/// the manager cannot see (a `systemd` user session that reads a different
+/// config home, an isolated-HOME test sandbox) would silently cap nothing.
+/// `None` when the manager itself could not be asked.
+fn slice_load_state() -> Option<String> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            SLICE_NAME,
+            "--property=LoadState",
+            "--value",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Provision the slice for the given unit content: write the unit if it
+/// changed, daemon-reload if it was written, then verify the manager actually
+/// loaded it. Every failure mode returns a specific, printable reason — the
+/// caller turns it into the one-per-process degrade note.
+fn provision_slice(content: &str) -> Result<(), String> {
+    let unit_dir = user_unit_dir()
+        .ok_or_else(|| "no config directory to install gantry.slice into".to_string())?;
+    let wrote = write_unit_if_changed(&unit_dir, content)
+        .map_err(|e| format!("cannot write {}: {e}", unit_dir.join(SLICE_NAME).display()))?;
+    if wrote {
+        systemctl_user(&["daemon-reload"])?;
+    }
+    match slice_load_state() {
+        Some(state) if state == "loaded" => Ok(()),
+        Some(state) => Err(format!(
+            "{SLICE_NAME} is installed but the user manager reports LoadState={state}"
+        )),
+        None => Err("no reachable systemd user manager (systemctl --user failed)".to_string()),
+    }
+}
+
+/// The placement decision given whether the slice is enabled and whether
+/// provisioning succeeded (pure — every branch pinned by test). The `Err`
+/// case carries the degrade reason, printed once per process as a
+/// `[gantry] note:` line; an explicitly disabled slice is a deliberate
+/// operator choice, so it degrades silently.
+fn decide_placement(enabled: bool, provision: Result<(), String>) -> (Placement, Option<String>) {
+    match (enabled, provision) {
+        (false, _) => (Placement::Plain, None),
+        (true, Ok(())) => (Placement::Slice, None),
+        (true, Err(why)) => (
+            Placement::Plain,
+            Some(format!(
+                "gantry.slice unavailable ({why}) — local runs spawn plain, \
+                 without cgroup caps; the fallback semaphore still bounds \
+                 degraded runs"
+            )),
+        ),
+    }
+}
+
+/// One placement decision per process, made lazily before the first local
+/// spawn and cached: the probe cost (a PATH scan, at most one unit write, one
+/// `daemon-reload`, one load-state query) is paid once, not per run.
+#[derive(Debug)]
+struct Decision {
+    placement: Placement,
+    /// The resolved `systemd-run` binary — `Some` exactly when `placement`
+    /// is [`Placement::Slice`] (the path search already succeeded).
+    systemd_run: Option<PathBuf>,
+}
+
+/// Per-run + boxwide slice placement for gantry-spawned local runs
+/// (plan Component 6). Build with [`Self::from_config`]; spawn children with
+/// [`Self::spawn`], which returns the child's [`ExitStatus`] unchanged — the
+/// systemd-run wrapper (when active) waits for the child and propagates its
+/// exit code, so every call site keeps its existing INV-3 mapping.
+pub struct SlicePlacement {
+    enabled: bool,
+    cpu_quota_pct: u32,
+    memory_max: String,
+    slice_cpu_quota_pct: u32,
+    slice_memory_max: String,
+    decision: std::sync::OnceLock<Decision>,
+}
+
+impl SlicePlacement {
+    /// Read the placement configuration from the layered config.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            enabled: config.local.slice_enabled,
+            cpu_quota_pct: u32::from(config.local.cpu_quota_pct),
+            memory_max: config.local.memory_max.clone(),
+            slice_cpu_quota_pct: config.local.slice_cpu_quota_pct,
+            slice_memory_max: config.local.slice_memory_max.clone(),
+            decision: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Decide (once per process) how local children are spawned.
+    fn decide(&self) -> &Decision {
+        self.decision.get_or_init(|| {
+            let systemd_run =
+                find_executable_in_path(&std::env::var("PATH").unwrap_or_default(), "systemd-run");
+            // An explicitly disabled slice is the operator opting out: no unit
+            // is written and no manager is touched. Otherwise provisioning
+            // happens iff the launcher exists — the per-run caps ride the
+            // same launch line, so the unit content is provisioned from the
+            // live config values.
+            let provision = if !self.enabled {
+                Ok(())
+            } else {
+                match systemd_run.as_deref() {
+                    Some(_) => provision_slice(&slice_unit_content(
+                        self.slice_cpu_quota_pct,
+                        &self.slice_memory_max,
+                    )),
+                    None => Err("systemd-run not found on PATH".to_string()),
+                }
+            };
+            let (placement, note) = decide_placement(self.enabled, provision);
+            if let Some(note) = note {
+                eprintln!("[gantry] note: {note}");
+            }
+            Decision {
+                placement,
+                systemd_run: if placement == Placement::Slice {
+                    systemd_run
+                } else {
+                    None
+                },
+            }
+        })
+    }
+
+    /// Spawn `real` with `args`, slice-placed and per-run-capped when the
+    /// slice is active, plainly otherwise. The returned status is the
+    /// child's either way (module docs: `--scope` propagates it), so the
+    /// caller's verdict mapping is untouched by this wrapper.
+    pub fn spawn(&self, real: &Path, args: &[String]) -> std::io::Result<ExitStatus> {
+        let decision = self.decide();
+        match (&decision.placement, &decision.systemd_run) {
+            (Placement::Slice, Some(systemd_run)) => Ok(slice_launch_command(
+                systemd_run,
+                real,
+                args,
+                self.cpu_quota_pct,
+                &self.memory_max,
+            )
+            .status()?),
+            _ => Command::new(real).args(args).status(),
+        }
+    }
+}
 
 // ============================================================================
 // Semaphore
@@ -233,39 +661,49 @@ impl FallbackSemaphore {
         })
     }
 
-    /// Acquire a fallback slot, queueing loudly (FIFO) for at most
-    /// `max_wait`.
+    /// Acquire a fallback slot, queueing loudly for at most `max_wait`.
+    ///
+    /// The queue class comes from the `GANTRY_AGENT` environment convention
+    /// ([`QueueClass::from_env`]); tests and future call sites pass one
+    /// explicitly via [`Self::admit_as`].
+    pub fn admit(&self) -> Result<Admission, SemaphoreError> {
+        self.admit_as(QueueClass::from_env())
+    }
+
+    /// [`Self::admit`] as an explicit [`QueueClass`] — the seam that keeps
+    /// process-environment mutation out of tests and lets a future submission
+    /// gate classify by its own signal.
     ///
     /// The queue position line prints on the first wait and whenever the
     /// position changes (plus at most once per [`QUEUE_LINE_INTERVAL`] while
     /// nothing changes) so an agent transcript sees movement without per-poll
-    /// spam.
-    pub fn admit(&self) -> Result<Admission, SemaphoreError> {
+    /// spam. An agent's line carries the triage tag ([`queue_line_for`]).
+    pub fn admit_as(&self, class: QueueClass) -> Result<Admission, SemaphoreError> {
         let deadline = Instant::now() + self.max_wait;
-        let ticket = self.mint_ticket()?;
+        let ticket = self.mint_ticket(class)?;
         let mut announced: Option<(u64, Instant)> = None;
         let mut poll = POLL_MIN;
 
         loop {
-            let ahead = self.live_tickets_below(ticket.number)?;
+            let ahead = self.ahead_count(ticket.number, class)?;
 
-            // Only the smallest live ticket may try slots — strict FIFO, and
-            // (module docs) exactly one contender exists at any instant, so
-            // the non-blocking slot flock below has no competitor to lose to.
+            // Only a waiter with nothing outranking it may try slots — strict
+            // order within a class, humans ahead of agents — and (module
+            // docs) exactly one contender exists at any instant, so the
+            // non-blocking slot flock below has no competitor to lose to.
             if ahead == 0 {
                 if let Some(slot) = self.try_slots()? {
                     // The slot flock is now this run's liveness proof; the
                     // ticket's ordering job is done. Release it at once —
-                    // kept, it would sit "ahead" of every waiter (its number
-                    // is the smallest live one) and hold the whole queue
-                    // behind a run that already has its slot, collapsing the
-                    // pool to a single concurrent run.
+                    // kept, it would sit "ahead" of every waiter and hold the
+                    // whole queue behind a run that already has its slot,
+                    // collapsing the pool to a single concurrent run.
                     drop(ticket);
                     return Ok(Admission::Acquired(SlotGuard { _slot: slot }));
                 }
             }
 
-            Self::announce_queue_position(ahead, &mut announced);
+            Self::announce_queue_position(ahead, class, &mut announced);
 
             if Instant::now() >= deadline {
                 // Drop the ticket (releasing its lock) on the way out so the
@@ -281,7 +719,11 @@ impl FallbackSemaphore {
 
     /// Print the loud queue-position line, throttled by position change or
     /// [`QUEUE_LINE_INTERVAL`], whichever comes first.
-    fn announce_queue_position(ahead: u64, announced: &mut Option<(u64, Instant)>) {
+    fn announce_queue_position(
+        ahead: u64,
+        class: QueueClass,
+        announced: &mut Option<(u64, Instant)>,
+    ) {
         let now = Instant::now();
         let due = match *announced {
             None => true,
@@ -290,15 +732,17 @@ impl FallbackSemaphore {
             }
         };
         if due {
-            eprintln!("{}", queue_line(ahead));
+            eprintln!("{}", queue_line_for(ahead, class));
             *announced = Some((ahead, now));
         }
     }
 
     /// Mint the next FIFO ticket: bump the counter under the queue lock,
     /// create the ticket file create-new (collision-proof even where the lock
-    /// degraded), and hold its exclusive lock from this instant.
-    fn mint_ticket(&self) -> Result<Ticket, SemaphoreError> {
+    /// degraded), hold its exclusive lock from this instant, and mark it with
+    /// the waiter's [`QueueClass`] — the only record of the class another
+    /// waiter (which cannot see this process's environment) can read.
+    fn mint_ticket(&self, class: QueueClass) -> Result<Ticket, SemaphoreError> {
         let tickets_dir = self.dir.join("tickets");
         io_map(fs::create_dir_all(&tickets_dir), &tickets_dir)?;
 
@@ -343,17 +787,37 @@ impl FallbackSemaphore {
             });
         }
 
+        // Mark the ticket with its queue class before any scanner can count
+        // it: a ticket without a readable marker reads as interactive (the
+        // conservative default), which would wrongly let an agent waiter
+        // count this agent as a human — harmless — but would also make an
+        // interactive waiter count an agent ahead of it — not harmless. The
+        // write happens under the held lock, and the only reader is a later
+        // scan; a scan racing the write reads the conservative default for
+        // one poll and self-corrects on the next.
+        let mut marked = file;
+        marked
+            .write_all(class.marker().as_bytes())
+            .map_err(|e| SemaphoreError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
+
         Ok(Ticket {
             number,
-            _lock: file,
+            _lock: marked,
         })
     }
 
-    /// Count live tickets strictly below `number` — the honest queue position,
-    /// since FIFO means every one of them starts before this run does. Dead
-    /// tickets found along the way (lock acquirable = holder gone) are
-    /// unlinked; numbers are never reused, so this cannot race a live holder.
-    fn live_tickets_below(&self, number: u64) -> Result<u64, SemaphoreError> {
+    /// Count the live tickets that outrank this waiter under the humans-first
+    /// ordering ([`QueueClass`]): a human counts live humans with a smaller
+    /// number (strict FIFO among interactive waiters — agents never block a
+    /// human); an agent counts every live human ticket (any number — humans
+    /// first is not positional) plus live agents with a smaller number (FIFO
+    /// among agents). Dead tickets found along the way (lock acquirable =
+    /// holder gone) are unlinked; numbers are never reused, so this cannot
+    /// race a live holder.
+    fn ahead_count(&self, number: u64, class: QueueClass) -> Result<u64, SemaphoreError> {
         let tickets_dir = self.dir.join("tickets");
         let mut live = 0u64;
         for entry in fs::read_dir(&tickets_dir).map_err(|e| SemaphoreError::Io {
@@ -367,9 +831,6 @@ impl FallbackSemaphore {
             let Some(n) = parse_ticket_name(&entry.file_name()) else {
                 continue;
             };
-            if n >= number {
-                continue;
-            }
             let path = tickets_dir.join(entry.file_name());
             let file = match open_lock_file(&path, false) {
                 Ok(f) => f,
@@ -381,7 +842,23 @@ impl FallbackSemaphore {
                 // `file` (drop) plus unlinking keeps the dir bounded.
                 drop(file);
                 let _ = fs::remove_file(&path);
-            } else {
+                continue;
+            }
+            // A live ticket: classify it from its minted marker. Unreadable
+            // content reads as interactive — the conservative reading, which
+            // for an interactive waiter keeps the position honest and for an
+            // agent only ever makes it wait longer, never shorter.
+            let theirs = QueueClass::from_marker(&fs::read_to_string(&path).unwrap_or_default());
+            let outranks = match (class, theirs) {
+                // Agents are outranked by any live human waiter, wherever it
+                // sits in the numbering, and by earlier agents.
+                (QueueClass::Agent, QueueClass::Interactive) => true,
+                (QueueClass::Agent, QueueClass::Agent) => n < number,
+                // Humans are outranked only by earlier humans.
+                (QueueClass::Interactive, QueueClass::Interactive) => n < number,
+                (QueueClass::Interactive, QueueClass::Agent) => false,
+            };
+            if outranks {
                 live += 1;
             }
         }
@@ -416,11 +893,19 @@ fn io_map(result: std::io::Result<()>, path: &Path) -> Result<(), SemaphoreError
 }
 
 /// The loud queue-position line (plan Component 6:
-/// `[gantry] waiting for local slot (N ahead)`). `ahead` counts live
-/// *waiting* tickets below this run's — under FIFO, exactly the queued runs
-/// that start first (slot holders have already released their tickets).
-fn queue_line(ahead: u64) -> String {
-    format!("[gantry] waiting for local slot ({ahead} ahead)")
+/// `[gantry] waiting for local slot (N ahead)`). `ahead` counts the live
+/// waiting tickets that outrank this run's (see [`FallbackSemaphore::ahead_count`]).
+/// The interactive line is the plan's verbatim; an agent's line carries the
+/// triage tag — a human reading the transcript can see at a glance that this
+/// waiter is a machine parked behind humans by design, not a hung run.
+fn queue_line_for(ahead: u64, class: QueueClass) -> String {
+    match class {
+        QueueClass::Interactive => format!("[gantry] waiting for local slot ({ahead} ahead)"),
+        QueueClass::Agent => format!(
+            "[gantry] waiting for local slot ({ahead} ahead) \
+             [agent: queued behind humans]"
+        ),
+    }
 }
 
 /// Parse `ticket-<n>` back to `n`; anything else (slot files, the counter,
@@ -545,7 +1030,9 @@ pub fn run_fallback(
         }
     };
 
-    let status = std::process::Command::new(&real).args(args).status();
+    // Slice-placed and per-run-capped (plan Component 6): the capped fallback
+    // is exactly the run class the boxwide slice exists to bound.
+    let status = SlicePlacement::from_config(config).spawn(&real, args);
 
     let (verdict, exit_code) = match status {
         Ok(status) => {
@@ -641,8 +1128,14 @@ mod tests {
 
     #[test]
     fn queue_line_matches_plan_format() {
-        assert_eq!(queue_line(0), "[gantry] waiting for local slot (0 ahead)");
-        assert_eq!(queue_line(17), "[gantry] waiting for local slot (17 ahead)");
+        assert_eq!(
+            queue_line_for(0, QueueClass::Interactive),
+            "[gantry] waiting for local slot (0 ahead)"
+        );
+        assert_eq!(
+            queue_line_for(17, QueueClass::Interactive),
+            "[gantry] waiting for local slot (17 ahead)"
+        );
     }
 
     #[test]
@@ -828,7 +1321,7 @@ mod tests {
 
         // The next mint continues past the stale number (the admit above
         // consumed 11, so the counter is already there).
-        let next = sem.mint_ticket().unwrap();
+        let next = sem.mint_ticket(QueueClass::Interactive).unwrap();
         assert_eq!(next.number, 12);
     }
 
@@ -842,16 +1335,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let sem = semaphore(dir.path().to_path_buf(), 1, 5_000);
 
-        let earlier = sem.mint_ticket().unwrap();
-        let later = sem.mint_ticket().unwrap();
+        let earlier = sem.mint_ticket(QueueClass::Interactive).unwrap();
+        let later = sem.mint_ticket(QueueClass::Interactive).unwrap();
 
         assert_eq!(
-            sem.live_tickets_below(later.number).unwrap(),
+            sem.ahead_count(later.number, QueueClass::Interactive)
+                .unwrap(),
             1,
             "the live earlier waiter is ahead"
         );
         assert_eq!(
-            sem.live_tickets_below(earlier.number).unwrap(),
+            sem.ahead_count(earlier.number, QueueClass::Interactive)
+                .unwrap(),
             0,
             "nobody is ahead of the head waiter"
         );
@@ -861,10 +1356,431 @@ mod tests {
         // corpse.
         drop(earlier);
         assert_eq!(
-            sem.live_tickets_below(later.number).unwrap(),
+            sem.ahead_count(later.number, QueueClass::Interactive)
+                .unwrap(),
             0,
             "a released ticket must stop counting as ahead"
         );
         drop(later);
+    }
+
+    // ========================================================================
+    // GANTRY_AGENT humans-first ordering (plan Component 6, bf-xj0)
+    // ========================================================================
+
+    #[test]
+    fn agent_env_convention_truthy_spellings_only() {
+        // The conventional truthy spellings mark an agent — case-insensitive,
+        // trimmed.
+        for v in ["1", "true", "TRUE", "Yes", "on", " 1 "] {
+            assert_eq!(
+                QueueClass::from_env_value(Some(v)),
+                QueueClass::Agent,
+                "'{v}' must classify as an agent"
+            );
+        }
+        // Unset, empty, or a stray value is interactive: a typo'd value must
+        // never demote a human behind machines.
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("agent"),
+            Some("2"),
+        ] {
+            assert_eq!(
+                QueueClass::from_env_value(v),
+                QueueClass::Interactive,
+                "{v:?} must classify as interactive"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_marker_round_trips_and_defaults_interactive() {
+        assert_eq!(
+            QueueClass::from_marker(QueueClass::Agent.marker()),
+            QueueClass::Agent
+        );
+        assert_eq!(
+            QueueClass::from_marker(QueueClass::Interactive.marker()),
+            QueueClass::Interactive
+        );
+        // Unreadable or unrecognized content (a pre-priority ticket, a
+        // truncated write) reads as the conservative interactive default.
+        for text in ["", "garbage", " agent  ", "INTERACTIVE"] {
+            assert_eq!(
+                QueueClass::from_marker(text),
+                QueueClass::Interactive,
+                "'{text}' must read as interactive"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_queue_line_carries_the_triage_tag() {
+        assert_eq!(
+            queue_line_for(2, QueueClass::Interactive),
+            "[gantry] waiting for local slot (2 ahead)"
+        );
+        let line = queue_line_for(2, QueueClass::Agent);
+        assert!(
+            line.starts_with("[gantry] waiting for local slot (2 ahead)"),
+            "the plan's verbatim line prefix must survive: {line}"
+        );
+        assert!(
+            line.contains("agent"),
+            "an agent's queue line must carry the triage tag: {line}"
+        );
+    }
+
+    /// The humans-first ordering at the `ahead_count` level: a human is never
+    /// outranked by an agent (wherever it sits in the numbering), an agent is
+    /// outranked by *any* live human waiter, and each class is FIFO among
+    /// itself.
+    #[test]
+    #[cfg(unix)]
+    fn humans_first_ordering_counts() {
+        let dir = TempDir::new().unwrap();
+        let sem = semaphore(dir.path().to_path_buf(), 1, 5_000);
+
+        let agent_early = sem.mint_ticket(QueueClass::Agent).unwrap();
+        let human_late = sem.mint_ticket(QueueClass::Interactive).unwrap();
+        let agent_late = sem.mint_ticket(QueueClass::Agent).unwrap();
+
+        // The late human outranks nothing (agents never block a human).
+        assert_eq!(
+            sem.ahead_count(human_late.number, QueueClass::Interactive)
+                .unwrap(),
+            0,
+            "an agent waiter must never block a human"
+        );
+        // Every live human outranks an agent, positionally regardless; agents
+        // are FIFO among themselves.
+        assert_eq!(
+            sem.ahead_count(agent_early.number, QueueClass::Agent)
+                .unwrap(),
+            1,
+            "the early agent waits behind the human"
+        );
+        assert_eq!(
+            sem.ahead_count(agent_late.number, QueueClass::Agent)
+                .unwrap(),
+            2,
+            "the late agent waits behind the human and the early agent"
+        );
+
+        // The human leaves: the early agent becomes head of the queue.
+        drop(human_late);
+        assert_eq!(
+            sem.ahead_count(agent_early.number, QueueClass::Agent)
+                .unwrap(),
+            0,
+            "the human leaving must unblock the agent"
+        );
+        assert_eq!(
+            sem.ahead_count(agent_late.number, QueueClass::Agent)
+                .unwrap(),
+            1,
+            "the early agent still outranks the late one"
+        );
+
+        drop(agent_early);
+        drop(agent_late);
+    }
+
+    /// The acceptance scenario, deterministically: an interactive waiter is
+    /// already in the queue when a `GANTRY_AGENT=1` run arrives — the agent
+    /// queues behind it, and only the interactive waiter is positioned to
+    /// take the next free slot.
+    #[test]
+    #[cfg(unix)]
+    fn agent_queues_behind_an_interactive_waiter() {
+        let dir = TempDir::new().unwrap();
+        let sem = semaphore(dir.path().to_path_buf(), 1, 5_000);
+
+        let human = sem.mint_ticket(QueueClass::Interactive).unwrap();
+        let agent = sem.mint_ticket(QueueClass::Agent).unwrap();
+
+        assert_eq!(
+            sem.ahead_count(agent.number, QueueClass::Agent).unwrap(),
+            1,
+            "the agent must queue behind the interactive waiter"
+        );
+        assert_eq!(
+            sem.ahead_count(human.number, QueueClass::Interactive)
+                .unwrap(),
+            0,
+            "the interactive waiter must be the one ahead"
+        );
+
+        // Once the human's ticket is gone, the agent is next — the ordering
+        // is humans-first, not humans-only.
+        drop(human);
+        assert_eq!(sem.ahead_count(agent.number, QueueClass::Agent).unwrap(), 0);
+        drop(agent);
+    }
+
+    /// An agent on an empty pool admits immediately: the ordering is
+    /// humans-*first*, not humans-*only* — a `GANTRY_AGENT=1` run must never
+    /// stall just because no human is waiting.
+    #[test]
+    #[cfg(unix)]
+    fn agent_admits_immediately_on_an_empty_pool() {
+        let dir = TempDir::new().unwrap();
+        let sem = semaphore(dir.path().to_path_buf(), 2, 1_000);
+        assert!(matches!(
+            sem.admit_as(QueueClass::Agent).unwrap(),
+            Admission::Acquired(_)
+        ));
+    }
+
+    // ========================================================================
+    // Boxwide gantry.slice sum cap (plan Component 6, bf-xj0)
+    // ========================================================================
+
+    /// A `SlicePlacement` with its one-per-process decision pre-seeded, so a
+    /// test exercises a chosen placement without probing the real PATH or
+    /// touching the real user manager.
+    fn placement_with(placement: Placement, systemd_run: Option<PathBuf>) -> SlicePlacement {
+        let sp = SlicePlacement {
+            enabled: true,
+            cpu_quota_pct: 200,
+            memory_max: "6G".to_string(),
+            slice_cpu_quota_pct: crate::config::DEFAULT_SLICE_CPU_QUOTA_PCT,
+            slice_memory_max: crate::config::DEFAULT_SLICE_MEMORY_MAX.to_string(),
+            decision: std::sync::OnceLock::new(),
+        };
+        sp.decision
+            .set(Decision {
+                placement,
+                systemd_run,
+            })
+            .unwrap();
+        sp
+    }
+
+    #[test]
+    fn slice_unit_content_pins_the_sum_cap() {
+        let unit = slice_unit_content(1200, "32G");
+        assert!(
+            unit.starts_with("# Managed by gantry"),
+            "marked as ours: {unit}"
+        );
+        assert!(unit.contains("[Slice]"));
+        // Caps without accounting are merely observed, not enforced.
+        assert!(unit.contains("CPUAccounting=true"));
+        assert!(unit.contains("MemoryAccounting=true"));
+        assert!(unit.contains("CPUQuota=1200%"));
+        assert!(unit.contains("MemoryMax=32G"));
+        // The configured values travel verbatim.
+        assert_eq!(
+            slice_unit_content(800, "24G"),
+            slice_unit_content(800, "24G")
+        );
+        assert!(slice_unit_content(800, "24G").contains("CPUQuota=800%"));
+        assert!(slice_unit_content(800, "24G").contains("MemoryMax=24G"));
+    }
+
+    #[test]
+    fn slice_launch_command_matches_the_plan_line() {
+        let cmd = slice_launch_command(
+            Path::new("/usr/bin/systemd-run"),
+            Path::new("/home/u/.cargo/bin/cargo"),
+            &["test".to_string(), "--lib".to_string()],
+            200,
+            "6G",
+        );
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "--scope",
+                "--user",
+                "--slice=gantry.slice",
+                "-p",
+                "CPUQuota=200%",
+                "-p",
+                "MemoryMax=6G",
+                "-p",
+                "MemorySwapMax=0",
+                "-q",
+                "--",
+                "/home/u/.cargo/bin/cargo",
+                "test",
+                "--lib",
+            ],
+            "the plan §6 capping line plus --slice, in order: {argv:?}"
+        );
+        assert_eq!(
+            cmd.get_program(),
+            std::ffi::OsStr::new("/usr/bin/systemd-run")
+        );
+    }
+
+    #[test]
+    fn placement_decision_branches() {
+        // Disabled is a deliberate operator choice: plain, silently.
+        assert_eq!(
+            decide_placement(false, Err("no systemd".to_string())),
+            (Placement::Plain, None)
+        );
+        // Enabled and provisioned: slice, no note.
+        assert_eq!(decide_placement(true, Ok(())), (Placement::Slice, None));
+        // Enabled but unavailable: plain, loudly.
+        let (placement, note) = decide_placement(true, Err("no user manager".to_string()));
+        assert_eq!(placement, Placement::Plain);
+        let note = note.expect("a degrade reason must be printed");
+        assert!(note.contains("gantry.slice unavailable"));
+        assert!(note.contains("no user manager"));
+        assert!(
+            note.contains("without cgroup caps"),
+            "the note must say what was lost: {note}"
+        );
+    }
+
+    #[test]
+    fn unit_file_is_written_only_when_content_differs() {
+        let dir = TempDir::new().unwrap();
+        let content = slice_unit_content(1200, "32G");
+
+        // Missing: written.
+        assert!(write_unit_if_changed(dir.path(), &content).unwrap());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(SLICE_NAME)).unwrap(),
+            content
+        );
+
+        // Same content: not rewritten (a warm box pays no daemon-reload).
+        assert!(!write_unit_if_changed(dir.path(), &content).unwrap());
+
+        // A changed cap: rewritten.
+        let changed = slice_unit_content(800, "24G");
+        assert!(write_unit_if_changed(dir.path(), &changed).unwrap());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(SLICE_NAME)).unwrap(),
+            changed
+        );
+    }
+
+    /// The slice-placed spawn end to end, against a fake `systemd-run` that
+    /// logs the launch line it was handed and then execs the real command:
+    /// the wrapper receives the full plan line (slice flag included), and the
+    /// child's exit code propagates through `--scope` unchanged (INV-3).
+    #[test]
+    #[cfg(unix)]
+    fn slice_spawn_launches_through_the_wrapper_and_propagates_the_exit_code() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("argv.log");
+        let fake = tmp.path().join("systemd-run");
+        // Log every wrapper flag up to `--`, then exec the payload so the
+        // status gantry sees is the payload's.
+        fs::write(
+            &fake,
+            // The log path is baked into the script rather than passed as
+            // $GANTRY_FAKE_ARGV_LOG: the child inherits this process's
+            // environment, and parallel tests setting the same var would
+            // race each other's children.
+            format!(
+                "#!/usr/bin/env bash\n\
+                 while [ \"$1\" != \"--\" ]; do \n\
+                 printf '%s\\n' \"$1\" >> '{}'; shift; done\n\
+                 shift\nexec \"$@\"\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sp = placement_with(Placement::Slice, Some(fake));
+        let status = sp
+            .spawn(Path::new("sh"), &["-c".to_string(), "exit 7".to_string()])
+            .unwrap();
+        assert_eq!(
+            status_to_i32(status),
+            7,
+            "the child's exit code must survive"
+        );
+
+        let argv = fs::read_to_string(&log).unwrap();
+        for expected in [
+            "--scope",
+            "--user",
+            "--slice=gantry.slice",
+            "CPUQuota=200%",
+            "MemoryMax=6G",
+            "MemorySwapMax=0",
+        ] {
+            assert!(
+                argv.contains(expected),
+                "launch line lacks {expected}: {argv}"
+            );
+        }
+    }
+
+    /// The clean degrade: a plain spawn when the slice is unavailable — same
+    /// child, same exit code, no wrapper in between.
+    #[test]
+    #[cfg(unix)]
+    fn plain_spawn_is_uncapped_and_faithful() {
+        let sp = placement_with(Placement::Plain, None);
+        let status = sp
+            .spawn(Path::new("sh"), &["-c".to_string(), "exit 3".to_string()])
+            .unwrap();
+        assert_eq!(status_to_i32(status), 3);
+    }
+
+    /// N concurrent slice-placed spawns all launch through the wrapper: the
+    /// slice (not gantry) enforces the sum cap, so the invariant gantry must
+    /// uphold is that *every* concurrent capped run lands inside
+    /// `--slice=gantry.slice` — none escapes as a plain spawn.
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_slice_spawns_all_carry_the_slice() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("argv.log");
+        let fake = tmp.path().join("systemd-run");
+        fs::write(
+            &fake,
+            // The log path is baked into the script rather than passed as
+            // $GANTRY_FAKE_ARGV_LOG: the child inherits this process's
+            // environment, and parallel tests setting the same var would
+            // race each other's children.
+            format!(
+                "#!/usr/bin/env bash\n\
+                 while [ \"$1\" != \"--\" ]; do \n\
+                 printf '%s\\n' \"$1\" >> '{}'; shift; done\n\
+                 shift\nexec \"$@\"\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sp = std::sync::Arc::new(placement_with(Placement::Slice, Some(fake)));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let sp = std::sync::Arc::clone(&sp);
+                std::thread::spawn(move || sp.spawn(Path::new("true"), &[]).unwrap().success())
+            })
+            .collect();
+        for w in workers {
+            assert!(w.join().unwrap(), "every concurrent run must succeed");
+        }
+
+        let launches = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            launches.matches("--slice=gantry.slice").count(),
+            4,
+            "all 4 concurrent runs must land inside the slice: {launches}"
+        );
     }
 }
