@@ -535,6 +535,20 @@ pub enum Verdict {
     Superseded,
 }
 
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Verdict::Pass => "Pass",
+            Verdict::TestFailure => "TestFailure",
+            Verdict::GateFailure => "GateFailure",
+            Verdict::InfraFailure => "InfraFailure",
+            Verdict::Cancelled => "Cancelled",
+            Verdict::Superseded => "Superseded",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Where the run actually executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
