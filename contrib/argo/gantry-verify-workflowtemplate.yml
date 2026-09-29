@@ -1,30 +1,84 @@
 # gantry-verify — reference WorkflowTemplate for the gantry Argo backend.
 #
-# This is the genericized rust-verify contract from docs/plan/plan.md (§"argo"):
-# gantry submits a Workflow whose parameters bind to the four inputs below and
-# whose entrypoint is `gantry-verify`. The backend (src/backend/argo.rs) reads
-# the run verdict from the `verdict` output parameter, which carries this
-# template's verdict.json (schema documented in src/backend/mod.rs, VerdictJson),
-# and recovers the run log from the `output` output parameter when podGC
-# (OnPodCompletion) deleted the pod before `kubectl logs -f` could stream it.
-# Argo output parameters are size-capped (~256KiB): huge logs truncate (Q-6).
-# The recovery contract (fast-run podGC, mid-stream pod vanish, loud error
-# when neither source exists) is pinned by tests/argo_backend_integration.rs.
+# This is the genericized rust-verify contract from docs/plan/plan.md (§"argo",
+# Phase 2): the backend (src/backend/argo.rs) submits a Workflow bound to the
+# parameters below and reads the run verdict from the `verdict` output
+# parameter, recovering the run log from the `output` output parameter when
+# podGC (OnPodCompletion) deleted the pod before `kubectl logs -f` could
+# stream it. Argo output parameters are size-capped (~256KiB): huge logs
+# truncate (Q-6). The recovery contract (fast-run podGC, mid-stream pod
+# vanish, loud error when neither source exists) is pinned by
+# tests/argo_backend_integration.rs.
 #
-# Remote contract: the remote executes exactly the argv the caller typed. v1
-# intercepts `cargo test` only, so the step runs `cargo test` + args-json.
-# Quality gates (clippy/fmt) are NOT run here — opt-in gates are a later phase.
+# Parameters (all arrive as env vars, never inline text substitution — an
+# arg containing quotes or newlines must not be able to touch the shell,
+# S-4 / EC-06):
+#   repo              git remote holding the pushed epoch ref (client sends spec.repo_url)
+#   revision          commit sha the client pushed as refs/gantry/<epoch>-<sha>
+#   args-json         JSON array: the caller's argv after the subcommand (default "[]")
+#   gates-json        JSON array of opt-in quality gates, subset of [clippy, fmt]
+#                     (default "[]" = faithful-argv only, plan Q-2)
+#   contract-version  remote contract version the client pins (default "1");
+#                     echoed verbatim into verdict.json as contract_version —
+#                     the client-side half of the handshake (interpreting the
+#                     echo, "contract drift" on mismatch → InfraFailure) lives
+#                     in src/verdict.rs: CONTRACT_VERSION is what this build
+#                     sends, and a present-but-different echo classifies the
+#                     whole document as infra, never a misread verdict
+#                     (an absent echo is a pre-handshake producer, not drift)
+#   builder-image     image with git + jq + bash >= 4 + the Rust toolchain
+#                     (never a moving tag; Q-4 governs repo-layer selection,
+#                     so only user config may choose it). The pinned default
+#                     below is the stock Rust image: git and bash it has, jq
+#                     it has NOT — an unmodified default fails loudly at the
+#                     jq gate below (infra, exit 2, "[gantry] jq not found")
+#                     before cloning, the client degrades to its capped local
+#                     fallback, and the operator gets a one-line fix: pin a
+#                     jq-capable default in the GitOps copy of this template
+#                     (that is where an org image belongs), or send
+#                     builder-image per run from client config.
 #
-# Builder image requirements: git and jq alongside the Rust toolchain. The
-# pinned default below is the stock Rust image; override `builder-image` with
-# an image that includes git + jq (never a moving tag). sccache is optional:
-# mount credentials and export SCCACHE_* env vars via an executor-level patch
-# or a derived template — this reference keeps it out to stay credential-free.
+# Remote contract: the remote executes exactly the argv the caller typed
+# (faithful-argv, plan Q-2). v1 intercepts `cargo test` only, so the step
+# runs `cargo test` + args-json. Two documented deviations, both
+# instrumentation, neither argv semantics:
+#   - Unless the caller already chose a --message-format, the step appends
+#     `--message-format json` (before the harness `--` separator) to derive
+#     verdict.json's failure_class from cargo's stable JSON stream. The
+#     human stream is then reassembled: compiler diagnostics replay from
+#     their rendered text and the harness's own human lines pass through
+#     verbatim, so the caller sees what a plain run would have printed.
+#   - Opt-in gates (gates-json) run only after a passing suite and are
+#     reported as separately-labeled `[gantry] gate:` results — never
+#     conflated with the test verdict (AS-5). A failed gate keeps the
+#     suite's exit_code 0 in verdict.json and attributes via
+#     failure_class: gate-failure, while the container exits 3 so the
+#     workflow reads Failed (agents must see red).
 #
-# Install: kubectl apply -f this file in the cluster's Argo Workflows
-# namespace (namespaced, matching the backend's workflowTemplateRef — the
-# submitted Workflow must target the same namespace for the reference to
-# resolve).
+# verdict.json (schema_version 1, see src/verdict.rs VerdictJson): phase,
+# exit_code, oom, deadline_exceeded, optional failure_class
+# (compile-error | test-failure | doctest | harness-panic | gate-failure),
+# contract_version. exit_code is the CLIENT's ladder (0 pass, 1 a real
+# failure whatever its class, 2 infra) — never cargo's raw 101, which the
+# client would read as InfraFailure and re-run locally (INV-7); the suite's
+# raw code stays in the run log and in the container's own exit status. The
+# document is written BEFORE anything can fail: a run that never reaches its
+# own classification (OOMKilled container, node loss, deadline) leaves the
+# pre-written infra default behind — exit_code 2 reads as InfraFailure,
+# because a vanished suite claims nothing about the code. A SIGKILL'd
+# container cannot classify itself; 137 while alive is still flagged oom.
+# deadline_exceeded is never set in-process: the workflow-level deadline
+# fires from outside, and the pre-written default covers it.
+#
+# Install: this template ships in the gantry repo as reference; deploying it
+# to a cluster goes through that cluster's GitOps repo (for iad-ci:
+# declarative-config k8s/iad-ci/argo-workflows/) — never kubectl apply.
+# Namespaced, matching the backend's workflowTemplateRef: the submitted
+# Workflow must target the same namespace for the reference to resolve.
+#
+# sccache is optional: mount credentials and export SCCACHE_* env vars via an
+# executor-level patch or a derived template — this reference keeps it out to
+# stay credential-free.
 apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
@@ -32,12 +86,20 @@ metadata:
   namespace: argo-workflows
 spec:
   entrypoint: gantry-verify
+  # 40min, matching the client's deadline_minutes default. Expiry marks the
+  # workflow Failed from the outside; the pre-written infra verdict below is
+  # what the client then reads — InfraFailure, never a fake test failure.
+  activeDeadlineSeconds: 2400
   arguments:
     parameters:
       - name: repo
       - name: revision
       - name: args-json
         value: "[]"
+      - name: gates-json
+        value: "[]"
+      - name: contract-version
+        value: "1"
       - name: builder-image
         value: rust:1.83
   templates:
@@ -47,6 +109,8 @@ spec:
           - name: repo
           - name: revision
           - name: args-json
+          - name: gates-json
+          - name: contract-version
           - name: builder-image
       outputs:
         parameters:
@@ -62,32 +126,303 @@ spec:
         image: "{{inputs.parameters.builder-image}}"
         command: [bash, -c]
         workingDir: /workspace
+        # Parameters ride as env vars: env values are byte-exact, argv
+        # text-substitution would hand a quote-bearing arg the shell (S-4).
+        env:
+          - name: GANTRY_REPO
+            value: "{{inputs.parameters.repo}}"
+          - name: GANTRY_REVISION
+            value: "{{inputs.parameters.revision}}"
+          - name: GANTRY_ARGS_JSON
+            value: "{{inputs.parameters.args-json}}"
+          - name: GANTRY_GATES_JSON
+            value: "{{inputs.parameters.gates-json}}"
+          - name: GANTRY_CONTRACT_VERSION
+            value: "{{inputs.parameters.contract-version}}"
         args:
           - |
             set -euo pipefail
-            mkdir -p /tmp/gantry-verdict
-            verdict_file=/tmp/gantry-verdict/verdict.json
 
+            work=/tmp/gantry-verdict
+            verdict_file="$work/verdict.json"
+            run_log="$work/output.log"
+            messages="$work/cargo-messages.jsonl"
+            mkdir -p "$work"
+            : > "$run_log"
+            : > "$messages"
+
+            # --- verdict emission -----------------------------------------
+            # jq builds every document (values arrive as jq args, never
+            # interpolated into the JSON text). If jq itself is missing, the
+            # honest fallback is the static infra default below — a missing
+            # verdict.json would degrade the client to exit-code-only, where
+            # this step's exit 2 would read as a test failure.
+            emit_verdict() {  # phase exit_code failure_class oom
+              jq -n \
+                --arg phase "$1" \
+                --argjson exit_code "$2" \
+                --arg failure_class "${3:-}" \
+                --argjson oom "${4:-false}" \
+                --arg contract_version "$GANTRY_CONTRACT_VERSION" \
+                '{schema_version: 1}
+                 + {phase: $phase, exit_code: $exit_code, oom: $oom, deadline_exceeded: false}
+                 + {contract_version: $contract_version}
+                 + (if $failure_class == "" then {} else {failure_class: $failure_class} end)' \
+                > "$verdict_file"
+            }
+            if command -v jq >/dev/null 2>&1; then
+              emit_verdict Failed 2 "" false
+            else
+              printf '%s\n' '{"schema_version": 1, "phase": "Failed", "exit_code": 2, "oom": false, "deadline_exceeded": false}' \
+                > "$verdict_file"
+              echo "[gantry] jq not found: cannot echo contract_version or classify failures" >&2
+              exit 2
+            fi
+
+            # S-5: the client may hand this step a credentialed URL — git needs
+            # it to fetch — but the run log never carries it. Mask any userinfo
+            # before echoing the remote into the log (gantry-exec.sh redacts
+            # identically; the client redacts again at the runlog layer).
+            redact_url() {
+              printf '%s' "$1" | sed -E 's#(//)[^/@]+@#\1[redacted]@#'
+            }
+
+            # Contract handshake guard: the client pins a version; a malformed
+            # one is a client bug and must fail loudly (infra), never masquerade
+            # as a test result. Well-formed versions are echoed verbatim.
+            case "$GANTRY_CONTRACT_VERSION" in
+              "" | *[!A-Za-z0-9._-]*)
+                echo "[gantry] contract drift: malformed contract_version: $GANTRY_CONTRACT_VERSION" >&2
+                exit 2
+                ;;
+            esac
+
+            # Same guard for the revision: a content address, never a ref
+            # name. Hex-only keeps a tampered Workflow from glob-matching a
+            # different epoch ref through the for-each-ref suffix pattern
+            # below ('*' and '[' are wildcards there) and pins S-1 — no
+            # spelling of this asks the template for a branch.
+            case "$GANTRY_REVISION" in
+              "" | *[!0-9a-f]*)
+                echo "[gantry] revision must be a hex commit sha: $GANTRY_REVISION" >&2
+                exit 2
+                ;;
+            esac
+
+            # --- clone: refs/gantry/* only (never a branch, S-1 / INV-2) ---
+            # revision is the sha the client pushed; the refspace is fetched
+            # and the epoch ref resolved by suffix. A bare-sha fetch would
+            # need uploadpack.allowAnySHA1InWant on the server, which gantry
+            # cannot assume; fetching the refspace needs no server opt-in.
+            # --depth=1 keeps it bounded; the client-side GC sweep keeps the
+            # refspace small at steady state.
             git init -q /workspace
-            git -C /workspace remote add origin "{{inputs.parameters.repo}}"
-            git -C /workspace fetch -q --depth=1 origin "{{inputs.parameters.revision}}"
-            git -C /workspace checkout -q FETCH_HEAD
+            git -C /workspace remote add origin "$GANTRY_REPO"
+            git -C /workspace fetch -q --depth=1 origin '+refs/gantry/*:refs/gantry/*' || {
+              echo "[gantry] fetch of refs/gantry/* from $(redact_url "$GANTRY_REPO") failed" >&2
+              exit 2
+            }
+            gantry_ref=$(git -C /workspace for-each-ref --format='%(refname)' \
+              --sort=refname "refs/gantry/*-$GANTRY_REVISION" | head -n 1 || true)
+            # The || true masks only for-each-ref dying on SIGPIPE when a very
+            # large refspace outgrows the pipe after head has its line — any
+            # real failure (bad remote, bad pattern) also empties the
+            # variable, and the guard below reports that honestly as infra.
+            if [ -z "$gantry_ref" ]; then
+              echo "[gantry] no refs/gantry/* ref for revision $GANTRY_REVISION (not pushed, or GC'd)" >&2
+              exit 2
+            fi
+            git -C /workspace checkout -q --detach "$gantry_ref"
 
-            # Parse args-json into the argv the caller typed (jq required).
-            mapfile -t args < <(printf '%s' '{{inputs.parameters.args-json}}' | jq -r '.[]')
+            # --- argv: decode args-json, split at the harness separator ----
+            # jq's @sh emits each element shell-quoted, so the eval below sees
+            # only jq-quoted text: quotes, newlines and metacharacters in args
+            # stay data end-to-end (EC-06 / INV-5, S-4). args-json carries the
+            # caller's argv after the subcommand; the harness separator "--"
+            # splits cargo flags from libtest flags, and the instrumentation
+            # flag (if added) must land on the cargo side.
+            printf '%s' "$GANTRY_ARGS_JSON" |
+              jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null || {
+              echo "[gantry] args-json must be a JSON array of strings" >&2
+              exit 2
+            }
+            quoted_cargo=$(printf '%s' "$GANTRY_ARGS_JSON" |
+              jq -j 'if index("--") then .[0:index("--")] else . end | map(@sh) | join(" ")')
+            quoted_harness=$(printf '%s' "$GANTRY_ARGS_JSON" |
+              jq -j 'if index("--") then .[index("--"):] else [] end | map(@sh) | join(" ")')
+            # An explicit caller-chosen message format is respected as-is:
+            # instrumentation must not fight the argv, so no taxonomy then.
+            fmt_present=$(printf '%s' "$GANTRY_ARGS_JSON" |
+              jq 'any(.[]; . == "--message-format" or startswith("--message-format="))')
+            set --
+            [ -n "$quoted_cargo" ] && eval "set -- \"\$@\" $quoted_cargo"
+            [ -n "$quoted_harness" ] && eval "set -- \"\$@\" $quoted_harness"
+            if [ "$fmt_present" = "false" ]; then
+              set -- --message-format json "$@"
+            fi
 
-            exit_code=0
-            # tee captures the full run log for the `output` output parameter;
-            # pipefail keeps the pipeline exit at cargo's own status (the
-            # failing step in a pipe wins under `set -o pipefail`).
-            cargo test "${args[@]}" 2>&1 | tee /tmp/gantry-verdict/output.log || exit_code=$?
+            # --- run: stream-split stdout/stderr ---------------------------
+            # stdout carries the cargo JSON protocol (instrumented) or human
+            # output (caller's own --message-format); stderr is always human.
+            # Both streams are piped through FIFO readers waited on by PID, so
+            # the human view streams live, the raw protocol lands in messages
+            # for the taxonomy, and classification can never race the last
+            # lines. In instrumented mode stdout MIXES the JSON protocol with
+            # the test harness's human lines ("running N tests", "test
+            # result: …"): JSON lines are archived to messages (rendered
+            # diagnostics replayed so the human stream reads like a plain
+            # run), every other line IS the harness's human output and is
+            # archived to the run log and replayed verbatim — dropping it
+            # would mute the caller and blind the run-log taxonomy (doctest
+            # and harness-panic detection read the run log).
+            mkfifo "$work/stdout.fifo" "$work/stderr.fifo"
+            if [ "$fmt_present" = "true" ]; then
+              ( while IFS= read -r line || [ -n "$line" ]; do
+                  printf '%s\n' "$line" | tee -a "$run_log" >&2
+                done ) < "$work/stdout.fifo" &
+            else
+              ( while IFS= read -r line || [ -n "$line" ]; do
+                  if printf '%s\n' "$line" | jq -e 'type == "object"' >/dev/null 2>&1; then
+                    printf '%s\n' "$line" >>"$messages"
+                    rendered=$(printf '%s\n' "$line" | jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' 2>/dev/null || true)
+                    if [ -n "$rendered" ]; then
+                      printf '%s\n' "$rendered" | tee -a "$run_log" >&2
+                    fi
+                  else
+                    printf '%s\n' "$line" | tee -a "$run_log" >&2
+                  fi
+                done ) < "$work/stdout.fifo" &
+            fi
+            stdout_reader=$!
+            ( while IFS= read -r line || [ -n "$line" ]; do
+                printf '%s\n' "$line" | tee -a "$run_log" >&2
+              done ) < "$work/stderr.fifo" &
+            stderr_reader=$!
 
-            # OOM (SIGKILL -> 137) and other signals classify as InfraFailure
-            # through VerdictJson.to_verdict's exit-code ladder.
-            phase=Succeeded
-            [ "$exit_code" -eq 0 ] || phase=Failed
-            cat > "$verdict_file" <<EOF
-            {"schema_version": 1, "phase": "$phase", "exit_code": $exit_code,
-             "oom": false, "deadline_exceeded": false}
-            EOF
+            set +e
+            cargo test "$@" >"$work/stdout.fifo" 2>"$work/stderr.fifo"
+            exit_code=$?
+            set -e
+            # Waited on separately: `wait a b` reports only the second
+            # status, and a reader that died (full disk under pipefail) must
+            # not pass for a clean one — an incomplete archive is an
+            # infra-shaped lie about a run that did happen.
+            wait "$stdout_reader"
+            wait "$stderr_reader"
+            rm -f "$work/stdout.fifo" "$work/stderr.fifo"
+
+            # --- failure taxonomy (cargo --message-format json stream) -----
+            # Classes are derived only for a suite that ran to completion and
+            # failed (exit 1..127; 127 itself is intercepted as infra in the
+            # final block — the class derived for it is never read):
+            # compile-error outranks everything (rustc
+            # never finished); harness-panic is a stack-overflowed test
+            # binary; doctest means the only FAILED section was Doc-tests; the
+            # rest is test-failure. Signal-killed suites (>=128) are infra,
+            # classified by the final block below — not a failure class. Without
+            # instrumentation (caller's own --message-format) no class is
+            # derivable; the exit-code ladder decides, honestly.
+            failure_class=""
+            if [ "$exit_code" -ne 0 ] && [ "$exit_code" -lt 128 ]; then
+              if [ "$fmt_present" = "true" ]; then
+                failure_class=""
+              elif [ -n "$(jq -R 'fromjson? | select(.reason? == "compiler-message" and .message.level? == "error")' \
+                     "$messages" 2>/dev/null)" ]; then
+                # Line-wise and lenient on purpose: `jq -s` would need the
+                # whole file to parse, and it never does — the harness's
+                # human lines share the stream with the protocol. Read via
+                # command substitution, not `| grep -q .`: grep -q exits at
+                # the first match, and under pipefail a jq still writing the
+                # rest of a large error stream then dies by SIGPIPE (141),
+                # which would flip a detected compile-error into the
+                # fallthrough class exactly when errors are numerous enough
+                # to outgrow the pipe buffer.
+                failure_class="compile-error"
+              elif grep -q "has overflowed its stack" "$run_log"; then
+                failure_class="harness-panic"
+              elif awk '/Doc-tests/ { docs = 1 }
+                        /^test result: FAILED/ { if (docs) doc_failed = 1; else other_failed = 1 }
+                        END { exit !(doc_failed && !other_failed) }' "$run_log"; then
+                failure_class="doctest"
+              else
+                failure_class="test-failure"
+              fi
+            fi
+
+            # --- quality gates (opt-in, labeled; AS-5) ---------------------
+            # Only after a passing suite: a failing suite is the verdict
+            # already, and gates must never be conflated with it. Gate output
+            # is archived into the run log under its [gantry] gate: label.
+            if [ "$exit_code" -eq 0 ]; then
+              printf '%s' "$GANTRY_GATES_JSON" |
+                jq -e 'type == "array" and all(.[]; . == "clippy" or . == "fmt")' >/dev/null || {
+                echo "[gantry] gates-json must be a JSON array drawn from: clippy, fmt" >&2
+                exit 2
+              }
+              gate_failed=""
+              while IFS= read -r gate; do
+                [ -n "$gate" ] || continue
+                printf '[gantry] gate: %s\n' "$gate" | tee -a "$run_log" >&2
+                case "$gate" in
+                  clippy)
+                    gate_status=0
+                    cargo clippy --all-targets -- -D warnings 2>&1 | tee -a "$run_log" || gate_status=$?
+                    ;;
+                  fmt)
+                    gate_status=0
+                    cargo fmt --check 2>&1 | tee -a "$run_log" || gate_status=$?
+                    ;;
+                esac
+                if [ "$gate_status" -ne 0 ]; then
+                  printf '[gantry] gate: %s FAILED\n' "$gate" | tee -a "$run_log" >&2
+                  gate_failed=$gate
+                  break
+                fi
+              done < <(printf '%s' "$GANTRY_GATES_JSON" | jq -r '.[]')
+              if [ -n "$gate_failed" ]; then
+                # exit_code stays 0 (the suite's truth); the gate is
+                # attributed via failure_class. Container exits 3 so the
+                # workflow reads Failed — agents must see red.
+                emit_verdict Failed 0 gate-failure false
+                exit 3
+              fi
+            fi
+
+            # --- final verdict ---------------------------------------------
+            # verdict.json's exit_code rides the client's ladder (0 pass, 1 a
+            # real failure whatever its class, 2 infra) — never cargo's raw
+            # 101, which would read as InfraFailure client-side and trigger
+            # the capped local re-run the verdict ladder exists to prevent
+            # (INV-7; gantry-exec.sh normalizes identically). The suite's raw
+            # code stays in the run log and in the container's own exit
+            # status, which turns the workflow Failed either way — agents
+            # must see red.
+            if [ "$exit_code" -eq 0 ]; then
+              emit_verdict Succeeded 0 "" false
+              exit 0
+            fi
+            if [ "$exit_code" -eq 127 ]; then
+              # 127 is the shell's command-not-found: the toolchain itself
+              # never ran, so a test-failure verdict (1) would be a lie about
+              # a suite that never executed — infra (2), whose capped local
+              # fallback still lands the caller a real result (gantry-exec.sh
+              # normalizes identically; contract parity between the two
+              # executors).
+              emit_verdict Failed 2 "" false
+              exit "$exit_code"
+            fi
+            if [ "$exit_code" -ge 128 ]; then
+              # Signal-killed suite: infra, exactly like the command
+              # contract's raw >=128 -> infra (gantry-exec.sh). 137 is
+              # SIGKILL — conventionally the OOM killer — and is flagged oom
+              # on top, so oom outranks the whole ladder client-side
+              # (VerdictJson::to_verdict).
+              if [ "$exit_code" -eq 137 ]; then
+                emit_verdict Failed 2 "" true
+              else
+                emit_verdict Failed 2 "" false
+              fi
+              exit "$exit_code"
+            fi
+            emit_verdict Failed 1 "$failure_class" false
             exit "$exit_code"

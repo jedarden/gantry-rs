@@ -51,6 +51,17 @@ pub const DEFAULT_FALLBACK_SLOTS: u32 = 3;
 /// storm of typical suites drains before a waiter abandons the queue.
 pub const DEFAULT_FALLBACK_WAIT_SECS: u64 = 3600;
 
+/// Default box-level *sum* CPU cap carried by `gantry.slice`, as a
+/// percentage of one core (plan Component 6: "configurable, e.g. 12 CPU /
+/// 32G" — 1200% = 12 cores). The per-run caps bound one run; this bounds
+/// all of them added together, so 20 × 200% can no longer add up past the
+/// machine.
+pub const DEFAULT_SLICE_CPU_QUOTA_PCT: u32 = 1200;
+
+/// Default box-level *sum* memory cap carried by `gantry.slice`
+/// (plan Component 6). Pairs with [`DEFAULT_SLICE_CPU_QUOTA_PCT`].
+pub const DEFAULT_SLICE_MEMORY_MAX: &str = "32G";
+
 /// Local execution resource limits.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalConfig {
@@ -69,6 +80,18 @@ pub struct LocalConfig {
     /// bound the run proceeds without a slot — loudly — because a verdict
     /// (INV-1) outranks the admission cap.
     pub fallback_wait_secs: u64,
+    /// Place every gantry-spawned local run in the boxwide `gantry.slice`
+    /// (plan Component 6). Default true; gantry degrades to a plain spawn —
+    /// loudly, once per process — where no usable systemd user manager
+    /// exists (containers, CI, macOS: risk R5).
+    pub slice_enabled: bool,
+    /// Box-level *sum* CPU cap carried by `gantry.slice`, as a percentage of
+    /// one core (default 1200 = 12 cores). The slice bounds the *total*
+    /// load of all gantry-spawned local runs; the per-run `cpu_quota_pct`
+    /// bounds each one.
+    pub slice_cpu_quota_pct: u32,
+    /// Box-level *sum* memory cap carried by `gantry.slice` (default "32G").
+    pub slice_memory_max: String,
 }
 
 /// Tool-specific configuration (e.g., cargo).
@@ -230,6 +253,9 @@ struct RawLocal {
     cap_passthrough: Option<bool>,
     fallback_slots: Option<u32>,
     fallback_wait_secs: Option<u64>,
+    slice_enabled: Option<bool>,
+    slice_cpu_quota_pct: Option<u32>,
+    slice_memory_max: Option<String>,
     #[serde(flatten)]
     unknown: HashMap<String, toml::Value>,
 }
@@ -487,6 +513,9 @@ impl GantryConfig {
                 cap_passthrough: true,
                 fallback_slots: DEFAULT_FALLBACK_SLOTS,
                 fallback_wait_secs: DEFAULT_FALLBACK_WAIT_SECS,
+                slice_enabled: true,
+                slice_cpu_quota_pct: DEFAULT_SLICE_CPU_QUOTA_PCT,
+                slice_memory_max: DEFAULT_SLICE_MEMORY_MAX.to_string(),
             },
             tools: {
                 let mut map = HashMap::new();
@@ -597,6 +626,38 @@ impl GantryConfig {
                 Some(0) => warnings
                     .push("local.fallback_wait_secs must be at least 1; ignoring".to_string()),
                 Some(v) => base.local.fallback_wait_secs = v,
+                None => {}
+            }
+
+            // The gantry.slice sum-cap keys are box-overload protection in the
+            // same class as the semaphore keys above (plan Component 6): a
+            // cloned repo must not be able to opt the box out of the slice or
+            // raise the total CPU/memory the slice admits. Zero CPU from any
+            // layer would make the slice a place where nothing can run.
+            match local.slice_enabled {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'slice_enabled' (trust boundary S-2), ignoring"
+                        .to_string(),
+                ),
+                Some(v) => base.local.slice_enabled = v,
+                None => {}
+            }
+            match local.slice_cpu_quota_pct {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'slice_cpu_quota_pct' (trust boundary S-2), ignoring"
+                        .to_string(),
+                ),
+                Some(0) => warnings
+                    .push("local.slice_cpu_quota_pct must be at least 1; ignoring".to_string()),
+                Some(v) => base.local.slice_cpu_quota_pct = v,
+                None => {}
+            }
+            match local.slice_memory_max {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'slice_memory_max' (trust boundary S-2), ignoring"
+                        .to_string(),
+                ),
+                Some(v) => base.local.slice_memory_max = v,
                 None => {}
             }
         }
@@ -962,6 +1023,9 @@ impl GantryConfig {
                 cap_passthrough: Some(config.local.cap_passthrough),
                 fallback_slots: Some(config.local.fallback_slots),
                 fallback_wait_secs: Some(config.local.fallback_wait_secs),
+                slice_enabled: Some(config.local.slice_enabled),
+                slice_cpu_quota_pct: Some(config.local.slice_cpu_quota_pct),
+                slice_memory_max: Some(config.local.slice_memory_max.clone()),
                 unknown: HashMap::new(),
             }),
             tool: config
@@ -1071,6 +1135,9 @@ mod tests {
         assert!(cfg.local.cap_passthrough);
         assert_eq!(cfg.local.fallback_slots, DEFAULT_FALLBACK_SLOTS);
         assert_eq!(cfg.local.fallback_wait_secs, DEFAULT_FALLBACK_WAIT_SECS);
+        assert!(cfg.local.slice_enabled);
+        assert_eq!(cfg.local.slice_cpu_quota_pct, DEFAULT_SLICE_CPU_QUOTA_PCT);
+        assert_eq!(cfg.local.slice_memory_max, DEFAULT_SLICE_MEMORY_MAX);
         assert!(cfg.intercepts("cargo", "test"));
     }
 
@@ -1794,6 +1861,169 @@ mod tests {
 
         assert_eq!(reparsed.local.fallback_slots, 7);
         assert_eq!(reparsed.local.fallback_wait_secs, 1200);
+    }
+
+    // ========================================================================
+    // Boxwide gantry.slice sum cap config (plan Component 6, bf-xj0)
+    // ========================================================================
+
+    #[test]
+    fn slice_cap_keys_merge_from_user_layer() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            slice_enabled = true
+            slice_cpu_quota_pct = 800
+            slice_memory_max = "24G"
+            "#,
+        );
+        let repo = layer_file(temp.path(), "repo.toml", "");
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert!(result.config.local.slice_enabled);
+        assert_eq!(result.config.local.slice_cpu_quota_pct, 800);
+        assert_eq!(result.config.local.slice_memory_max, "24G");
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn repo_layer_cannot_touch_slice_cap_keys() {
+        // The slice is the box's total-load backstop: a cloned repo opting out
+        // of the slice or raising the sum cap is the same S-2 overreach as
+        // raising the fallback slot count.
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            slice_enabled = true
+            slice_cpu_quota_pct = 1200
+            slice_memory_max = "32G"
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [local]
+            slice_enabled = false
+            slice_cpu_quota_pct = 100000
+            slice_memory_max = "1T"
+
+            [tool.cargo]
+            intercept = ["test", "check"]
+            "#,
+        );
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert!(result.config.local.slice_enabled, "repo cannot opt out");
+        assert_eq!(
+            result.config.local.slice_cpu_quota_pct, 1200,
+            "repo cannot raise the CPU sum cap"
+        );
+        assert_eq!(
+            result.config.local.slice_memory_max, "32G",
+            "repo cannot raise the memory sum cap"
+        );
+        for key in ["slice_enabled", "slice_cpu_quota_pct", "slice_memory_max"] {
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(key) && w.contains("trust boundary")),
+                "a trust-boundary warning must name '{key}': {:?}",
+                result.warnings
+            );
+        }
+        // The stray restricted keys must not discard the repo's own narrowing.
+        assert!(result.config.intercepts("cargo", "check"));
+    }
+
+    #[test]
+    fn zero_slice_cpu_quota_is_rejected_from_any_layer() {
+        // A 0% CPU slice is a slice where nothing can ever run.
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(
+            temp.path(),
+            "system.toml",
+            r#"
+            [local]
+            slice_cpu_quota_pct = 0
+            "#,
+        );
+        let user = layer_file(temp.path(), "user.toml", "");
+        let repo = layer_file(temp.path(), "repo.toml", "");
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(
+            result.config.local.slice_cpu_quota_pct,
+            DEFAULT_SLICE_CPU_QUOTA_PCT
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("slice_cpu_quota_pct")),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn slice_cap_keys_round_trip_through_the_lkg_snapshot() {
+        // A key missing from to_raw would silently reset to the default
+        // exactly when the config is broken — the worst moment to lose the
+        // box's total-load backstop.
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            slice_enabled = true
+            slice_cpu_quota_pct = 900
+            slice_memory_max = "40G"
+            "#,
+        );
+        let repo = layer_file(temp.path(), "repo.toml", "");
+
+        let loaded =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        let raw = Config::to_raw(&loaded.config);
+        let serialized = toml::to_string_pretty(&raw).unwrap();
+        let mut reparsed = Config::tier_0_defaults();
+        let mut warnings = Vec::new();
+        let snapshot = temp.path().join("snapshot.toml");
+        fs::write(&snapshot, serialized).unwrap();
+        Config::merge_layer(
+            &mut reparsed,
+            &snapshot,
+            ConfigLayer::Defaults,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(reparsed.local.slice_enabled);
+        assert_eq!(reparsed.local.slice_cpu_quota_pct, 900);
+        assert_eq!(reparsed.local.slice_memory_max, "40G");
     }
 
     #[test]

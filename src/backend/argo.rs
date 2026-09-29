@@ -5,7 +5,10 @@
 // when podGC ate the logs.
 //
 // The Argo backend implements RemoteBackend using kubectl as the execution layer:
-// - submit: builds Workflow manifest with serde, runs kubectl create -f -
+// - submit: builds Workflow manifest with serde, runs kubectl create -f -;
+//   every submission carries `contract-version` (CONTRACT_VERSION) — the
+//   client half of the verdict.json handshake the reference template echoes
+//   back, and a foreign echo classifies the run infra in wait() below
 // - stream_logs: kubectl logs -f on the workflow's pod
 // - wait: polls kubectl get workflow status.phase until terminal or deadline
 // - status: one-shot status.phase → RunStatus snapshot (never blocks, never
@@ -22,6 +25,7 @@
 // run progresses, not a captured end-of-run result.
 
 use crate::backend::{BackendError, RemoteBackend, RunSpec, RunStatus, Verdict, VerdictJson};
+use crate::verdict::CONTRACT_VERSION;
 use std::io::{Read, Write};
 use std::process::{Command, Output};
 use std::thread;
@@ -39,13 +43,15 @@ const STATUS_POLL: Duration = Duration::from_secs(2);
 /// Argo Workflow manifest structures (serde-based, no string splicing).
 ///
 /// Phase 1a implements minimal Workflow submit spec matching the gantry-verify
-/// template contract: parameters (repo, revision, args-json, builder-image),
-/// generateName, entrypoint, and a workflowTemplateRef to the cluster's
-/// WorkflowTemplate. Workflow-level arguments are merged with the template's
-/// arguments (argo-workflows docs §"Workflow Templates"): names the workflow
-/// supplies take effect; names it omits keep the template's default — which is
-/// how an unconfigured builder-image falls back to the template default.
+/// template contract: parameters (repo, revision, args-json, contract-version,
+/// builder-image), generateName, entrypoint, and a workflowTemplateRef to the
+/// cluster's WorkflowTemplate. Workflow-level arguments are merged with the
+/// template's arguments (argo-workflows docs §"Workflow Templates"): names the
+/// workflow supplies take effect; names it omits keep the template's default —
+/// which is how an unconfigured builder-image falls back to the template
+/// default.
 mod workflow {
+    use crate::verdict::CONTRACT_VERSION;
     use serde::{Deserialize, Serialize};
 
     /// Workflow submit manifest.
@@ -166,7 +172,13 @@ mod workflow {
         ///
         /// Parameters follow the gantry-verify template contract (plan §argo):
         /// repo, revision, args-json always; builder-image only when configured
-        /// (omitting it lets the WorkflowTemplate default apply).
+        /// (omitting it lets the WorkflowTemplate default apply). `contract-version`
+        /// is always sent — the client half of the handshake (plan §"Versioning &
+        /// compatibility"): the template echoes it back verbatim in verdict.json,
+        /// and the client reading a different echo is contract drift
+        /// (src/verdict.rs). Gates stay unsent here: they are opt-in from trusted
+        /// user config and the template's faithful-argv default ("[]") already
+        /// implements Q-2.
         pub fn new(
             generate_name: &str,
             template_name: &str,
@@ -187,6 +199,10 @@ mod workflow {
                 Parameter {
                     name: "args-json".to_string(),
                     value: args_json.to_string(),
+                },
+                Parameter {
+                    name: "contract-version".to_string(),
+                    value: CONTRACT_VERSION.to_string(),
                 },
             ];
             if let Some(image) = builder_image {
@@ -883,7 +899,10 @@ impl RemoteBackend for ArgoBackend {
     /// [`BackendError`] on stderr. Either way the terminal phase classifies
     /// the run (Succeeded → Pass, Failed → TestFailure, Error →
     /// InfraFailure). status.phase remains the authoritative terminal signal.
-    /// Attributions gate failures to "[gantry] gate:" in output.
+    /// Attributions gate failures to "[gantry] gate:" in output, and a
+    /// contract-version echo this client does not speak surfaces as the
+    /// explicit "contract drift" message the plan's versioning section
+    /// requires before its InfraFailure classification.
     fn wait(
         &self,
         h: &crate::backend::RunHandle,
@@ -919,6 +938,19 @@ impl RemoteBackend for ArgoBackend {
             if let Some(value) = status.as_ref().and_then(|s| s.output_parameter("verdict")) {
                 match VerdictJson::parse(value) {
                     Ok(vj) => {
+                        // Contract drift first, loudly: the document echoed a
+                        // contract this client does not speak, so nothing
+                        // else it claims can be trusted — to_verdict()
+                        // classifies it InfraFailure, and the plan's
+                        // versioning section requires that classification to
+                        // arrive with an explicit "contract drift" message,
+                        // never as a bare verdict.
+                        if let Some(echo) = vj.contract_drift() {
+                            eprintln!(
+                                "[gantry] contract drift: verdict.json echoes contract_version {:?}, this client speaks {:?} — treating as infra failure",
+                                echo, CONTRACT_VERSION
+                            );
+                        }
                         let verdict = vj.to_verdict();
                         // Attributions for gate failures
                         if verdict == Verdict::GateFailure {
@@ -1013,6 +1045,7 @@ impl RemoteBackend for ArgoBackend {
 mod tests {
     use super::*;
     use crate::backend::RunHandle;
+    use crate::verdict::CONTRACT_VERSION;
 
     #[test]
     fn test_workflow_manifest_serialization() {
@@ -1035,9 +1068,10 @@ mod tests {
 
     /// The serialized manifest must match the expected Kubernetes/YAML structure
     /// exactly: k8s camelCase key names, the gantry-verify template contract, and
-    /// all four parameters (repo, revision, args-json, builder-image). kubectl
-    /// receives JSON on stdin, and JSON is a YAML subset, so this pins the YAML
-    /// manifest shape too. Object key order is irrelevant to the comparison.
+    /// all five parameters (repo, revision, args-json, contract-version,
+    /// builder-image). kubectl receives JSON on stdin, and JSON is a YAML subset,
+    /// so this pins the YAML manifest shape too. Object key order is irrelevant
+    /// to the comparison.
     #[test]
     fn test_workflow_manifest_matches_expected_yaml_structure() {
         let workflow = Workflow::new(
@@ -1068,6 +1102,7 @@ mod tests {
                         { "name": "repo", "value": "https://github.com/example/repo" },
                         { "name": "revision", "value": "abc123" },
                         { "name": "args-json", "value": r#"["test","--","--nocapture"]"# },
+                        { "name": "contract-version", "value": CONTRACT_VERSION },
                         { "name": "builder-image", "value": "rust:1.83" },
                     ]
                 }
@@ -1079,6 +1114,7 @@ mod tests {
 
     /// Unconfigured builder image must omit the parameter entirely, so the
     /// WorkflowTemplate default applies (an empty-value override would break it).
+    /// `contract-version` is not optional — it rides every submission.
     #[test]
     fn test_workflow_manifest_omits_builder_image_when_unset() {
         let workflow = Workflow::new(
@@ -1093,7 +1129,7 @@ mod tests {
         let actual: serde_json::Value =
             serde_json::to_value(&workflow).expect("manifest must serialize");
 
-        // The whole manifest must match the three-parameter shape exactly:
+        // The whole manifest must match the four-parameter shape exactly:
         // no `builder-image` parameter, no `clusterScope` in the template
         // ref, and no other structural drift.
         let expected = serde_json::json!({
@@ -1112,6 +1148,7 @@ mod tests {
                         { "name": "repo", "value": "https://github.com/example/repo" },
                         { "name": "revision", "value": "abc123" },
                         { "name": "args-json", "value": "[]" },
+                        { "name": "contract-version", "value": CONTRACT_VERSION },
                     ]
                 }
             }
@@ -1717,6 +1754,9 @@ mod tests {
         assert_eq!(value_of("repo"), "https://github.com/example/repo");
         assert_eq!(value_of("revision"), "abc123");
         assert_eq!(value_of("args-json"), r#"["--nocapture"]"#);
+        // The handshake rides every submission: the template echoes this back
+        // in verdict.json and the client reads a different echo as drift.
+        assert_eq!(value_of("contract-version"), CONTRACT_VERSION);
         assert_eq!(value_of("builder-image"), "rust:1.83");
     }
 
@@ -1888,6 +1928,36 @@ mod tests {
             with_exec_retry(|| backend.wait(&handle, Instant::now() + Duration::from_secs(5)))
                 .expect("wait must return on terminal phase");
         assert_eq!(verdict, Verdict::InfraFailure);
+    }
+
+    /// A verdict.json echoing a foreign contract_version is contract drift:
+    /// wait() classifies it InfraFailure no matter what the rest of the
+    /// document claims — here a *passing* document (Succeeded, exit 0) flips
+    /// to infra, the "never a misread verdict" half of the plan's handshake
+    /// rule. The explicit drift message itself is stderr surface (the
+    /// parse-level drift semantics are pinned in src/verdict.rs tests).
+    #[test]
+    fn test_wait_contract_drift_echo_is_infra_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let drifted = status_json_with_verdict(
+            "Succeeded",
+            r#"{"schema_version":1,"phase":"Succeeded","exit_code":0,"oom":false,"deadline_exceeded":false,"contract_version":"9"}"#,
+        );
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            &format!("#!/usr/bin/env bash\ncat <<'JSON'\n{}\nJSON\n", drifted),
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict =
+            with_exec_retry(|| backend.wait(&handle, Instant::now() + Duration::from_secs(5)))
+                .expect("wait must return on terminal phase");
+        assert_eq!(verdict, Verdict::InfraFailure);
+        assert!(verdict.is_infra_failure());
     }
 
     // --- the status.phase ladder --------------------------------------------

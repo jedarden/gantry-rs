@@ -17,6 +17,19 @@ use crate::backend::{BackendError, Verdict};
 /// The only verdict.json schema_version this build knows (Phase 1a).
 const SCHEMA_VERSION: u32 = 1;
 
+/// The remote contract version this client speaks (plan §"Versioning &
+/// compatibility", "Remote contract").
+///
+/// The Argo backend sends it as the Workflow's `contract-version` parameter
+/// (src/backend/argo.rs `Workflow::new`); the contrib template echoes it back
+/// verbatim in verdict.json. A document that echoes a *different* version
+/// claims a contract this client cannot interpret — that is contract drift,
+/// and it classifies as [`Verdict::InfraFailure`] (never a misread verdict).
+/// An *absent* echo is not drift: the field is an additive-evolution
+/// addition, so a schema-1 producer that predates the handshake simply omits
+/// it, and this client knows the schema-1 document completely.
+pub const CONTRACT_VERSION: &str = "1";
+
 /// FailureClass: detailed failure classification from verdict.json.
 ///
 /// Derived from cargo's stable `--message-format json` stream in the remote
@@ -76,6 +89,24 @@ where
     Ok(raw.as_deref().and_then(FailureClass::from_kebab))
 }
 
+/// Deserialize `contract_version` leniently by value *shape*:
+/// absent/null reads as `None` (a schema-1 producer predating the handshake),
+/// a string reads as itself, and any other JSON shape reads as the empty
+/// string — a present-but-uninterpretable echo that can never equal
+/// [`CONTRACT_VERSION`], so it lands on contract drift rather than failing
+/// the whole document parse. That mirrors `failure_class` leniency: a
+/// producer fumbling one field must not cost the document its infra signals.
+fn deserialize_lenient_contract_version<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(_) => Ok(Some(String::new())),
+    }
+}
+
 /// VerdictJson: versioned verdict.json structure from remote executor.
 ///
 /// Emitted as a Workflow output parameter by the remote template. Contains
@@ -121,6 +152,21 @@ pub struct VerdictJson {
         skip_serializing_if = "Option::is_none"
     )]
     pub failure_class: Option<FailureClass>,
+
+    /// The `contract_version` echo (plan §"Versioning & compatibility",
+    /// "Remote contract"): the template echoes back verbatim the version the
+    /// client sent as the Workflow's `contract-version` parameter. Absent
+    /// means a schema-1 producer predating the handshake (additive evolution:
+    /// not drift); present and different from [`CONTRACT_VERSION`] — or
+    /// present in a shape this client cannot read — is contract drift, and
+    /// [`VerdictJson::to_verdict`] classifies the document as
+    /// [`Verdict::InfraFailure`] no matter what its other fields claim.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient_contract_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub contract_version: Option<String>,
 }
 
 impl VerdictJson {
@@ -165,6 +211,10 @@ impl VerdictJson {
             oom: false,
             deadline_exceeded: false,
             failure_class: None,
+            // The client fabricated this document from the terminal phase —
+            // there is no remote echo to check, and none is needed: the
+            // ladder here runs on knowledge the client produced itself.
+            contract_version: None,
         }
         .to_verdict()
     }
@@ -179,15 +229,34 @@ impl VerdictJson {
         matches!(self.failure_class, Some(FailureClass::GateFailure))
     }
 
+    /// The contract-drift signal, shared by the verdict ladder and the
+    /// client's message: `Some(echo)` when the document echoes a
+    /// `contract_version` this client does not speak, `None` when the
+    /// handshake confirms (echo matches) or does not apply (absent — a
+    /// schema-1 producer predating the handshake; see [`CONTRACT_VERSION`]).
+    pub fn contract_drift(&self) -> Option<&str> {
+        self.contract_version
+            .as_deref()
+            .filter(|echo| *echo != CONTRACT_VERSION)
+    }
+
     /// Convert the verdict.json to a Verdict using full ladder semantics.
     ///
-    /// Precedence: infrastructure signals (OOMKilled, deadline exceeded, the
-    /// workflow itself erroring) classify as InfraFailure first — a cap firing
-    /// says nothing about the code, so it must never read as a test result —
-    /// then explicit gate attribution, then the exit-code ladder. An absent
-    /// verdict.json never reaches this method; it degrades to exit-code-only
-    /// via [`Verdict::interpret`].
+    /// Precedence: contract drift first — a document that echoes a contract
+    /// this client does not speak cannot vouch for anything its other fields
+    /// claim, so it classifies as InfraFailure ("contract drift", plan
+    /// §"Versioning & compatibility"), never a misread verdict — then
+    /// infrastructure signals (OOMKilled, deadline exceeded, the workflow
+    /// itself erroring), then explicit gate attribution, then the exit-code
+    /// ladder. An absent verdict.json never reaches this method; it degrades
+    /// to exit-code-only via [`Verdict::interpret`].
     pub fn to_verdict(&self) -> Verdict {
+        // Contract drift outranks everything: the document's own meaning is
+        // what is in question.
+        if self.contract_drift().is_some() {
+            return Verdict::InfraFailure;
+        }
+
         // InfraFailure signals take precedence (OOM, deadline, workflow Error)
         if self.oom || self.deadline_exceeded || self.phase == "Error" {
             return Verdict::InfraFailure;
@@ -214,7 +283,10 @@ mod tests {
     // --- verdict.json parsing: failure classes ------------------------------
 
     /// Build a schema-1 verdict.json document with the given fields
-    /// (`failure_class` omitted when None).
+    /// (`failure_class` omitted when None). Always carries the matching
+    /// `contract_version` echo: a post-handshake producer confirms the
+    /// contract, and the handshake tests below build their mismatching /
+    /// absent / garbled variants on top of this helper.
     fn verdict_doc(
         phase: &str,
         exit_code: i32,
@@ -228,6 +300,7 @@ mod tests {
             "exit_code": exit_code,
             "oom": oom,
             "deadline_exceeded": deadline,
+            "contract_version": CONTRACT_VERSION,
         });
         if let Some(class) = class {
             obj["failure_class"] = serde_json::Value::String(class.to_string());
@@ -553,6 +626,7 @@ mod tests {
                     oom: false,
                     deadline_exceeded: false,
                     failure_class: None,
+                    contract_version: None,
                 };
                 assert_eq!(
                     VerdictJson::from_exit_code(phase, code),
@@ -631,7 +705,140 @@ mod tests {
         }
     }
 
-    // --- property tests ------------------------------------------------------
+    // --- the contract handshake (contract_version echo) ----------------------
+
+    /// Swap the helper's matching echo for `echo_json` (a raw JSON value
+    /// source). Matched against the compact form serde_json actually emits
+    /// (no space after the colon).
+    fn with_echo(doc: &str, echo_json: &str) -> String {
+        doc.replace(
+            &format!(r#""contract_version":"{}""#, CONTRACT_VERSION),
+            &format!(r#""contract_version":{echo_json}"#),
+        )
+    }
+
+    /// The drift signal fires exactly when a present echo differs from
+    /// [`CONTRACT_VERSION`] — a matching echo and an absent echo are both
+    /// "no drift" (the handshake confirmed, or a schema-1 producer predates
+    /// it; see [`CONTRACT_VERSION`] for why absence is tolerance, not drift).
+    #[test]
+    fn contract_drift_signals_exactly_the_mismatching_echo() {
+        let matching = VerdictJson::parse(&verdict_doc("Succeeded", 0, false, false, None))
+            .expect("matching echo must parse");
+        assert_eq!(matching.contract_drift(), None);
+        assert_eq!(matching.contract_version.as_deref(), Some(CONTRACT_VERSION));
+
+        let echo_less =
+            VerdictJson::parse(r#"{"schema_version": 1, "phase": "Succeeded", "exit_code": 0}"#)
+                .expect("echo-less document must parse");
+        assert_eq!(echo_less.contract_version, None);
+        assert_eq!(echo_less.contract_drift(), None);
+
+        for stray in ["\"2\"", "\"0\"", "\"v9\"", "\"\"", "\"1 \""] {
+            let doc = with_echo(&verdict_doc("Succeeded", 0, false, false, None), stray);
+            let vj = VerdictJson::parse(&doc)
+                .unwrap_or_else(|e| panic!("stray echo {stray} must parse: {e}"));
+            let expected = stray.trim_matches('"');
+            assert_eq!(vj.contract_drift(), Some(expected), "echo {stray}");
+        }
+    }
+
+    /// The plan's handshake rule (§"Versioning & compatibility"): a mismatch
+    /// the client can't interpret is InfraFailure with drift semantics,
+    /// never a misread verdict. Across the full field matrix, swapping the
+    /// matching echo for a foreign one flips every document — pass, gate,
+    /// OOM, deadline, whatever — to InfraFailure.
+    #[test]
+    fn property_mismatching_echo_is_infra_failure_across_the_matrix() {
+        for base in all_schema_one_documents() {
+            let expected = VerdictJson::parse(&base).expect("base parses").to_verdict();
+            // Sanity: with the matching echo the matrix classifies normally
+            // (this is what makes the flip below a drift effect, not noise).
+            assert_ne!(expected, Verdict::Cancelled, "matrix verdict is real");
+
+            let drifted = with_echo(&base, r#""9""#);
+            let parsed = VerdictJson::parse(&drifted)
+                .unwrap_or_else(|e| panic!("{drifted}: drift broke parse: {e}"));
+            assert_eq!(parsed.contract_drift(), Some("9"));
+            assert_eq!(
+                parsed.to_verdict(),
+                Verdict::InfraFailure,
+                "foreign echo must read as infra: {drifted}"
+            );
+            assert!(parsed.to_verdict().is_infra_failure());
+        }
+    }
+
+    /// A producer that echoes a non-string shape tried to confirm a contract
+    /// this client cannot read: the document still parses (one fumbled field
+    /// must not cost the rest), but the unreadable echo can never match, so
+    /// it is drift — InfraFailure, not a guessed verdict.
+    #[test]
+    fn garbled_echo_shape_is_drift_not_parse_error() {
+        for garbled in ["42", "true", "[\"1\"]", "{\"v\":1}"] {
+            let doc = with_echo(&verdict_doc("Succeeded", 0, false, false, None), garbled);
+            let parsed = VerdictJson::parse(&doc)
+                .unwrap_or_else(|e| panic!("garbled echo {garbled} must still parse: {e}"));
+            assert!(parsed.contract_drift().is_some(), "garbled {garbled}");
+            assert_eq!(
+                parsed.to_verdict(),
+                Verdict::InfraFailure,
+                "garbled echo {garbled}"
+            );
+        }
+    }
+
+    /// Absence of the echo is tolerance, not drift — the field arrived by
+    /// additive evolution, so a schema-1 producer predating the handshake is
+    /// fully interpretable and the ladder decides exactly as before.
+    #[test]
+    fn absent_echo_is_a_pre_handshake_producer_not_drift() {
+        let pass =
+            VerdictJson::parse(r#"{"schema_version": 1, "phase": "Succeeded", "exit_code": 0}"#)
+                .expect("echo-less pass must parse");
+        assert_eq!(pass.contract_drift(), None);
+        assert_eq!(pass.to_verdict(), Verdict::Pass);
+
+        let gate = VerdictJson::parse(
+            r#"{"schema_version": 1, "phase": "Succeeded", "exit_code": 0,
+                "failure_class": "gate-failure"}"#,
+        )
+        .expect("echo-less gate document must parse");
+        assert_eq!(gate.contract_drift(), None);
+        assert_eq!(gate.to_verdict(), Verdict::GateFailure);
+
+        let oom = VerdictJson::parse(
+            r#"{"schema_version": 1, "phase": "Failed", "exit_code": 137,
+                "oom": true, "deadline_exceeded": false}"#,
+        )
+        .expect("echo-less oom document must parse");
+        assert_eq!(oom.to_verdict(), Verdict::InfraFailure);
+    }
+
+    /// The handshake does not disturb the degradation contract: malformed
+    /// JSON and unsupported schema versions still degrade to exit-code-only
+    /// regardless of any echo they carry — there is no parseable schema-1
+    /// document to handshake with.
+    #[test]
+    fn handshake_does_not_disturb_the_degradation_contract() {
+        assert_eq!(
+            Verdict::interpret(1, Some(r#"{not json, "contract_version": "9"}"#)),
+            Verdict::TestFailure,
+            "unparseable document degrades on the exit code alone"
+        );
+        assert_eq!(
+            Verdict::interpret(
+                0,
+                Some(
+                    r#"{"schema_version": 2, "phase": "Succeeded",
+                "exit_code": 0, "contract_version": "9"}"#
+                )
+            ),
+            Verdict::Pass,
+            "unsupported schema degrades; the echo is never consulted"
+        );
+    }
+
     //
     // Dependency-free property tests over a deterministic generated space:
     // every base document in the full field matrix crossed with every unknown-
@@ -694,7 +901,11 @@ mod tests {
     /// override a parseable document.
     #[test]
     fn property_unknown_fields_never_change_parse_or_verdict() {
-        const NAMES: &[&str] = &["future_field", "contract_version", "toolchain", "node_name"];
+        // contract_version is NOT here: it is a known field since the
+        // contract handshake, and injecting into it is drift semantics —
+        // covered by property_mismatching_echo_is_infra_failure_across_the_matrix
+        // above, not by the unknown-field tolerance.
+        const NAMES: &[&str] = &["future_field", "toolchain", "node_name"];
         let values = unknown_field_values();
 
         for base in all_schema_one_documents() {
@@ -750,6 +961,12 @@ mod tests {
                 assert!(
                     !serialized.contains("failure_class"),
                     "absent failure_class must not serialize: {serialized}"
+                );
+            }
+            if parsed.contract_version.is_none() {
+                assert!(
+                    !serialized.contains("contract_version"),
+                    "absent contract_version must not serialize: {serialized}"
                 );
             }
 
