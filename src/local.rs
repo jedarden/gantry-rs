@@ -243,9 +243,9 @@ impl QueueClass {
 
 /// The single systemd user slice every gantry-spawned local run lands in
 /// (plan Component 6). The slice unit carries the box-level *sum* cap —
-/// `local.slice_cpu_quota_pct` / `local.slice_memory_max` — so the total load
-/// of all gantry runs stays inside it no matter how many per-run scopes nest
-/// beneath.
+/// fixed at 12 CPU / 32G until the `local.slice_*` tuning keys land with
+/// the slice-config surface — so the total load of all gantry runs stays
+/// inside it no matter how many per-run scopes nest beneath.
 pub const SLICE_NAME: &str = "gantry.slice";
 
 /// How the next local child is spawned.
@@ -473,6 +473,13 @@ struct Decision {
 /// [`Self::spawn`], which returns the child's [`ExitStatus`] unchanged — the
 /// systemd-run wrapper (when active) waits for the child and propagates its
 /// exit code, so every call site keeps its existing INV-3 mapping.
+/// Boxwide `gantry.slice` sum-cap defaults (plan Component 6): 12 CPU / 32G.
+/// These mirror the `crate::config::DEFAULT_SLICE_*` surface, which lands
+/// with the slice-config slice; until then the sum cap is fixed here and the
+/// placement cannot be switched off via config.
+const DEFAULT_SLICE_CPU_QUOTA_PCT: u32 = 1200;
+const DEFAULT_SLICE_MEMORY_MAX: &str = "32G";
+
 pub struct SlicePlacement {
     enabled: bool,
     cpu_quota_pct: u32,
@@ -486,11 +493,16 @@ impl SlicePlacement {
     /// Read the placement configuration from the layered config.
     pub fn from_config(config: &Config) -> Self {
         Self {
-            enabled: config.local.slice_enabled,
+            // `local.slice_enabled` (the operator opt-out) and the
+            // `local.slice_*` tuning keys land with the slice-config
+            // surface; until then the placement is always on at the default
+            // sum cap, and `decide` degrades loudly when systemd-run is
+            // unavailable.
+            enabled: true,
             cpu_quota_pct: u32::from(config.local.cpu_quota_pct),
             memory_max: config.local.memory_max.clone(),
-            slice_cpu_quota_pct: config.local.slice_cpu_quota_pct,
-            slice_memory_max: config.local.slice_memory_max.clone(),
+            slice_cpu_quota_pct: DEFAULT_SLICE_CPU_QUOTA_PCT,
+            slice_memory_max: DEFAULT_SLICE_MEMORY_MAX.to_string(),
             decision: std::sync::OnceLock::new(),
         }
     }
@@ -1548,8 +1560,8 @@ mod tests {
             enabled: true,
             cpu_quota_pct: 200,
             memory_max: "6G".to_string(),
-            slice_cpu_quota_pct: crate::config::DEFAULT_SLICE_CPU_QUOTA_PCT,
-            slice_memory_max: crate::config::DEFAULT_SLICE_MEMORY_MAX.to_string(),
+            slice_cpu_quota_pct: super::DEFAULT_SLICE_CPU_QUOTA_PCT,
+            slice_memory_max: super::DEFAULT_SLICE_MEMORY_MAX.to_string(),
             decision: std::sync::OnceLock::new(),
         };
         sp.decision
