@@ -105,6 +105,19 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         eprintln!("[gantry] ineligible: {}", eligibility.reason);
         eprintln!("[gantry] verdict: Ineligible");
 
+        // The runlog classifies this exit as an InfraFailure, so the flight
+        // recorder treats it as one (plan Component 7). No intent record was
+        // written, so the bundle lands under the same stand-in id the verdict
+        // record below carries.
+        record_infra_failure(
+            config,
+            "ineligible",
+            "gate",
+            &eligibility.reason,
+            None,
+            None,
+        );
+
         // Write verdict record if runlog is available
         if let Some(rl) = runlog {
             let _ = write_local_verdict(
@@ -182,6 +195,11 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         eprintln!("[gantry] push failed: {}", push_result.reason);
         eprintln!("[gantry] verdict: PushFailed");
 
+        // Flight recorder (plan Component 7, bf-3mc): the push is where most
+        // infra flakes live (auth, remote reachability), so the bundle gathers
+        // the git state while it is still fresh.
+        record_infra_failure(config, &run_id, "push", &push_result.reason, None, None);
+
         // Write verdict record if runlog is available (infra failure path)
         if let Some(rl) = runlog {
             let _ = write_local_verdict(
@@ -225,6 +243,10 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             eprintln!("[gantry] submit failed: {}", e);
             eprintln!("[gantry] verdict: InfraFailure");
 
+            // Flight recorder (plan Component 7, bf-3mc): the backend's own
+            // error text is the raw response a post-mortem wants.
+            record_infra_failure(config, &run_id, "submit", &e.reason, None, None);
+
             // Write verdict record if runlog is available (infra failure path)
             if let Some(rl) = runlog {
                 let _ = write_local_verdict(
@@ -265,6 +287,18 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             eprintln!("[gantry] wait failed: {}", e);
             eprintln!("[gantry] verdict: InfraFailure");
 
+            // Flight recorder (plan Component 7, bf-3mc): the failure happened
+            // after submit, so the bundle names the handle the run was watched
+            // under.
+            record_infra_failure(
+                config,
+                &run_id,
+                "wait",
+                &e.reason,
+                Some(&handle.handle),
+                None,
+            );
+
             // Write verdict record if runlog is available (infra failure path)
             if let Some(rl) = runlog {
                 let _ = write_verdict(
@@ -287,6 +321,21 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             return 1;
         }
     };
+
+    // A terminal InfraFailure verdict is an infra exit like any other (plan
+    // Component 7, bf-3mc): the run produced no usable verdict, so the bundle
+    // is written even though wait() itself returned cleanly. Checked before
+    // the record below because Verdict is Copy but the runlog write moves it.
+    if verdict == Verdict::InfraFailure {
+        record_infra_failure(
+            config,
+            &run_id,
+            "remote-verdict",
+            "remote run ended in InfraFailure",
+            Some(&handle.handle),
+            None,
+        );
+    }
 
     // Step 6: Write terminal verdict record (successful completion path)
     if let Some(rl) = runlog {
@@ -356,6 +405,36 @@ fn convert_backend_verdict_to_runlog(verdict: Verdict) -> crate::runlog::Verdict
         Verdict::Cancelled => crate::runlog::Verdict::Cancelled,
         Verdict::Superseded => crate::runlog::Verdict::Superseded,
     }
+}
+
+/// Flight recorder entry point for the remote pipeline (plan Component 7,
+/// bf-3mc): snapshot one InfraFailure into the REDACTED crash bundle under
+/// `<state dir>/crash/<run-id>/` ([`crate::crash::record`]). Every site that
+/// prints `verdict: InfraFailure` calls this first, so the bundle always
+/// carries the run id the runlog intent used — `gantry report <run-id>` finds
+/// it. Best effort by construction: the recorder degrades to a single
+/// `[gantry] warning:` line and never changes the verdict, the exit code, or
+/// the trailer the caller is about to write. `handle` names the backend run
+/// when the failure happened after submit; the backend errors this pipeline
+/// sees expose a reason string only, so `backend_response` has nothing honest
+/// to carry here and stays `None`.
+fn record_infra_failure(
+    config: &Config,
+    run_id: &str,
+    stage: &str,
+    reason: &str,
+    handle: Option<&str>,
+    recent_stderr: Option<&str>,
+) {
+    let rec = crate::crash::CrashRecord {
+        run_id,
+        stage,
+        infra_reason: reason,
+        handle,
+        backend_response: None,
+        recent_stderr,
+    };
+    crate::crash::record(config, &rec);
 }
 
 // ============================================================================
