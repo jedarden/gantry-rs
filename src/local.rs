@@ -1030,6 +1030,18 @@ pub fn run_fallback(
         Ok(path) => path,
         Err(why) => {
             eprintln!("[gantry] {why}");
+            // Flight recorder (plan Component 7): the fallback is an
+            // InfraFailure tail like the remote stages, so the bundle is
+            // written before the verdict record closes the run.
+            crate::crash::record_stage(
+                config,
+                ctx.run_id,
+                "fallback-resolve",
+                &why.to_string(),
+                None,
+                None,
+                None,
+            );
             record_fallback_verdict(
                 ctx,
                 Verdict::InfraFailure,
@@ -1058,6 +1070,17 @@ pub fn run_fallback(
         }
         Err(why) => {
             eprintln!("[gantry] failed to run `{}`: {why}", real.display());
+            // Flight recorder (plan Component 7): same InfraFailure tail
+            // contract as the resolve failure above.
+            crate::crash::record_stage(
+                config,
+                ctx.run_id,
+                "fallback-spawn",
+                &why.to_string(),
+                None,
+                None,
+                None,
+            );
             (Verdict::InfraFailure, 1)
         }
     };

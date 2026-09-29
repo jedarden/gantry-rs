@@ -116,6 +116,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             &eligibility.reason,
             None,
             None,
+            None,
         );
 
         // Write verdict record if runlog is available
@@ -198,7 +199,17 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         // Flight recorder (plan Component 7, bf-3mc): the push is where most
         // infra flakes live (auth, remote reachability), so the bundle gathers
         // the git state while it is still fresh.
-        record_infra_failure(config, &run_id, "push", &push_result.reason, None, None);
+        // The pusher's reason is the raw response this stage surfaced, so it
+        // rides both the event line and the backend artifact channel.
+        record_infra_failure(
+            config,
+            &run_id,
+            "push",
+            &push_result.reason,
+            None,
+            Some(&push_result.reason),
+            None,
+        );
 
         // Write verdict record if runlog is available (infra failure path)
         if let Some(rl) = runlog {
@@ -245,7 +256,15 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
 
             // Flight recorder (plan Component 7, bf-3mc): the backend's own
             // error text is the raw response a post-mortem wants.
-            record_infra_failure(config, &run_id, "submit", &e.reason, None, None);
+            record_infra_failure(
+                config,
+                &run_id,
+                "submit",
+                &e.reason,
+                None,
+                Some(&e.reason),
+                None,
+            );
 
             // Write verdict record if runlog is available (infra failure path)
             if let Some(rl) = runlog {
@@ -296,6 +315,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                 "wait",
                 &e.reason,
                 Some(&handle.handle),
+                Some(&e.reason),
                 None,
             );
 
@@ -333,6 +353,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             "remote-verdict",
             "remote run ended in InfraFailure",
             Some(&handle.handle),
+            None,
             None,
         );
     }
@@ -415,15 +436,17 @@ fn convert_backend_verdict_to_runlog(verdict: Verdict) -> crate::runlog::Verdict
 /// it. Best effort by construction: the recorder degrades to a single
 /// `[gantry] warning:` line and never changes the verdict, the exit code, or
 /// the trailer the caller is about to write. `handle` names the backend run
-/// when the failure happened after submit; the backend errors this pipeline
-/// sees expose a reason string only, so `backend_response` has nothing honest
-/// to carry here and stays `None`.
+/// when the failure happened after submit; `backend_response` carries the raw
+/// text the failure site actually surfaced (push/submit/wait hand over the
+/// same string their `[gantry]` line prints) and stays `None` where gantry
+/// generated the reason itself (gate, remote-verdict, the local tails).
 fn record_infra_failure(
     config: &Config,
     run_id: &str,
     stage: &str,
     reason: &str,
     handle: Option<&str>,
+    backend_response: Option<&str>,
     recent_stderr: Option<&str>,
 ) {
     let rec = crate::crash::CrashRecord {
@@ -431,7 +454,7 @@ fn record_infra_failure(
         stage,
         infra_reason: reason,
         handle,
-        backend_response: None,
+        backend_response,
         recent_stderr,
     };
     crate::crash::record(config, &rec);
@@ -567,6 +590,7 @@ fn execute_locally(
             // exec, never fall back to self (plan §1). Loud, recorded, and
             // non-zero, matching the passthrough contract.
             eprintln!("[gantry] {why}");
+            record_infra_failure(config, &run_id, "local-resolve", &why, None, None, None);
             if let Some(rl) = &runlog {
                 let _ = write_local_verdict(
                     rl,
@@ -609,6 +633,15 @@ fn execute_locally(
             // permission denied, exec format error): same loud-and-non-zero
             // contract as a resolution failure.
             eprintln!("[gantry] failed to run `{}`: {why}", real.display());
+            record_infra_failure(
+                config,
+                &run_id,
+                "local-spawn",
+                &why.to_string(),
+                None,
+                None,
+                None,
+            );
             (crate::runlog::Verdict::InfraFailure, 1)
         }
     };
