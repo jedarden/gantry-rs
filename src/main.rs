@@ -164,11 +164,12 @@ fn exit_code_from(exit_code: i32) -> ExitCode {
     ExitCode::from(exit_code_u8)
 }
 
-/// Management CLI: explicit `gantry version` / `gantry help` commands.
+/// Management CLI: explicit `gantry` commands (version, help, on/off,
+/// doctor, quickcheck, …).
 ///
-/// Phase 0.5 implements only version and help (the minimal CLI surface). The
-/// full command set (doctor, why, init, etc.) lands in Phase 1a as the CLI
-/// module grows.
+/// Phase 0.5 shipped only version and help; the command set grows with the
+/// CLI modules (doctor in Phase 1a, `quickcheck` — the Tier-0 proof — in
+/// Phase 1b). `print_usage` stays the one authoritative list of what exists.
 fn run_management_cli(argv: &[String]) -> ExitCode {
     // argv[0] is "gantry"; argv[1] is the subcommand if present.
     let subcommand = argv.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -254,6 +255,12 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
             }
         }
 
+        // quickcheck: the 30-second no-backend sanity check (plan §"CLI
+        // surface", bf-139) — shim resolves, cap works, git ok. The Tier-0
+        // proof: it passes with no backend configured by construction, and
+        // exits 0 iff every required check passed.
+        "quickcheck" => gantry::quickcheck::run(),
+
         // Unknown command: print a hint and exit 2 (conventional for CLI misuse).
         _ => {
             eprintln!("gantry: unknown command '{subcommand}'");
@@ -295,6 +302,7 @@ fn print_usage() {
     println!("  gantry doctor       Run health checks");
     println!("  gantry doctor --e2e Run end-to-end canary test");
     println!("  gantry doctor --drill Run fault-injection fire drill");
+    println!("  gantry quickcheck   30s no-backend sanity: shim, cap, git");
     println!();
     println!("Cargo tool profile:");
     println!("  cargo test          Run cargo test (passthrough in Phase 0.5)");

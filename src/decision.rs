@@ -502,7 +502,18 @@ fn execute_locally(
         }
     };
 
-    let status = std::process::Command::new(&real).args(args).status();
+    // Capped (bf-139, plan §"Tier-0"): the Tier-0 and kill-switch tails are
+    // what make gantry "a pure local cap-wrapper" — the child runs under the
+    // configured per-run cgroup cap exactly as the predecessor bash pair
+    // capped its local runs. The process-wide wrapper probes the launch line
+    // once per process (so an unusable scope degrades before the real run,
+    // even when several local tails fire in one process) and, once scoped,
+    // propagates the child's exit status, so the verdict mapping below is
+    // untouched (INV-3); where a scope cannot be created the degrade is a
+    // plain spawn with a one-per-process `[gantry] cap:` note (plan
+    // Component 6). The boxwide `gantry.slice` placement (bf-xj0) layers on
+    // this same seam later.
+    let status = crate::cap::process_cap(config).spawn(&real, args);
 
     let (verdict, exit_code) = match status {
         Ok(status) => {
