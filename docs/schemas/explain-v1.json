@@ -1,0 +1,88 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "gantry explain --json (schema v1)",
+  "description": "Dry run for a hypothetical invocation: which gates would pass, which backend would be chosen, and the exact ref a real run would push — computed without any network I/O (git status/rev-parse are local). Published per plan 'Versioning & compatibility': additive fields are free, consumers ignore unknown ones, and removing or retyping a field is a major bump (a new file, explain-v2.json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "tool", "subcommand", "args", "intercepted", "kill_switch", "tier0", "decision", "reason", "next_action", "backend", "gates", "detached", "ref", "sha"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "tool": {
+      "type": "string",
+      "description": "First word of the explained command, e.g. \"cargo\"."
+    },
+    "subcommand": {
+      "type": "string",
+      "description": "Second word of the explained command; empty when absent."
+    },
+    "args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "The argv tail the shim would receive, subcommand first (matches the args field of a run record)."
+    },
+    "intercepted": {
+      "type": "boolean",
+      "description": "False means the shim would passthrough untouched; gates were not consulted."
+    },
+    "kill_switch": {
+      "type": ["string", "null"],
+      "description": "Why gantry is disabled (e.g. \"GANTRY_LOCAL=1\", \"state file: gantry off\") when a kill switch decides the run; null when enabled."
+    },
+    "tier0": {
+      "type": "boolean",
+      "description": "True when the zero-config cap-only mode (backend none) is what keeps the run local."
+    },
+    "decision": {
+      "enum": ["remote", "local"],
+      "description": "What a real run would do."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Why this decision; empty on the eligible-remote path."
+    },
+    "next_action": {
+      "type": ["string", "null"],
+      "description": "The exact step to eligibility when the GitGate blocks the run; null otherwise."
+    },
+    "backend": {
+      "type": "string",
+      "description": "Backend a remote run would use (\"argo\" / \"command\"); \"none\" when the decision is local."
+    },
+    "gates": {
+      "type": ["object", "null"],
+      "description": "GitGate inputs as evaluated now; null when the decision was made before the gates (not intercepted, kill switch, tier0).",
+      "additionalProperties": false,
+      "required": ["worktree", "head", "remote", "clean"],
+      "properties": {
+        "worktree": {
+          "type": "boolean"
+        },
+        "head": {
+          "type": "boolean"
+        },
+        "remote": {
+          "type": "boolean"
+        },
+        "clean": {
+          "type": "boolean"
+        }
+      }
+    },
+    "detached": {
+      "type": ["boolean", "null"],
+      "description": "HEAD detached (EC-02: eligible, just noted); null when the gates were not consulted."
+    },
+    "ref": {
+      "type": ["string", "null"],
+      "description": "The exact ref a real run would push, when the decision is remote. The epoch prefix is unix seconds at naming time, so the answer is exact up to the second the hypothetical run starts."
+    },
+    "sha": {
+      "type": ["string", "null"],
+      "description": "The commit sha HEAD resolves to; null when it does not resolve."
+    }
+  }
+}

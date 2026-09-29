@@ -267,6 +267,20 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
         // 2 usage error — same convention as the unknown-command arm below.
         "report" => ExitCode::from(gantry::crash::cli_report(&argv[2..]) as u8),
 
+        // why: replay the last run's gate/decision trace from the write-ahead
+        // ledger (plan §"CLI surface", bf-1n4). Exit codes are why::cli's:
+        // 0 a last run was found, 1 nothing recorded, 2 usage error.
+        "why" => ExitCode::from(gantry::cli::why::cli(&argv[2..]) as u8),
+
+        // explain: the dry run — gates, chosen backend, exact ref, no network
+        // (plan §"CLI surface", bf-1n4). 0 explanation produced, 2 usage.
+        "explain" => ExitCode::from(gantry::cli::explain::cli(&argv[2..]) as u8),
+
+        // status: recent and in-flight runs from the ledger (plan §"CLI
+        // surface", bf-1n4). 0 once arguments parse (an empty ledger is a
+        // valid status), 2 usage error.
+        "status" => ExitCode::from(gantry::cli::status::cli(&argv[2..]) as u8),
+
         // Unknown command: print a hint and exit 2 (conventional for CLI misuse).
         _ => {
             eprintln!("gantry: unknown command '{subcommand}'");
@@ -311,6 +325,11 @@ fn print_usage() {
     println!("  gantry quickcheck   30s no-backend sanity: shim, cap, git");
     println!("  gantry report <id>  Print a run's REDACTED crash bundle");
     println!("                      (--package <dir> copies it out)");
+    println!("  gantry why          Replay the last run's gate/decision trace");
+    println!("                      (--json for the machine contract)");
+    println!("  gantry explain      Dry run: gates, backend, exact ref — no network");
+    println!("                      (explain -- cargo test; add --json)");
+    println!("  gantry status       Recent and in-flight runs (--json, --limit N)");
     println!();
     println!("Cargo tool profile:");
     println!("  cargo test          Run cargo test (passthrough in Phase 0.5)");
