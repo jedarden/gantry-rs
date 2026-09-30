@@ -504,7 +504,10 @@ exec "$@"
             .spawn(Path::new("sh"), &["-c".to_string(), "exit 7".to_string()])
             .expect("plain spawn");
         assert_eq!(status.code(), Some(7));
-        assert_eq!(cap.describe(), "plain exec — no cgroup cap (documented degrade)");
+        assert_eq!(
+            cap.describe(),
+            "plain exec — no cgroup cap (documented degrade)"
+        );
     }
 
     #[test]
