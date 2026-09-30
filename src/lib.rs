@@ -14,4 +14,5 @@ pub mod shim;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod uninstall; // plan §8 installer line: "`gantry uninstall` reverses it"
 pub mod verdict;

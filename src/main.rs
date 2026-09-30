@@ -280,6 +280,11 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
         // 2 usage error — same convention as the unknown-command arm below.
         "report" => ExitCode::from(gantry::crash::cli_report(&argv[2..]) as u8),
 
+        // uninstall: reverse an install — shims, binary, state, config,
+        // slice unit (plan §8: "`gantry uninstall` reverses it"). Exit codes
+        // are uninstall::cli's: 0 clean, 1 leftovers remain, 2 usage error.
+        "uninstall" => ExitCode::from(gantry::uninstall::cli(&argv[2..]) as u8),
+
         // Unknown command: print a hint and exit 2 (conventional for CLI misuse).
         _ => {
             eprintln!("gantry: unknown command '{subcommand}'");
@@ -329,6 +334,8 @@ fn print_usage() {
     println!("  gantry quickcheck   30s no-backend sanity: shim, cap, git");
     println!("  gantry report <id>  Print a run's REDACTED crash bundle");
     println!("                      (--package <dir> copies it out)");
+    println!("  gantry uninstall    Remove shims, binary, state, and config");
+    println!("                      (--dry-run to preview, --keep-config to keep settings)");
     println!();
     println!("Cargo tool profile:");
     println!("  cargo test          Run cargo test (passthrough in Phase 0.5)");

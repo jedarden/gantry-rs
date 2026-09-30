@@ -326,6 +326,21 @@ fn user_unit_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("systemd").join("user"))
 }
 
+/// The slice unit file's path — the single spelling of where the unit lives,
+/// shared by provisioning ([`provision_slice`]) and retirement
+/// (`crate::uninstall`), so the two can never disagree about the location.
+pub(crate) fn slice_unit_path() -> Option<PathBuf> {
+    user_unit_dir().map(|d| d.join(SLICE_NAME))
+}
+
+/// Reload the user systemd manager after a slice-unit change on disk
+/// (provisioning reloads after a write; uninstall after a removal).
+/// Best-effort by contract: the caller degrades with a note — a stale
+/// manager view is never worth failing an uninstall over.
+pub(crate) fn reload_user_manager() -> Result<(), String> {
+    systemctl_user(&["daemon-reload"])
+}
+
 /// Find an executable `name` in a PATH-style string. Pure over the supplied
 /// value: the production caller passes `$PATH`, tests pass their own — no
 /// process-environment mutation in tests.
