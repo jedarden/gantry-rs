@@ -406,6 +406,37 @@ mod tests {
         assert_eq!(vj.to_verdict(), Verdict::Pass);
     }
 
+    /// A `failure_class` whose value is not a JSON string is a malformed
+    /// document, not an unknown class: serde rejects it outright with the
+    /// document-level parse error, and the caller degrades to exit-code-only.
+    /// Leniency is reserved for class *strings* this build does not know —
+    /// see [`unknown_failure_class_degrades_to_absent_not_error`] — and for
+    /// null, which is the documented shape of "absent".
+    #[test]
+    fn invalid_failure_class_value_is_rejected_by_serde() {
+        let bad_values = [
+            "42",
+            "1.5",
+            "true",
+            "false",
+            "[]",
+            r#"{"class": "test-failure"}"#,
+        ];
+        for bad in bad_values {
+            let doc = format!(
+                r#"{{"schema_version": 1, "phase": "Failed", "exit_code": 1,
+                    "failure_class": {bad}}}"#
+            );
+            let err = VerdictJson::parse(&doc)
+                .expect_err(&format!("failure_class {bad} must be rejected by serde"));
+            assert!(
+                err.reason.starts_with("failed to parse verdict.json"),
+                "failure_class {bad}: wrong error: {}",
+                err.reason
+            );
+        }
+    }
+
     // --- verdict.json parsing: schema and defaults --------------------------
 
     /// Optional fields are truly optional: the minimal schema-1 document
@@ -459,6 +490,31 @@ mod tests {
             assert!(
                 err.reason.starts_with("failed to parse verdict.json"),
                 "{doc:?}: wrong error: {}",
+                err.reason
+            );
+        }
+    }
+
+    /// The two schema versions the required-case list names explicitly — 0
+    /// (pre-versioning) and 2 (the first future version) — are rejected with
+    /// an error that names the offending version, so a producer/consumer
+    /// version mismatch is diagnosable from the message alone and callers
+    /// degrade to exit-code-only rather than guessing.
+    #[test]
+    fn schema_version_zero_and_two_are_rejected_with_a_clear_error() {
+        for version in [0u32, 2] {
+            let doc =
+                format!(r#"{{"schema_version": {version}, "phase": "Succeeded", "exit_code": 0}}"#);
+            let err = VerdictJson::parse(&doc)
+                .expect_err(&format!("schema_version {version} must be rejected"));
+            assert!(
+                err.reason.contains("schema version"),
+                "{version}: wrong error: {}",
+                err.reason
+            );
+            assert!(
+                err.reason.contains(&version.to_string()),
+                "{version}: error must name the version: {}",
                 err.reason
             );
         }
@@ -529,6 +585,29 @@ mod tests {
         assert_eq!(verdict, Verdict::GateFailure);
         assert!(!verdict.is_infra_failure());
         assert!(verdict.has_test_result());
+    }
+
+    /// The other canonical gate shape (moved here from the argo backend's old
+    /// parser tests): the suite passed but the gate failed, so the remote
+    /// wraps the run as overall exit 1 with explicit gate attribution. The
+    /// attribution must survive that failing exit code — a GateFailure is a
+    /// test result (never the local-fallback InfraFailure) and it reports the
+    /// exit code a test failure would.
+    #[test]
+    fn gate_failure_attribution_survives_a_failing_exit_code() {
+        let vj = VerdictJson::parse(&verdict_doc(
+            "Failed",
+            1,
+            false,
+            false,
+            Some("gate-failure"),
+        ))
+        .expect("gate document must parse");
+        let verdict = vj.to_verdict();
+        assert_eq!(verdict, Verdict::GateFailure);
+        assert!(!verdict.is_infra_failure());
+        assert!(verdict.has_test_result());
+        assert_eq!(verdict.to_exit_code(), 1);
     }
 
     /// The exit-code ladder inside to_verdict: with no infra signals and no

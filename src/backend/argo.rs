@@ -1171,60 +1171,13 @@ mod tests {
         assert_eq!(config.base_url, None);
     }
 
-    #[test]
-    fn test_verdict_json_parse_pass() {
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Succeeded",
-            "exit_code": 0,
-            "oom": false,
-            "deadline_exceeded": false
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        assert_eq!(vj.to_verdict(), Verdict::Pass);
-    }
-
-    #[test]
-    fn test_verdict_json_parse_test_failure() {
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "test-failure"
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        assert_eq!(vj.to_verdict(), Verdict::TestFailure);
-    }
-
-    #[test]
-    fn test_verdict_json_parse_oom_is_infra_failure() {
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": true,
-            "deadline_exceeded": false
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        assert_eq!(vj.to_verdict(), Verdict::InfraFailure);
-    }
-
-    #[test]
-    fn test_verdict_json_parse_unsupported_version() {
-        let json = r#"{
-            "schema_version": 2,
-            "phase": "Succeeded",
-            "exit_code": 0
-        }"#;
-
-        let result = VerdictJson::parse(json);
-        assert!(result.is_err());
-    }
+    // verdict.json parser tests (schema versioning, failure_class presence /
+    // absence / invalid shapes, oom and deadline_exceeded defaults, the verdict
+    // ladder) live in src/verdict.rs — the single definition site of the
+    // verdict.json schema — rather than being duplicated here against the
+    // extraction (bf-2jnj, gantry-3eb02ee9). The tests below cover the
+    // *backend* side: wait() feeding a fetched verdict.json document through
+    // VerdictJson::parse to the Verdict it reports.
 
     #[test]
     fn test_argo_backend_describe_without_base_url() {
@@ -1284,92 +1237,6 @@ mod tests {
             description,
             "https://argo.example.com/workflows/my-namespace/test-workflow-abc123"
         );
-    }
-
-    #[test]
-    fn test_verdict_json_parse_gate_failure() {
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "gate-failure"
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        assert_eq!(vj.to_verdict(), Verdict::GateFailure);
-    }
-
-    #[test]
-    fn test_verdict_json_gate_failure_with_tests_passed() {
-        // Scenario: tests passed (exit 0) but clippy gate failed (overall exit 1)
-        // The verdict.json explicitly indicates gate failure
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "gate-failure"
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        let verdict = vj.to_verdict();
-
-        assert_eq!(verdict, Verdict::GateFailure);
-        // Verify gate failure never triggers local fallback (infra-only)
-        assert!(!verdict.is_infra_failure());
-        // Verify gate failure is considered a test result (tests ran)
-        assert!(verdict.has_test_result());
-    }
-
-    #[test]
-    fn test_verdict_json_test_failure_vs_gate_failure() {
-        // Test failure: no failure_class, exit 1, phase Failed
-        let test_json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false
-        }"#;
-
-        let test_vj = VerdictJson::parse(test_json).unwrap();
-        assert_eq!(test_vj.to_verdict(), Verdict::TestFailure);
-
-        // Gate failure: explicit failure_class
-        let gate_json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "gate-failure"
-        }"#;
-
-        let gate_vj = VerdictJson::parse(gate_json).unwrap();
-        assert_eq!(gate_vj.to_verdict(), Verdict::GateFailure);
-    }
-
-    #[test]
-    fn test_verdict_json_gate_failure_not_infra_failure() {
-        // Gate failures should NOT trigger local fallback
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "gate-failure"
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        let verdict = vj.to_verdict();
-
-        assert_eq!(verdict, Verdict::GateFailure);
-        assert_eq!(verdict.to_exit_code(), 1); // Same exit code as test failure
-        assert!(!verdict.is_infra_failure()); // Does NOT trigger local fallback
     }
 
     /// Write an executable mock kubectl into `dir` and return its path
