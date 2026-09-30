@@ -11,7 +11,7 @@
 
 use crate::backend::command::CommandBackend;
 use crate::backend::{BackendError, RemoteBackend, RunSpec, Verdict};
-use crate::config::Config;
+use crate::config::{Backend, Config};
 use crate::refs::RefPusher;
 use crate::runlog::{
     Decision as RunLogDecision, Durations, GateInputs, IntentRecord, RanLocation, RunLog,
@@ -20,7 +20,7 @@ use crate::runlog::{
 use crate::state;
 use std::fs;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Run the decision pipeline for an intercepted subcommand.
 ///
@@ -315,7 +315,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             as u64;
 
     let run_start = Instant::now();
-    let deadline = Instant::now() + config.command_deadline();
+    let deadline = Instant::now() + backend_wait_deadline(config);
     let verdict_result = backend.wait(&handle, deadline);
     let run_duration_ms = run_start.elapsed().as_millis() as u64;
 
@@ -654,7 +654,7 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
             as u64;
 
     let run_start = Instant::now();
-    let deadline = Instant::now() + config.command_deadline();
+    let deadline = Instant::now() + backend_wait_deadline(config);
     let verdict = match backend.wait(&handle, deadline) {
         Ok(v) => v,
         Err(e) => {
@@ -876,6 +876,21 @@ fn record_infra_failure(
         recent_stderr,
     };
     crate::crash::record(config, &rec);
+}
+
+/// The wait/stream deadline for the run's configured backend: the
+/// per-backend override with the global `[remote] deadline_minutes` as
+/// fallback (features.md v1.x "timeout/deadline config per backend"). The
+/// argo backend resolves through [`Config::argo_deadline`] — its
+/// `remote.argo.deadline_minutes` override — never the generic deadline;
+/// the command templates keep [`Config::command_deadline`]. Tier-0 never
+/// enters a remote wait, so its arm exists only to keep the match
+/// exhaustive.
+fn backend_wait_deadline(config: &Config) -> Duration {
+    match config.remote.backend {
+        Backend::Argo => config.argo_deadline(),
+        Backend::None | Backend::Command => config.command_deadline(),
+    }
 }
 
 /// Render the stderr line a failed `backend.wait()` reports.
@@ -1313,6 +1328,62 @@ mod tests {
                 wait_failure_line(&e, "h-1"),
                 "[gantry] wait failed: command not found: my-ci"
             );
+        }
+    }
+
+    mod backend_deadline_resolution {
+        use super::*;
+        use crate::config::ArgoConfig;
+
+        #[test]
+        fn argo_backend_resolves_through_the_argo_override() {
+            // An argo-configured run's wait deadline is argo_deadline()'s —
+            // the per-backend override wins even when it is shorter than the
+            // global, and the command override (present but for a different
+            // backend) must not bleed into it.
+            let mut config = Config::hardcoded();
+            config.remote.backend = Backend::Argo;
+            config.remote.deadline_minutes = 40;
+            config.remote.argo = Some(ArgoConfig {
+                deadline_minutes: Some(3),
+                ..Default::default()
+            });
+            assert_eq!(backend_wait_deadline(&config), Duration::from_secs(3 * 60));
+        }
+
+        #[test]
+        fn argo_backend_inherits_the_global_without_an_override() {
+            // An argo table without deadline_minutes — and no table at all —
+            // inherits the global: None means "inherit", not "unbounded".
+            let mut config = Config::hardcoded();
+            config.remote.backend = Backend::Argo;
+            config.remote.deadline_minutes = 7;
+            config.remote.argo = Some(ArgoConfig::default());
+            assert_eq!(backend_wait_deadline(&config), Duration::from_secs(7 * 60));
+
+            config.remote.argo = None;
+            assert_eq!(backend_wait_deadline(&config), Duration::from_secs(7 * 60));
+        }
+
+        #[test]
+        fn command_backend_keeps_the_command_deadline() {
+            // The command templates are untouched by the argo override: the
+            // pairing is per-backend, so a command-configured run resolves
+            // its own key even when the argo table carries one.
+            let mut config = Config::hardcoded();
+            config.remote.backend = Backend::Command;
+            config.remote.deadline_minutes = 40;
+            config.remote.argo = Some(ArgoConfig {
+                deadline_minutes: Some(3),
+                ..Default::default()
+            });
+            config.remote.command = Some(crate::config::CommandConfig {
+                submit: vec![],
+                logs: vec![],
+                wait: vec![],
+                deadline_minutes: Some(5),
+            });
+            assert_eq!(backend_wait_deadline(&config), Duration::from_secs(5 * 60));
         }
     }
 

@@ -888,6 +888,24 @@ impl GantryConfig {
         Duration::from_secs(minutes * 60)
     }
 
+    /// Get the argo backend's effective remote-run deadline as a Duration.
+    ///
+    /// The per-backend override (`remote.argo.deadline_minutes`,
+    /// features.md v1.x "timeout/deadline config per backend") wins when set;
+    /// `None` — and an absent `[remote.argo]` table — inherits the global
+    /// `[remote] deadline_minutes`. The argo-backend wait path resolves its
+    /// `Instant` deadline through this, never through [`Self::deadline`], so
+    /// a configured override cannot be silently dropped at the watch loop.
+    pub fn argo_deadline(&self) -> Duration {
+        let minutes = self
+            .remote
+            .argo
+            .as_ref()
+            .and_then(|a| a.deadline_minutes)
+            .unwrap_or(self.remote.deadline_minutes);
+        Duration::from_secs(minutes * 60)
+    }
+
     // ============================================================================
     // Path helpers
     // ============================================================================
@@ -1940,6 +1958,68 @@ mod tests {
         Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
 
         assert_eq!(cfg.command_deadline(), Duration::from_secs(5 * 60));
+        assert_eq!(cfg.deadline(), Duration::from_secs(40 * 60));
+    }
+
+    #[test]
+    fn argo_deadline_inherits_global_without_argo_table() {
+        // No [remote.argo] table at all: the global deadline applies.
+        let mut cfg = Config::tier_0_defaults();
+        cfg.remote.deadline_minutes = 7;
+        assert!(cfg.remote.argo.is_none());
+        assert_eq!(cfg.argo_deadline(), Duration::from_secs(7 * 60));
+    }
+
+    #[test]
+    fn argo_deadline_inherits_global_when_override_absent() {
+        // An argo table without deadline_minutes inherits the global —
+        // `None` means "inherit", not "unbounded".
+        let mut cfg = Config::tier_0_defaults();
+        cfg.remote.deadline_minutes = 7;
+        cfg.remote.argo = Some(ArgoConfig {
+            deadline_minutes: None,
+            ..Default::default()
+        });
+        assert_eq!(cfg.argo_deadline(), Duration::from_secs(7 * 60));
+    }
+
+    #[test]
+    fn argo_deadline_override_wins_over_global() {
+        // The point of the per-backend key (features.md v1.x): a configured
+        // override beats the global for the argo backend — including when
+        // it is shorter.
+        let mut cfg = Config::tier_0_defaults();
+        cfg.remote.deadline_minutes = 40;
+        cfg.remote.argo = Some(ArgoConfig {
+            deadline_minutes: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(cfg.argo_deadline(), Duration::from_secs(3 * 60));
+    }
+
+    #[test]
+    fn argo_deadline_override_survives_the_load_path() {
+        // End to end through merge_layer: the override a user wrote in TOML
+        // is what argo_deadline() resolves, while the global key keeps its
+        // own value (the two must not bleed into each other).
+        let mut cfg = Config::tier_0_defaults();
+        let temp = TempDir::new().unwrap();
+        let config = write_test_config(
+            temp.path(),
+            r#"
+            [remote]
+            backend = "argo"
+            deadline_minutes = 40
+
+            [remote.argo]
+            deadline_minutes = 5
+            "#,
+        );
+
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
+
+        assert_eq!(cfg.argo_deadline(), Duration::from_secs(5 * 60));
         assert_eq!(cfg.deadline(), Duration::from_secs(40 * 60));
     }
 
