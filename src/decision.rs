@@ -886,12 +886,25 @@ fn record_infra_failure(
 /// deadline exceeded prints the handle) because a timed-out run reads
 /// differently from every other backend failure: nothing is wrong with the
 /// code under test — the budget ran out, no verdict exists to report
-/// (DD-4), and the run continues through the InfraFailure tail. Every other
-/// wait failure keeps the generic `[gantry] wait failed:` line carrying the
-/// backend's reason.
+/// (DD-4), and the run continues through the InfraFailure tail. The expiry
+/// abandons the watch without cancelling the run, so when the backend
+/// carries a run URL/identifier ([`BackendError::run_url`] — the argo
+/// backend's `describe()`: the UI URL, or a bare identifier with no
+/// `base_url`) the line appends it: the "here's-the-run-URL message"
+/// (features.md v1.x) telling the operator where the abandoned run can
+/// still be watched. Every other wait failure keeps the generic
+/// `[gantry] wait failed:` line carrying the backend's reason.
 fn wait_failure_line(e: &BackendError, handle: &str) -> String {
     if e.deadline_exceeded {
-        format!("[gantry] timeout: run {handle} exceeded its deadline before a verdict was returned")
+        match e.run_url.as_deref() {
+            Some(url) => format!(
+                "[gantry] timeout: run {handle} exceeded its deadline before a verdict was \
+                 returned; the abandoned run can still be watched at {url}"
+            ),
+            None => format!(
+                "[gantry] timeout: run {handle} exceeded its deadline before a verdict was returned"
+            ),
+        }
     } else {
         format!("[gantry] wait failed: {}", e.reason)
     }
@@ -1254,6 +1267,41 @@ mod tests {
             assert!(
                 line.contains("workflow-abc-123"),
                 "timeout line must name the run, got: {line}"
+            );
+            assert!(line.contains("[gantry] timeout"));
+        }
+
+        #[test]
+        fn timeout_line_appends_the_run_url_the_backend_provides() {
+            // The argo backend's expiry carries describe() — the UI URL the
+            // operator needs once gantry stops watching (features.md v1.x
+            // "here's-the-run-URL message"). Dropping it on the way from the
+            // backend error to stderr would strand the abandoned run.
+            let e = BackendError::deadline_with_url(
+                "workflow gantry-abc123 deadline exceeded while polling status.phase",
+                "https://argo.example.com/workflows/argo-workflows/gantry-abc123",
+            );
+            assert_eq!(
+                wait_failure_line(&e, "gantry-abc123"),
+                "[gantry] timeout: run gantry-abc123 exceeded its deadline before a verdict \
+                 was returned; the abandoned run can still be watched at \
+                 https://argo.example.com/workflows/argo-workflows/gantry-abc123"
+            );
+        }
+
+        #[test]
+        fn timeout_line_prints_a_bare_identifier_as_the_run_url() {
+            // argo without a base_url describes the run as a bare identifier,
+            // not a URL — the line prints whatever the backend handed over
+            // either way, so the operator can always find the run.
+            let e = BackendError::deadline_with_url(
+                "workflow gantry-nourl deadline exceeded while polling status.phase",
+                "workflow/gantry-nourl",
+            );
+            let line = wait_failure_line(&e, "gantry-nourl");
+            assert!(
+                line.contains("workflow/gantry-nourl"),
+                "timeout line must carry the backend's run identifier, got: {line}"
             );
             assert!(line.contains("[gantry] timeout"));
         }
