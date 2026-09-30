@@ -882,7 +882,7 @@ mod tests {
             out.leftovers
         );
         assert_eq!(out.removed_binary, None);
-        assert_eq!(out.removed_shims, Vec::new());
+        assert_eq!(out.removed_shims, Vec::<PathBuf>::new());
         assert!(binary.is_file(), "the misnamed binary must survive");
         // Everything else still went.
         assert!(!state.exists());
@@ -915,7 +915,7 @@ mod tests {
         let out = execute(&targets, &path_var, &options(false, false));
 
         assert!(out.is_clean(), "{:?}", out.leftovers);
-        assert_eq!(out.removed_shims, vec![copy]);
+        assert_eq!(out.removed_shims, vec![copy.clone()]);
         assert!(!copy.exists(), "the copy must be gone");
         assert_eq!(out.cargo_resolves_to, Some(real_cargo));
     }
