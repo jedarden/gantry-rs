@@ -1508,6 +1508,7 @@ mod tests {
                 ],
                 logs: vec!["echo".to_string()],
                 wait: vec!["true".to_string()],
+                deadline_minutes: None,
             }),
         };
         let mut tools = HashMap::new();

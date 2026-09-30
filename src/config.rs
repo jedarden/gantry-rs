@@ -51,6 +51,14 @@ pub const DEFAULT_FALLBACK_SLOTS: u32 = 3;
 /// storm of typical suites drains before a waiter abandons the queue.
 pub const DEFAULT_FALLBACK_WAIT_SECS: u64 = 3600;
 
+/// Default wall-clock deadline for a remote run, in minutes (plan §2).
+/// Forty minutes — the same budget the reference Argo template enforces
+/// workflow-side (contrib/argo), so client and cluster expire a stalled run
+/// together. Every deadline key (`[remote]` and the per-backend overrides)
+/// must be at least 1; a zero duration is rejected at load because it would
+/// expire every remote run before it starts.
+pub const DEFAULT_DEADLINE_MINUTES: u64 = 40;
+
 /// Default box-level *sum* CPU cap carried by `gantry.slice`, as a
 /// percentage of one core (plan Component 6: "configurable, e.g. 12 CPU /
 /// 32G" — 1200% = 12 cores). The per-run caps bound one run; this bounds
@@ -114,7 +122,9 @@ pub struct RemoteConfig {
     /// Ref push mode: "ref" (default) or "branch" (legacy escape hatch).
     /// REPO-LAYER RESTRICTED per S-2.
     pub push_mode: PushMode,
-    /// Wall-clock deadline for remote runs (default: 40 minutes).
+    /// Wall-clock deadline for remote runs, in minutes (default:
+    /// [`DEFAULT_DEADLINE_MINUTES`]). Must be at least 1 — zero is rejected
+    /// at load.
     pub deadline_minutes: u64,
     /// Argo Workflows backend configuration.
     pub argo: Option<ArgoConfig>,
@@ -194,6 +204,11 @@ pub struct ArgoConfig {
     /// Base URL for Argo UI (optional, for describe() to return human-readable URLs).
     /// Example: "https://argo-ci.ardenone.com" or "http://localhost:8080"
     pub base_url: Option<String>,
+    /// Per-backend run deadline override, in minutes (features.md v1.x).
+    /// `None` inherits the global `[remote] deadline_minutes`; a value here
+    /// wins for this backend only. Must be at least 1 — zero is rejected at
+    /// load.
+    pub deadline_minutes: Option<u64>,
 }
 
 impl Default for ArgoConfig {
@@ -206,6 +221,7 @@ impl Default for ArgoConfig {
             generate_name: default_generate_name(),
             builder_image: None,
             base_url: None,
+            deadline_minutes: None,
         }
     }
 }
@@ -219,6 +235,12 @@ pub struct CommandConfig {
     pub logs: Vec<String>,
     /// Wait command for verdict: exit code 0=pass, 1=test-fail, >=2=infra-fail.
     pub wait: Vec<String>,
+    /// Per-backend run deadline override, in minutes (features.md v1.x).
+    /// `None` inherits the global `[remote] deadline_minutes`; a value here
+    /// wins for this backend only. Must be at least 1 — zero is rejected at
+    /// load. The repo layer cannot set it — the whole `[remote.command]`
+    /// table is user-layer only (trust boundary S-2).
+    pub deadline_minutes: Option<u64>,
 }
 
 // ============================================================================
@@ -289,6 +311,7 @@ struct RawArgo {
     generate_name: Option<String>,
     builder_image: Option<String>,
     base_url: Option<String>,
+    deadline_minutes: Option<u64>,
     #[serde(flatten)]
     unknown: HashMap<String, toml::Value>,
 }
@@ -298,6 +321,7 @@ struct RawCommand {
     submit: Vec<String>,
     logs: Vec<String>,
     wait: Vec<String>,
+    deadline_minutes: Option<u64>,
     #[serde(flatten)]
     unknown: HashMap<String, toml::Value>,
 }
@@ -532,7 +556,7 @@ impl GantryConfig {
                 backend: Backend::None,
                 ci_remote: "origin".to_string(),
                 push_mode: PushMode::Ref,
-                deadline_minutes: 40,
+                deadline_minutes: DEFAULT_DEADLINE_MINUTES,
                 argo: None,
                 command: None,
             },
@@ -744,7 +768,17 @@ impl GantryConfig {
                 None => {}
             }
 
+            // Deadline durations must be positive: a zero duration expires
+            // every remote run before it starts, so the layer is rejected
+            // (fail-closed to LKG/Tier-0 by the caller) with the key named.
+            // Negative durations cannot be represented — TOML rejects them
+            // at parse time with the same effect.
             if let Some(v) = remote.deadline_minutes {
+                if v == 0 {
+                    return Err("remote.deadline_minutes must be at least 1; \
+                                a zero duration expires every remote run immediately"
+                        .to_string());
+                }
                 base.remote.deadline_minutes = v;
             }
 
@@ -772,6 +806,15 @@ impl GantryConfig {
                 if let Some(v) = argo.base_url {
                     merged.base_url = Some(v);
                 }
+                if let Some(v) = argo.deadline_minutes {
+                    if v == 0 {
+                        return Err("remote.argo.deadline_minutes must be at least 1; \
+                                    a zero duration expires every remote run immediately \
+                                    (remove the key to inherit the global deadline)"
+                            .to_string());
+                    }
+                    merged.deadline_minutes = Some(v);
+                }
                 base.remote.argo = Some(merged);
             }
 
@@ -782,10 +825,17 @@ impl GantryConfig {
                         "repo config cannot set command backend (trust boundary S-2)".to_string(),
                     );
                 }
+                if command.deadline_minutes == Some(0) {
+                    return Err("remote.command.deadline_minutes must be at least 1; \
+                                a zero duration expires every remote run immediately \
+                                (remove the key to inherit the global deadline)"
+                        .to_string());
+                }
                 base.remote.command = Some(CommandConfig {
                     submit: command.submit,
                     logs: command.logs,
                     wait: command.wait,
+                    deadline_minutes: command.deadline_minutes,
                 });
             }
         }
@@ -1065,12 +1115,14 @@ impl GantryConfig {
                     generate_name: Some(a.generate_name.clone()),
                     builder_image: a.builder_image.clone(),
                     base_url: a.base_url.clone(),
+                    deadline_minutes: a.deadline_minutes,
                     unknown: HashMap::new(),
                 }),
                 command: config.remote.command.as_ref().map(|c| RawCommand {
                     submit: c.submit.clone(),
                     logs: c.logs.clone(),
                     wait: c.wait.clone(),
+                    deadline_minutes: c.deadline_minutes,
                     unknown: HashMap::new(),
                 }),
                 unknown: HashMap::new(),
@@ -1138,6 +1190,7 @@ mod tests {
         assert!(cfg.local.slice_enabled);
         assert_eq!(cfg.local.slice_cpu_quota_pct, DEFAULT_SLICE_CPU_QUOTA_PCT);
         assert_eq!(cfg.local.slice_memory_max, DEFAULT_SLICE_MEMORY_MAX);
+        assert_eq!(cfg.remote.deadline_minutes, DEFAULT_DEADLINE_MINUTES);
         assert!(cfg.intercepts("cargo", "test"));
     }
 
@@ -1463,6 +1516,7 @@ mod tests {
             generate_name = "gantry-"
             builder_image = "ronaldraygun/gantry-builder:1.83"
             base_url = "https://argo-ci.example.com"
+            deadline_minutes = 30
             "#,
         );
         let mut warnings = Vec::new();
@@ -1492,9 +1546,201 @@ mod tests {
             Some("ronaldraygun/gantry-builder:1.83".to_string())
         );
         assert_eq!(
+            argo.deadline_minutes,
+            Some(30),
+            "per-backend deadline dropped across the LKG round trip"
+        );
+        assert_eq!(
             restored.remote.argo.as_ref(),
             cfg.remote.argo.as_ref(),
             "argo block drifted across the LKG round trip"
+        );
+    }
+
+    // ========================================================================
+    // Per-backend deadline config (gantry-ac285465)
+    // ========================================================================
+
+    /// A per-backend deadline set in a config file parses and reaches the
+    /// backend config struct, and later layers override earlier ones
+    /// key-granularly — the plumbing contract this bead ships (the
+    /// enforcement that reads it lands separately).
+    #[test]
+    fn per_backend_deadline_reaches_backend_config_struct() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            deadline_minutes = 30
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote.argo]
+            deadline_minutes = 15
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), repo.as_deref()).unwrap();
+        let argo = result.config.remote.argo.expect("argo config present");
+        assert_eq!(argo.deadline_minutes, Some(15), "repo layer overrides user layer");
+
+        // The global deadline is untouched by a per-backend override.
+        assert_eq!(result.config.remote.deadline_minutes, DEFAULT_DEADLINE_MINUTES);
+    }
+
+    /// Same plumbing for the command-template backend's deadline override.
+    #[test]
+    fn command_backend_deadline_reaches_backend_config_struct() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "command"
+
+            [remote.command]
+            submit = ["echo", "{repo}"]
+            logs = ["cat"]
+            wait = ["true"]
+            deadline_minutes = 25
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+        let command = result.config.remote.command.expect("command config present");
+        assert_eq!(command.deadline_minutes, Some(25));
+        assert_eq!(result.config.remote.deadline_minutes, DEFAULT_DEADLINE_MINUTES);
+    }
+
+    /// A config that never mentions a deadline loads with the Tier-0 default:
+    /// the global budget, and per-backend overrides left None ("inherit the
+    /// global") — backward compatible with every config written before the
+    /// key existed.
+    #[test]
+    fn config_without_deadline_loads_with_tier0_default() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            namespace = "gantry-tests"
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+        assert_eq!(
+            result.config.remote.deadline_minutes,
+            DEFAULT_DEADLINE_MINUTES
+        );
+        let argo = result.config.remote.argo.expect("argo config present");
+        assert_eq!(
+            argo.deadline_minutes, None,
+            "unset per-backend deadline inherits the global"
+        );
+    }
+
+    /// Zero durations are rejected at load, with the offending key named —
+    /// a deadline of 0 would expire every remote run before it starts. The
+    /// caller fail-closes to LKG/Tier-0 on the same Err path as a parse
+    /// error.
+    #[test]
+    fn zero_global_deadline_minutes_rejected() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            deadline_minutes = 0
+            "#,
+        );
+
+        let err = Config::load_layers(None, user.as_deref(), None).unwrap_err();
+        assert!(
+            err.contains("remote.deadline_minutes") && err.contains("at least 1"),
+            "error should name the key and the requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_argo_deadline_minutes_rejected() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            deadline_minutes = 0
+            "#,
+        );
+
+        let err = Config::load_layers(None, user.as_deref(), None).unwrap_err();
+        assert!(
+            err.contains("remote.argo.deadline_minutes") && err.contains("at least 1"),
+            "error should name the key and the requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_command_deadline_minutes_rejected() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "command"
+
+            [remote.command]
+            submit = ["echo", "{repo}"]
+            logs = ["cat"]
+            wait = ["true"]
+            deadline_minutes = 0
+            "#,
+        );
+
+        let err = Config::load_layers(None, user.as_deref(), None).unwrap_err();
+        assert!(
+            err.contains("remote.command.deadline_minutes") && err.contains("at least 1"),
+            "error should name the key and the requirement: {err}"
+        );
+    }
+
+    /// Negative durations are not representable in the schema: TOML rejects
+    /// the value at parse time, which rejects the layer through the same
+    /// fail-closed Err path.
+    #[test]
+    fn negative_deadline_minutes_rejected() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            deadline_minutes = -5
+            "#,
+        );
+
+        let err = Config::load_layers(None, user.as_deref(), None).unwrap_err();
+        assert!(
+            err.contains("parse error"),
+            "a negative duration is a parse-level rejection: {err}"
         );
     }
 
@@ -1603,7 +1849,10 @@ mod tests {
     #[test]
     fn deadline_returns_duration() {
         let cfg = Config::tier_0_defaults();
-        assert_eq!(cfg.deadline(), Duration::from_secs(40 * 60));
+        assert_eq!(
+            cfg.deadline(),
+            Duration::from_secs(DEFAULT_DEADLINE_MINUTES * 60)
+        );
     }
 
     #[test]
