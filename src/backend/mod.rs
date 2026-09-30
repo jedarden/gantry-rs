@@ -121,11 +121,19 @@ impl fmt::Display for Verdict {
 /// Error type for backend operations.
 ///
 /// Phase 0.5: minimal string-based error type.
-/// Phase 1a will expand this to include InfraFailure classification.
+/// Phase 1a: the structured `deadline_exceeded` flag (features.md v1.x
+/// "timeout/deadline config per backend") lets the caller distinguish a run
+/// that outlived its deadline from every other backend failure. Both are
+/// InfraFailure — but a deadline expiry prints the "timed out, here's the
+/// run URL" line instead of the generic wait-failure line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackendError {
     /// Human-readable reason for the error.
     pub reason: String,
+    /// True when the error is a deadline expiry (the run's configured
+    /// timeout elapsed before a verdict). Never true for spawn errors,
+    /// parse errors, or remote test results.
+    pub deadline_exceeded: bool,
 }
 
 impl BackendError {
@@ -133,6 +141,16 @@ impl BackendError {
     pub fn new(reason: &str) -> Self {
         BackendError {
             reason: reason.to_string(),
+            deadline_exceeded: false,
+        }
+    }
+
+    /// Create a deadline-expiry BackendError: the run outlived its
+    /// configured timeout without producing a verdict.
+    pub fn deadline(reason: &str) -> Self {
+        BackendError {
+            reason: reason.to_string(),
+            deadline_exceeded: true,
         }
     }
 }

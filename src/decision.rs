@@ -10,7 +10,7 @@
 // short-circuits to passthrough/local when GANTRY_LOCAL=1 or Tier-0 (no backend).
 
 use crate::backend::command::CommandBackend;
-use crate::backend::{RemoteBackend, RunSpec, Verdict};
+use crate::backend::{BackendError, RemoteBackend, RunSpec, Verdict};
 use crate::config::Config;
 use crate::refs::RefPusher;
 use crate::runlog::{
@@ -313,14 +313,14 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             as u64;
 
     let run_start = Instant::now();
-    let deadline = Instant::now() + config.deadline();
+    let deadline = Instant::now() + config.command_deadline();
     let verdict_result = backend.wait(&handle, deadline);
     let run_duration_ms = run_start.elapsed().as_millis() as u64;
 
     let verdict = match verdict_result {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[gantry] wait failed: {}", e);
+            report_wait_failure(&e, &handle.handle);
             eprintln!("[gantry] verdict: InfraFailure");
 
             // Flight recorder (plan Component 7, bf-3mc): the failure happened
@@ -475,6 +475,30 @@ fn record_infra_failure(
         recent_stderr,
     };
     crate::crash::record(config, &rec);
+}
+
+/// Render the stderr line a failed `backend.wait()` reports.
+///
+/// A deadline expiry (the backend's structured `deadline_exceeded` flag,
+/// features.md v1.x "timeout/deadline config per backend") gets the
+/// `[gantry] timeout` line naming the run (plan §"failure modes": a client
+/// deadline exceeded prints the handle) because a timed-out run reads
+/// differently from every other backend failure: nothing is wrong with the
+/// code under test — the budget ran out, no verdict exists to report
+/// (DD-4), and the run continues through the InfraFailure tail. Every other
+/// wait failure keeps the generic `[gantry] wait failed:` line carrying the
+/// backend's reason.
+fn wait_failure_line(e: &BackendError, handle: &str) -> String {
+    if e.deadline_exceeded {
+        format!("[gantry] timeout: run {handle} exceeded its deadline before a verdict was returned")
+    } else {
+        format!("[gantry] wait failed: {}", e.reason)
+    }
+}
+
+/// Report a failed `backend.wait()` on stderr (see [`wait_failure_line`]).
+fn report_wait_failure(e: &BackendError, handle: &str) {
+    eprintln!("{}", wait_failure_line(e, handle));
 }
 
 // ============================================================================
@@ -790,6 +814,42 @@ mod tests {
         // but we can verify the function signature and basic flow compiles.
         // The real test is the integration test in tests/integration.rs.
         let _ = (config, repo_url, sha, args);
+    }
+
+    mod wait_failure_reporting {
+        use super::*;
+
+        #[test]
+        fn deadline_expiry_prints_the_timeout_line_naming_the_run() {
+            let e = BackendError::deadline("run h-9 deadline exceeded");
+            assert_eq!(
+                wait_failure_line(&e, "h-9"),
+                "[gantry] timeout: run h-9 exceeded its deadline before a verdict was returned"
+            );
+        }
+
+        #[test]
+        fn timeout_line_takes_the_identifier_from_the_handle_not_the_reason() {
+            // The identifier must come from the handle argument — a backend
+            // that phrases its expiry differently (or embeds nothing at all)
+            // still gets the run named on the timeout line.
+            let e = BackendError::deadline("totally different phrasing");
+            let line = wait_failure_line(&e, "workflow-abc-123");
+            assert!(
+                line.contains("workflow-abc-123"),
+                "timeout line must name the run, got: {line}"
+            );
+            assert!(line.contains("[gantry] timeout"));
+        }
+
+        #[test]
+        fn other_wait_failures_keep_the_generic_line() {
+            let e = BackendError::new("command not found: my-ci");
+            assert_eq!(
+                wait_failure_line(&e, "h-1"),
+                "[gantry] wait failed: command not found: my-ci"
+            );
+        }
     }
 
     mod tier0_notice {

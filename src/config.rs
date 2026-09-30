@@ -869,6 +869,25 @@ impl GantryConfig {
         Duration::from_secs(self.remote.deadline_minutes * 60)
     }
 
+    /// Get the command backend's effective remote-run deadline as a Duration.
+    ///
+    /// The per-backend override (`remote.command.deadline_minutes`,
+    /// features.md v1.x "timeout/deadline config per backend") wins when set;
+    /// `None` — and an absent `[remote.command]` table — inherits the global
+    /// `[remote] deadline_minutes`. The command-backend wait paths resolve
+    /// their `Instant` deadline through this, never through
+    /// [`Self::deadline`], so a configured override cannot be silently
+    /// dropped at the wait loop.
+    pub fn command_deadline(&self) -> Duration {
+        let minutes = self
+            .remote
+            .command
+            .as_ref()
+            .and_then(|c| c.deadline_minutes)
+            .unwrap_or(self.remote.deadline_minutes);
+        Duration::from_secs(minutes * 60)
+    }
+
     // ============================================================================
     // Path helpers
     // ============================================================================
@@ -1853,6 +1872,75 @@ mod tests {
             cfg.deadline(),
             Duration::from_secs(DEFAULT_DEADLINE_MINUTES * 60)
         );
+    }
+
+    #[test]
+    fn command_deadline_inherits_global_without_command_table() {
+        // No [remote.command] table at all: the global deadline applies.
+        let mut cfg = Config::tier_0_defaults();
+        cfg.remote.deadline_minutes = 7;
+        assert!(cfg.remote.command.is_none());
+        assert_eq!(cfg.command_deadline(), Duration::from_secs(7 * 60));
+    }
+
+    #[test]
+    fn command_deadline_inherits_global_when_override_absent() {
+        // A command table without deadline_minutes inherits the global —
+        // `None` means "inherit", not "unbounded".
+        let mut cfg = Config::tier_0_defaults();
+        cfg.remote.deadline_minutes = 7;
+        cfg.remote.command = Some(CommandConfig {
+            submit: vec!["submit-cmd".to_string()],
+            logs: vec!["logs-cmd".to_string()],
+            wait: vec!["wait-cmd".to_string()],
+            deadline_minutes: None,
+        });
+        assert_eq!(cfg.command_deadline(), Duration::from_secs(7 * 60));
+    }
+
+    #[test]
+    fn command_deadline_override_wins_over_global() {
+        // The point of the per-backend key (features.md v1.x): a configured
+        // override beats the global for the command backend — including when
+        // it is shorter.
+        let mut cfg = Config::tier_0_defaults();
+        cfg.remote.deadline_minutes = 40;
+        cfg.remote.command = Some(CommandConfig {
+            submit: vec![],
+            logs: vec![],
+            wait: vec![],
+            deadline_minutes: Some(3),
+        });
+        assert_eq!(cfg.command_deadline(), Duration::from_secs(3 * 60));
+    }
+
+    #[test]
+    fn command_deadline_override_survives_the_load_path() {
+        // End to end through merge_layer: the override a user wrote in TOML
+        // is what command_deadline() resolves, while the global key keeps
+        // its own value (the two must not bleed into each other).
+        let mut cfg = Config::tier_0_defaults();
+        let temp = TempDir::new().unwrap();
+        let config = write_test_config(
+            temp.path(),
+            r#"
+            [remote]
+            backend = "command"
+            deadline_minutes = 40
+
+            [remote.command]
+            submit = ["submit-cmd"]
+            logs = ["logs-cmd"]
+            wait = ["wait-cmd"]
+            deadline_minutes = 5
+            "#,
+        );
+
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
+
+        assert_eq!(cfg.command_deadline(), Duration::from_secs(5 * 60));
+        assert_eq!(cfg.deadline(), Duration::from_secs(40 * 60));
     }
 
     #[test]
