@@ -18,6 +18,8 @@ use crate::runlog::{
     VerdictRecord,
 };
 use crate::state;
+use std::fs;
+use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Run the decision pipeline for an intercepted subcommand.
@@ -50,13 +52,22 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// This guarantees that SIGKILL mid-run leaves an orphaned intent that doctor
 /// can report (INV-1), making silently-skipped runs structurally detectable.
 pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -> i32 {
-    // Check kill switches (gantry off state file, GANTRY_ON=0)
+    // Check kill switches (gantry off state file, GANTRY_ON=0). Disabled means
+    // gantry is fully transparent: the run executes locally (plan flow
+    // "disabled → LocalExecutor"), still recorded so nothing is silently
+    // skipped (INV-1).
     let (enabled, source) = state::check_enabled();
     if !enabled {
         eprintln!("[gantry] kill switch active: {}", source);
         eprintln!("[gantry] decision: local execution (kill switch)");
-        // Would fall back to local execution here, but for now return 1
-        return 1;
+        return execute_locally(
+            config,
+            repo_url,
+            sha,
+            args,
+            &format!("kill switch: {source}"),
+            "none",
+        );
     }
 
     // Open the runlog (creates state directory if needed)
@@ -347,6 +358,289 @@ fn convert_backend_verdict_to_runlog(verdict: Verdict) -> crate::runlog::Verdict
     }
 }
 
+// ============================================================================
+// Tier-0: zero-config local execution (plan §"Tier-0 zero-config")
+// ============================================================================
+
+/// Rate limit for the Tier-0 notice line: at most once per hour. Plan
+/// §"Tier-0 zero-config": the tier is noted "at most once per hour
+/// (state-file timestamp) so transcripts see it without per-run noise".
+const TIER0_NOTICE_INTERVAL_SECS: u64 = 3600;
+
+/// Run an intercepted subcommand under Tier-0 defaults (`backend = "none"`).
+///
+/// Tier-0 is the zero-config default: with no config file anywhere, gantry is
+/// a pure local cap-wrapper and nothing goes remote (plan §"Tier-0"). An
+/// intercepted subcommand never enters the remote pipeline — no GitGate
+/// eligibility, no RefPusher, no backend submit — but interception still
+/// applies the full RunLog treatment: a write-ahead intent record with
+/// `decision: local` plus a terminal verdict record, so `gantry why` can
+/// replay the decision truthfully (INV-1).
+///
+/// The kill switch is checked first: `gantry off` must make gantry fully
+/// transparent, so a disabled gantry runs locally without the tier notice —
+/// the user switched gantry off rather than merely leaving it unconfigured.
+pub fn run_tier0(config: &Config, repo_url: &str, sha: &str, args: &[String]) -> i32 {
+    let (enabled, source) = state::check_enabled();
+    if !enabled {
+        eprintln!("[gantry] kill switch active: {}", source);
+        eprintln!("[gantry] decision: local execution (kill switch)");
+        return execute_locally(
+            config,
+            repo_url,
+            sha,
+            args,
+            &format!("kill switch: {source}"),
+            "none",
+        );
+    }
+
+    eprintln!("[gantry] decision: local execution (Tier-0: no backend configured)");
+    note_tier0();
+    execute_locally(
+        config,
+        repo_url,
+        sha,
+        args,
+        "Tier-0: no backend configured (zero-config cap-only)",
+        "none",
+    )
+}
+
+/// Execute an intercepted subcommand locally, with the full RunLog treatment.
+///
+/// This is the shared tail of every local decision path (Tier-0, kill
+/// switch): a write-ahead intent record (`decision: local`, INV-1), the real
+/// binary resolved by the shim (never a fallback-to-self, plan §1), then a
+/// terminal verdict record and a faithful exit code (INV-3). Exit 0 maps to
+/// [`crate::runlog::Verdict::Pass`], any other exit to `TestFailure` — the
+/// suite's own failure is not an infra failure. A binary that cannot be
+/// resolved or spawned is an `InfraFailure`: loud, recorded, non-zero — never
+/// a silent success.
+///
+/// Returns the child's exit code, or 1 when nothing could be run.
+fn execute_locally(
+    config: &Config,
+    repo_url: &str,
+    sha: &str,
+    args: &[String],
+    reason: &str,
+    backend: &str,
+) -> i32 {
+    // Open the runlog first (per EC-08, proceed with in-memory records only
+    // if it cannot be opened). Its state directory is the same one the
+    // Tier-0 notice timestamp lives in — note_tier0() has usually created it
+    // by now, and RunLog::open tolerates an existing directory.
+    let runlog = match RunLog::open() {
+        Ok(rl) => Some(rl),
+        Err(e) => {
+            eprintln!(
+                "[gantry] warning: cannot open runlog: {}. Proceeding without logging.",
+                e
+            );
+            None
+        }
+    };
+
+    // Gate inputs are replay context for `gantry why`, not an eligibility
+    // check — a local run is never gated — so a failed git query degrades to
+    // `false` exactly as in the remote pipeline.
+    let gate_start = Instant::now();
+    let gate_inputs = GateInputs {
+        worktree: crate::gate::is_inside_work_tree().unwrap_or(false),
+        head: crate::gate::head_resolves().unwrap_or(false),
+        remote: crate::gate::remote_exists(&config.remote.ci_remote).unwrap_or(false),
+        clean: crate::gate::is_tree_clean().unwrap_or(false),
+    };
+    let gate_duration_ms = gate_start.elapsed().as_millis() as u64;
+
+    let run_id = if let Some(rl) = &runlog {
+        let intent = IntentRecord::new(
+            "cargo".to_string(),
+            args.to_vec(),
+            repo_url.to_string(),
+            sha.to_string(),
+            std::path::PathBuf::from("."),
+            gate_inputs,
+            RunLogDecision::Local,
+            reason.to_string(),
+            backend.to_string(),
+        );
+        match rl.open_intent(&intent) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!(
+                    "[gantry] warning: cannot write intent record: {}. Proceeding without logging.",
+                    e
+                );
+                fallback_run_id()
+            }
+        }
+    } else {
+        fallback_run_id()
+    };
+
+    let run_start = Instant::now();
+    let real = match crate::shim::resolve_real_binary(config) {
+        Ok(path) => path,
+        Err(why) => {
+            // Resolution failure OR the self-recursion guard's refusal: never
+            // exec, never fall back to self (plan §1). Loud, recorded, and
+            // non-zero, matching the passthrough contract.
+            eprintln!("[gantry] {why}");
+            if let Some(rl) = &runlog {
+                let _ = write_local_verdict(
+                    rl,
+                    run_id,
+                    crate::runlog::Verdict::InfraFailure,
+                    1,
+                    Some(local_durations(gate_duration_ms, &run_start)),
+                );
+            }
+            eprintln!("[gantry] verdict: InfraFailure");
+            return 1;
+        }
+    };
+
+    // Capped (bf-139, plan §"Tier-0"): the Tier-0 and kill-switch tails are
+    // what make gantry "a pure local cap-wrapper" — the child runs under the
+    // configured per-run cgroup cap exactly as the predecessor bash pair
+    // capped its local runs. The process-wide wrapper probes the launch line
+    // once per process (so an unusable scope degrades before the real run,
+    // even when several local tails fire in one process) and, once scoped,
+    // propagates the child's exit status, so the verdict mapping below is
+    // untouched (INV-3); where a scope cannot be created the degrade is a
+    // plain spawn with a one-per-process `[gantry] cap:` note (plan
+    // Component 6). The boxwide `gantry.slice` placement (bf-xj0) layers on
+    // this same seam later.
+    let status = crate::cap::process_cap(config).spawn(&real, args);
+
+    let (verdict, exit_code) = match status {
+        Ok(status) => {
+            let code = status_to_i32(status);
+            let verdict = if code == 0 {
+                crate::runlog::Verdict::Pass
+            } else {
+                crate::runlog::Verdict::TestFailure
+            };
+            (verdict, code)
+        }
+        Err(why) => {
+            // The binary resolved but would not run (missing exec bit,
+            // permission denied, exec format error): same loud-and-non-zero
+            // contract as a resolution failure.
+            eprintln!("[gantry] failed to run `{}`: {why}", real.display());
+            (crate::runlog::Verdict::InfraFailure, 1)
+        }
+    };
+
+    if let Some(rl) = &runlog {
+        let _ = write_local_verdict(
+            rl,
+            run_id,
+            verdict,
+            exit_code,
+            Some(local_durations(gate_duration_ms, &run_start)),
+        );
+    }
+
+    eprintln!("[gantry] verdict: {verdict}");
+    exit_code
+}
+
+/// Durations for a local run: only gate and run are meaningful; push and
+/// queue are remote-pipeline stages that never happened.
+fn local_durations(gate_ms: u64, run_start: &Instant) -> Durations {
+    Durations {
+        gate: gate_ms,
+        push: 0,
+        queue: 0,
+        run: run_start.elapsed().as_millis() as u64,
+    }
+}
+
+/// Generate a run_id when no runlog is available to mint one.
+///
+/// The stand-in keeps the verdict record schema-valid when the intent could
+/// not be written (or the runlog could not be opened): the pair correlation
+/// is then impossible by construction, but the record still carries a
+/// well-formed `run_id` instead of a lie.
+fn fallback_run_id() -> String {
+    format!(
+        "fallback-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    )
+}
+
+/// Map a child's exit status to a faithful i32 (INV-3): success → 0, a normal
+/// exit code verbatim, and on Unix death-by-signal S → 128+S (the shell's
+/// `$?` convention, matching the shim's passthrough mapping).
+fn status_to_i32(status: std::process::ExitStatus) -> i32 {
+    if status.success() {
+        return 0;
+    }
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        128 + status.signal().unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        1
+    }
+}
+
+/// Print the Tier-0 notice, at most once per hour.
+///
+/// Plan §"Tier-0 zero-config": "a `[gantry]` line notes the tier at most once
+/// per hour (state-file timestamp) so transcripts see it without per-run
+/// noise". The timestamp lives in `<state dir>/tier0-notice` (unix seconds)
+/// next to the runlog. Any failure to record it degrades to printing the
+/// notice — the tier line is never silently suppressed by a broken state
+/// file, and a failed timestamp write never blocks the run.
+fn note_tier0() {
+    let notice = "[gantry] Tier-0: no remote backend configured; running locally \
+                  (zero-config cap-only mode)";
+    let Some(dir) = state::StateFile::state_dir() else {
+        // Nowhere to record the hour: show the tier rather than go silent.
+        eprintln!("{notice}");
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if tier0_notice_due_in(&dir, now) {
+        eprintln!("{notice}");
+        // The state directory may not exist yet (this runs before RunLog::open
+        // could create it); create it so the timestamp actually lands.
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::write(dir.join("tier0-notice"), now.to_string());
+    }
+}
+
+/// Whether a Tier-0 notice is due, given the notice-timestamp directory and
+/// the current unix time. `true` when the file is missing, unreadable, or
+/// garbage (degrade open — the tier line is never silently suppressed), or
+/// when [`TIER0_NOTICE_INTERVAL_SECS`] have elapsed since the last notice.
+fn tier0_notice_due_in(dir: &Path, now: u64) -> bool {
+    match fs::read_to_string(dir.join("tier0-notice")) {
+        Ok(content) => content
+            .trim()
+            .parse::<u64>()
+            .map(|ts| now.saturating_sub(ts) >= TIER0_NOTICE_INTERVAL_SECS)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +661,77 @@ mod tests {
         // but we can verify the function signature and basic flow compiles.
         // The real test is the integration test in tests/integration.rs.
         let _ = (config, repo_url, sha, args);
+    }
+
+    mod tier0_notice {
+        use super::*;
+        use tempfile::TempDir;
+
+        #[test]
+        fn due_when_no_timestamp_file_exists() {
+            let dir = TempDir::new().unwrap();
+            assert!(tier0_notice_due_in(dir.path(), 1_000_000));
+        }
+
+        #[test]
+        fn suppressed_within_the_hour() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("tier0-notice"), "1000000").unwrap();
+            assert!(!tier0_notice_due_in(dir.path(), 1_000_000 + 3599));
+        }
+
+        #[test]
+        fn due_again_after_an_hour() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("tier0-notice"), "1000000").unwrap();
+            assert!(tier0_notice_due_in(dir.path(), 1_000_000 + 3600));
+        }
+
+        #[test]
+        fn clock_going_backwards_does_not_spam_the_notice() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("tier0-notice"), "2000000").unwrap();
+            assert!(!tier0_notice_due_in(dir.path(), 1_000_000));
+        }
+
+        #[test]
+        fn garbage_timestamp_degrades_to_due() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("tier0-notice"), "not-a-timestamp").unwrap();
+            assert!(tier0_notice_due_in(dir.path(), 1_000_000));
+        }
+
+        #[test]
+        fn surrounding_whitespace_is_tolerated() {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("tier0-notice"), " 1000000\n").unwrap();
+            assert!(!tier0_notice_due_in(dir.path(), 1_000_000 + 60));
+        }
+    }
+
+    mod local_exit_codes {
+        use super::*;
+
+        #[test]
+        fn success_maps_to_zero() {
+            let status = std::process::Command::new("true").status().unwrap();
+            assert_eq!(status_to_i32(status), 0);
+        }
+
+        #[test]
+        fn exit_code_is_faithful() {
+            let status = std::process::Command::new("false").status().unwrap();
+            assert_eq!(status_to_i32(status), 1);
+
+            let script = if cfg!(unix) { "exit 42" } else { "" };
+            if script.is_empty() {
+                return;
+            }
+            let status = std::process::Command::new("sh")
+                .args(["-c", script])
+                .status()
+                .unwrap();
+            assert_eq!(status_to_i32(status), 42);
+        }
     }
 }

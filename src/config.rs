@@ -41,6 +41,16 @@ pub struct GantryConfig {
 /// [`GantryConfig`], matching the plan and bead naming.
 pub type Config = GantryConfig;
 
+/// Default concurrent capped local *fallback* runs per box (plan Component 6
+/// "fallback admission semaphore"). The kernel-enforced pool itself lives in
+/// [`crate::local`]; this is the configured size of the pool.
+pub const DEFAULT_FALLBACK_SLOTS: u32 = 3;
+
+/// Default bounded wait for a fallback slot, in seconds (plan Component 6).
+/// One hour — above the 40-minute default remote deadline, so a fallback
+/// storm of typical suites drains before a waiter abandons the queue.
+pub const DEFAULT_FALLBACK_WAIT_SECS: u64 = 3600;
+
 /// Local execution resource limits.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalConfig {
@@ -50,6 +60,15 @@ pub struct LocalConfig {
     pub memory_max: String,
     /// Apply cgroup cap to passthrough invocations (default: true).
     pub cap_passthrough: bool,
+    /// Concurrent capped local *fallback* runs allowed (plan Component 6:
+    /// the fallback admission semaphore's slot count, enforced by
+    /// `crate::local`). Default 3. A remote outage under a fleet degrades as
+    /// a serialized trickle, not a stampede.
+    pub fallback_slots: u32,
+    /// Bounded wait for a fallback slot, in seconds (default 3600). Past the
+    /// bound the run proceeds without a slot — loudly — because a verdict
+    /// (INV-1) outranks the admission cap.
+    pub fallback_wait_secs: u64,
 }
 
 /// Tool-specific configuration (e.g., cargo).
@@ -135,6 +154,8 @@ impl std::fmt::Display for ConfigLayer {
 /// Argo Workflows backend configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArgoConfig {
+    /// Path to the kubectl binary (default: "kubectl", resolved via PATH).
+    pub kubectl_path: String,
     /// Path to kubeconfig (default: "~/.kube/config").
     pub kubeconfig: PathBuf,
     /// Kubernetes namespace.
@@ -143,9 +164,27 @@ pub struct ArgoConfig {
     pub template: String,
     /// Workflow name prefix (default: "gantry-").
     pub generate_name: String,
+    /// Builder image passed as the template's `builder-image` parameter
+    /// (optional; omitted from the manifest when unset so the template
+    /// default applies).
+    pub builder_image: Option<String>,
     /// Base URL for Argo UI (optional, for describe() to return human-readable URLs).
     /// Example: "https://argo-ci.ardenone.com" or "http://localhost:8080"
     pub base_url: Option<String>,
+}
+
+impl Default for ArgoConfig {
+    fn default() -> Self {
+        ArgoConfig {
+            kubectl_path: default_kubectl_path(),
+            kubeconfig: PathBuf::from(default_kubeconfig()),
+            namespace: default_namespace(),
+            template: default_template(),
+            generate_name: default_generate_name(),
+            builder_image: None,
+            base_url: None,
+        }
+    }
 }
 
 /// Command-template backend configuration.
@@ -163,60 +202,69 @@ pub struct CommandConfig {
 // TOML deserialization structures
 // ============================================================================
 
+// Every raw struct carries an `unknown` flatten map: keys we do not recognize
+// land there instead of failing the parse, and merge_layer turns them into
+// warnings (forward compatibility — warn, never error). The map value is
+// `toml::Value`, not `serde_json::Value`, so even a TOML datetime in an
+// unknown key still buffers instead of erroring.
+//
+// Typed fields are Option so that merge can tell "key absent" (inherit the
+// lower layer's value) from "key present" (override). This is what makes the
+// merge key-granular: a layer that sets cpu_quota_pct must not reset the
+// memory_max a lower layer already chose.
+
 #[derive(Deserialize, Serialize)]
 struct RawConfig {
     local: Option<RawLocal>,
     #[serde(default)]
     tool: HashMap<String, RawTool>,
     remote: Option<RawRemote>,
-    // Unknown keys go here and trigger warnings
     #[serde(flatten)]
-    _unknown: HashMap<String, serde_json::Value>,
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct RawLocal {
-    #[serde(default = "default_cpu_quota")]
-    cpu_quota_pct: u8,
-    #[serde(default = "default_memory_max")]
-    memory_max: String,
-    #[serde(default = "default_cap_passthrough")]
-    cap_passthrough: bool,
+    cpu_quota_pct: Option<u8>,
+    memory_max: Option<String>,
+    cap_passthrough: Option<bool>,
+    fallback_slots: Option<u32>,
+    fallback_wait_secs: Option<u64>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct RawTool {
-    #[serde(default)]
-    intercept: Vec<String>,
+    intercept: Option<Vec<String>>,
     real_binary: Option<String>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct RawRemote {
-    #[serde(default = "default_backend")]
-    backend: String,
-    #[serde(default = "default_ci_remote")]
-    ci_remote: String,
-    #[serde(default = "default_push_mode")]
-    push_mode: String,
-    #[serde(default = "default_deadline")]
-    deadline_minutes: u64,
+    backend: Option<String>,
+    ci_remote: Option<String>,
+    push_mode: Option<String>,
+    deadline_minutes: Option<u64>,
     argo: Option<RawArgo>,
     command: Option<RawCommand>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct RawArgo {
-    #[serde(default = "default_kubeconfig")]
-    kubeconfig: String,
-    #[serde(default = "default_namespace")]
-    namespace: String,
-    #[serde(default = "default_template")]
-    template: String,
-    #[serde(default = "default_generate_name")]
-    generate_name: String,
-    #[serde(default)]
+    kubectl_path: Option<String>,
+    kubeconfig: Option<String>,
+    namespace: Option<String>,
+    template: Option<String>,
+    generate_name: Option<String>,
+    builder_image: Option<String>,
     base_url: Option<String>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -224,30 +272,14 @@ struct RawCommand {
     submit: Vec<String>,
     logs: Vec<String>,
     wait: Vec<String>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
-// Default functions
-
-fn default_cpu_quota() -> u8 {
-    200
-}
-fn default_memory_max() -> String {
-    "6G".to_string()
-}
-fn default_cap_passthrough() -> bool {
-    true
-}
-fn default_backend() -> String {
-    "none".to_string()
-}
-fn default_ci_remote() -> String {
-    "origin".to_string()
-}
-fn default_push_mode() -> String {
-    "ref".to_string()
-}
-fn default_deadline() -> u64 {
-    40
+// Default functions — the [remote.argo] baseline. Shared between serde-free
+// construction (ArgoConfig::default) and key-granular layer merging.
+fn default_kubectl_path() -> String {
+    "kubectl".to_string()
 }
 fn default_kubeconfig() -> String {
     "~/.kube/config".to_string()
@@ -314,28 +346,79 @@ impl GantryConfig {
     /// Returns the loaded config, any warnings (e.g., unknown keys), and
     /// an optional broken-config banner if serving from last-known-good.
     pub fn load() -> ConfigLoadResult {
+        // Resolve the real layer and state paths; a path that cannot be
+        // determined is simply absent (state_dir absent disables the LKG
+        // mechanism entirely — the fallback is then always Tier-0).
+        let system = Self::system_config_path().ok();
+        let user = Self::user_config_path().ok();
+        let repo = Self::repo_config_path();
+        let state_dir = Self::state_dir().ok();
+
+        Self::load_with_paths(
+            system.as_deref(),
+            user.as_deref(),
+            repo.as_deref(),
+            state_dir.as_deref(),
+        )
+    }
+
+    /// [`load`](Self::load) with every filesystem location supplied by the
+    /// caller — the testable core of the last-known-good contract (Q-7).
+    ///
+    /// Like [`load_layers`](Self::load_layers) this touches no
+    /// process-global state: `state_dir` holds the LKG snapshot and the
+    /// broken-config marker. Failure posture is never silent and never
+    /// blocking:
+    ///
+    /// - clean load → config served, snapshot refreshed, broken marker
+    ///   cleared (a fix stops the banner and resets escalation);
+    /// - broken config + usable snapshot → snapshot served with a
+    ///   broken-config banner whose run count escalates;
+    /// - broken config, no usable snapshot → Tier-0 defaults, banner still
+    ///   shown, and every degradation reason on stderr.
+    fn load_with_paths(
+        system: Option<&Path>,
+        user: Option<&Path>,
+        repo: Option<&Path>,
+        state_dir: Option<&Path>,
+    ) -> ConfigLoadResult {
         let mut warnings = Vec::new();
         let mut broken_banner = None;
 
         // Try loading from layers; if corrupted, use LKG snapshot.
-        let load_result = Self::load_from_layers(&mut warnings);
+        let load_result = Self::load_layers(system, user, repo);
         let config = match load_result {
-            Ok(cfg) => {
-                // Config parsed successfully - persist as LKG snapshot.
-                let _ = Self::persist_lkg(&cfg);
-                cfg
+            Ok(result) => {
+                warnings.extend(result.warnings);
+                // Config parsed successfully — refresh the LKG snapshot and
+                // retire the banner: the marker must not survive a fix, or a
+                // later incident would inherit the old count and "since".
+                if let Some(dir) = state_dir {
+                    let _ = Self::persist_lkg_in(dir, &result.config);
+                    Self::clear_broken_marker_in(dir);
+                }
+                result.config
             }
             Err(err) => {
                 // Config broken - try LKG snapshot.
                 eprintln!("[gantry] config broken: {}, using last-known-good", err);
-                match Self::load_lkg(&mut warnings, &mut broken_banner) {
-                    Ok(cfg) => cfg,
-                    Err(_) => {
-                        // No LKG - fail open to Tier-0 defaults.
-                        eprintln!("[gantry] no last-known-good snapshot, using Tier-0 defaults");
-                        Self::tier_0_defaults()
+                let lkg = state_dir.and_then(|dir| {
+                    match Self::load_lkg_in(dir, &mut warnings, &mut broken_banner) {
+                        Ok(cfg) => Some(cfg),
+                        Err(e) => {
+                            // The snapshot itself is missing or corrupt — say
+                            // why instead of lumping it in with "no snapshot".
+                            eprintln!("[gantry] last-known-good snapshot unusable: {}", e);
+                            None
+                        }
                     }
-                }
+                });
+                lkg.unwrap_or_else(|| {
+                    // No LKG - fail open to Tier-0 defaults (still bannered —
+                    // the marker was written by load_lkg_in).
+                    eprintln!("[gantry] no usable last-known-good snapshot, using Tier-0 defaults");
+                    Self::tier_0_defaults()
+                })
             }
         };
 
@@ -346,16 +429,64 @@ impl GantryConfig {
         }
     }
 
+    /// Merge the three config layers over the Tier-0 defaults — the actual
+    /// layering/resolution logic, with every path supplied by the caller.
+    ///
+    /// This is [`load`](Self::load) minus process-global state: no `/etc`,
+    /// no `$HOME`, no cwd walk, no last-known-good reads or writes. `None`
+    /// means the layer is absent; a `Some` path that does not exist is
+    /// skipped the same way. Tests drive this directly against fixture
+    /// files to prove layering end-to-end.
+    ///
+    /// On success the [`ConfigLoadResult`] carries the merged config plus
+    /// every warning (unknown keys, ignored trust-boundary keys). On
+    /// failure — unreadable file, parse error, or a repo-layer trust-
+    /// boundary violation — returns Err and the caller falls back
+    /// (last-known-good, then Tier-0).
+    pub fn load_layers(
+        system: Option<&Path>,
+        user: Option<&Path>,
+        repo: Option<&Path>,
+    ) -> Result<ConfigLoadResult, String> {
+        let mut warnings = Vec::new();
+        let mut config = Self::tier_0_defaults();
+
+        // Later layers override earlier ones, key by key.
+        for (layer, path) in [
+            (ConfigLayer::System, system),
+            (ConfigLayer::User, user),
+            (ConfigLayer::Repo, repo),
+        ] {
+            let Some(path) = path else { continue };
+            if !path.exists() {
+                continue;
+            }
+            Self::merge_layer(&mut config, path, layer, &mut warnings)?;
+        }
+
+        Ok(ConfigLoadResult {
+            config,
+            warnings,
+            broken_banner: None,
+        })
+    }
+
     /// Tier-0 zero-config defaults: cap-only mode, no remote backend.
     ///
     /// This is the behavior when no config file exists or when the system
     /// has no valid config at all. Gantry becomes a pure local cap-wrapper.
-    fn tier_0_defaults() -> Self {
+    ///
+    /// Public because the Tier-0 baseline is a documented surface, not an
+    /// internal default: the stampede harness (tests/stampede/) and the
+    /// upcoming `gantry quickcheck` build on exactly these defaults.
+    pub fn tier_0_defaults() -> Self {
         GantryConfig {
             local: LocalConfig {
                 cpu_quota_pct: 200,
                 memory_max: "6G".to_string(),
                 cap_passthrough: true,
+                fallback_slots: DEFAULT_FALLBACK_SLOTS,
+                fallback_wait_secs: DEFAULT_FALLBACK_WAIT_SECS,
             },
             tools: {
                 let mut map = HashMap::new();
@@ -387,44 +518,13 @@ impl GantryConfig {
         Self::tier_0_defaults()
     }
 
-    /// Load configuration from the three layers in precedence order.
-    fn load_from_layers(warnings: &mut Vec<String>) -> Result<Self, String> {
-        let mut base_config = Self::tier_0_defaults();
-
-        // Layer 1: System config (/etc/gantry/config.toml)
-        if let Ok(system_path) = Self::system_config_path() {
-            if system_path.exists() {
-                Self::merge_layer(
-                    &mut base_config,
-                    &system_path,
-                    ConfigLayer::System,
-                    warnings,
-                )?;
-            }
-        }
-
-        // Layer 2: User config (~/.config/gantry/config.toml)
-        if let Ok(user_path) = Self::user_config_path() {
-            if user_path.exists() {
-                Self::merge_layer(&mut base_config, &user_path, ConfigLayer::User, warnings)?;
-            }
-        }
-
-        // Layer 3: Repo config (.gantry.toml) - WITH TRUST BOUNDARY
-        if let Some(repo_path) = Self::repo_config_path() {
-            if repo_path.exists() {
-                Self::merge_layer(&mut base_config, &repo_path, ConfigLayer::Repo, warnings)?;
-            }
-        }
-
-        Ok(base_config)
-    }
-
     /// Merge a single config layer into the base config.
     ///
-    /// If `layer` is [`ConfigLayer::Repo`], enforces trust boundary:
-    /// ci_remote, push_mode, and command backend cannot be modified from
-    /// the repo config.
+    /// The merge is key-granular: only keys the layer actually sets override
+    /// the base; everything else inherits what a lower layer chose (or the
+    /// Tier-0 default). If `layer` is [`ConfigLayer::Repo`], enforces the
+    /// trust boundary: ci_remote, push_mode, and command templates cannot be
+    /// modified from the repo config.
     fn merge_layer(
         base: &mut GantryConfig,
         path: &Path,
@@ -435,84 +535,183 @@ impl GantryConfig {
         let content =
             fs::read_to_string(path).map_err(|e| format!("{}: failed to read: {}", layer, e))?;
 
-        // Check for unknown keys at TOML parse time.
+        // Parse never rejects unknown keys; each struct's flatten map
+        // captures them and they are reported below (warn, never error).
         let raw: RawConfig =
             toml::from_str(&content).map_err(|e| format!("{}: parse error: {}", layer, e))?;
 
-        // Warn about unknown top-level sections.
-        let _ = &raw._unknown;
-
-        // Merge local config.
-        if let Some(local) = raw.local {
-            base.local.cpu_quota_pct = local.cpu_quota_pct;
-            base.local.memory_max = local.memory_max;
-            base.local.cap_passthrough = local.cap_passthrough;
+        // Unknown keys warn at the top level and within every section.
+        warn_unknown_keys(&raw.unknown, "", layer, warnings);
+        if let Some(local) = &raw.local {
+            warn_unknown_keys(&local.unknown, "local", layer, warnings);
+        }
+        for (name, tool) in &raw.tool {
+            warn_unknown_keys(&tool.unknown, &format!("tool.{name}"), layer, warnings);
+        }
+        if let Some(remote) = &raw.remote {
+            warn_unknown_keys(&remote.unknown, "remote", layer, warnings);
+            if let Some(argo) = &remote.argo {
+                warn_unknown_keys(&argo.unknown, "remote.argo", layer, warnings);
+            }
+            if let Some(command) = &remote.command {
+                warn_unknown_keys(&command.unknown, "remote.command", layer, warnings);
+            }
         }
 
-        // Merge tool configs.
+        // Merge local config, key by key.
+        if let Some(local) = raw.local {
+            if let Some(v) = local.cpu_quota_pct {
+                base.local.cpu_quota_pct = v;
+            }
+            if let Some(v) = local.memory_max {
+                base.local.memory_max = v;
+            }
+            if let Some(v) = local.cap_passthrough {
+                base.local.cap_passthrough = v;
+            }
+
+            // The fallback-semaphore keys are box-overload protection (plan
+            // Component 6): a cloned repo must not be able to raise the slot
+            // count, zero it out, or shrink the bounded wait into a no-op any
+            // more than it may redirect pushes. Same treatment as the other
+            // S-2 keys — warn and ignore rather than reject the layer, so a
+            // stray key never discards the repo's own intercept narrowing.
+            // A non-repo layer setting 0 would deadlock every fallback, so
+            // zero is invalid from any layer.
+            match local.fallback_slots {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'fallback_slots' (trust boundary S-2), ignoring"
+                        .to_string(),
+                ),
+                Some(0) => {
+                    warnings.push("local.fallback_slots must be at least 1; ignoring".to_string())
+                }
+                Some(v) => base.local.fallback_slots = v,
+                None => {}
+            }
+            match local.fallback_wait_secs {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'fallback_wait_secs' (trust boundary S-2), ignoring"
+                        .to_string(),
+                ),
+                Some(0) => warnings
+                    .push("local.fallback_wait_secs must be at least 1; ignoring".to_string()),
+                Some(v) => base.local.fallback_wait_secs = v,
+                None => {}
+            }
+        }
+
+        // Merge tool configs. A tool section without an `intercept` key
+        // inherits the lower layer's intercept list; naming a tool that no
+        // lower layer mentioned opts it in with the default `["test"]`. An
+        // explicit `intercept = []` narrows the tool to never intercept.
         for (tool_name, raw_tool) in raw.tool {
-            let tool_config = ToolConfig {
-                intercept: if raw_tool.intercept.is_empty() {
-                    vec!["test".to_string()]
-                } else {
-                    raw_tool.intercept
-                },
-                real_binary: raw_tool.real_binary.map(PathBuf::from),
+            let intercept = match raw_tool.intercept {
+                Some(v) => v,
+                None => base
+                    .tools
+                    .get(&tool_name)
+                    .map(|t| t.intercept.clone())
+                    .unwrap_or_else(|| vec!["test".to_string()]),
             };
-            base.tools.insert(tool_name, tool_config);
+            let real_binary = match raw_tool.real_binary {
+                Some(v) => Some(PathBuf::from(v)),
+                None => base
+                    .tools
+                    .get(&tool_name)
+                    .and_then(|t| t.real_binary.clone()),
+            };
+            base.tools.insert(
+                tool_name,
+                ToolConfig {
+                    intercept,
+                    real_binary,
+                },
+            );
         }
 
         // Merge remote config with trust boundary.
         if let Some(remote) = raw.remote {
-            // Parse backend type.
-            base.remote.backend = match remote.backend.as_str() {
-                "none" => Backend::None,
-                "argo" => Backend::Argo,
-                "command" => {
-                    if repo_layer {
-                        return Err(
-                            "repo config cannot set backend to 'command' (trust boundary S-2)"
-                                .to_string(),
-                        );
+            // Backend: only an explicit key overrides. `command` from the
+            // repo layer rejects the whole layer (fail-closed to LKG) — a
+            // repo-chosen executable template is arbitrary code execution.
+            if let Some(backend) = remote.backend {
+                base.remote.backend = match backend.as_str() {
+                    "none" => Backend::None,
+                    "argo" => Backend::Argo,
+                    "command" => {
+                        if repo_layer {
+                            return Err("repo config cannot set backend to 'command' \
+                                        (trust boundary S-2)"
+                                .to_string());
+                        }
+                        Backend::Command
                     }
-                    Backend::Command
-                }
-                _ => {
-                    warnings.push(format!(
-                        "unknown backend '{}', using 'none'",
-                        remote.backend
-                    ));
-                    Backend::None
-                }
-            };
-
-            // Trust boundary: repo layer cannot set ci_remote or push_mode.
-            if !repo_layer {
-                base.remote.ci_remote = remote.ci_remote;
-                base.remote.push_mode = match remote.push_mode.as_str() {
-                    "ref" => PushMode::Ref,
-                    "branch" => PushMode::Branch,
                     _ => {
-                        warnings.push(format!(
-                            "unknown push_mode '{}', using 'ref'",
-                            remote.push_mode
-                        ));
-                        PushMode::Ref
+                        warnings.push(format!("unknown backend '{backend}', using 'none'"));
+                        Backend::None
                     }
                 };
             }
 
-            base.remote.deadline_minutes = remote.deadline_minutes;
+            // Trust boundary (S-2): the repo layer cannot set ci_remote or
+            // push_mode. The key is ignored with a warning rather than
+            // rejecting the layer — a cloned repo must not redirect pushes,
+            // but a stray restricted key should not discard the repo's own
+            // intercept narrowing.
+            match remote.ci_remote {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'ci_remote' (trust boundary S-2), ignoring".to_string(),
+                ),
+                Some(v) => base.remote.ci_remote = v,
+                None => {}
+            }
+            match remote.push_mode {
+                Some(_) if repo_layer => warnings.push(
+                    "repo config cannot set 'push_mode' (trust boundary S-2), ignoring".to_string(),
+                ),
+                Some(v) => {
+                    base.remote.push_mode = match v.as_str() {
+                        "ref" => PushMode::Ref,
+                        "branch" => PushMode::Branch,
+                        _ => {
+                            warnings.push(format!("unknown push_mode '{v}', using 'ref'"));
+                            PushMode::Ref
+                        }
+                    }
+                }
+                None => {}
+            }
 
-            // Argo config.
+            if let Some(v) = remote.deadline_minutes {
+                base.remote.deadline_minutes = v;
+            }
+
+            // Argo config: key-granular onto whatever a lower layer built.
             if let Some(argo) = remote.argo {
-                base.remote.argo = Some(ArgoConfig {
-                    kubeconfig: Self::expand_home(&argo.kubeconfig),
-                    namespace: argo.namespace,
-                    template: argo.template,
-                    generate_name: argo.generate_name,
-                    base_url: argo.base_url,
-                });
+                let mut merged = base.remote.argo.take().unwrap_or_default();
+                if let Some(v) = argo.kubectl_path {
+                    merged.kubectl_path = v;
+                }
+                if let Some(v) = argo.kubeconfig {
+                    merged.kubeconfig = Self::expand_home(&v);
+                }
+                if let Some(v) = argo.namespace {
+                    merged.namespace = v;
+                }
+                if let Some(v) = argo.template {
+                    merged.template = v;
+                }
+                if let Some(v) = argo.generate_name {
+                    merged.generate_name = v;
+                }
+                if let Some(v) = argo.builder_image {
+                    merged.builder_image = Some(v);
+                }
+                if let Some(v) = argo.base_url {
+                    merged.base_url = Some(v);
+                }
+                base.remote.argo = Some(merged);
             }
 
             // Command config - trust boundary applies.
@@ -621,29 +820,28 @@ impl GantryConfig {
     // Last-known-good snapshot operations
     // ============================================================================
 
-    fn lkg_path() -> Result<PathBuf, String> {
-        Self::state_dir().map(|p| p.join("last-known-good.toml"))
+    fn lkg_path_in(state_dir: &Path) -> PathBuf {
+        state_dir.join("last-known-good.toml")
     }
 
-    fn lkg_meta_path() -> Result<PathBuf, String> {
-        Self::state_dir().map(|p| p.join("last-known-good.meta.json"))
+    fn lkg_meta_path_in(state_dir: &Path) -> PathBuf {
+        state_dir.join("last-known-good.meta.json")
     }
 
-    fn broken_marker_path() -> Result<PathBuf, String> {
-        Self::state_dir().map(|p| p.join("broken-config.marker"))
+    fn broken_marker_path_in(state_dir: &Path) -> PathBuf {
+        state_dir.join("broken-config.marker")
     }
 
-    /// Persist the current config as the last-known-good snapshot.
-    fn persist_lkg(config: &GantryConfig) -> Result<(), String> {
-        let state_dir = Self::state_dir()?;
-        fs::create_dir_all(&state_dir).map_err(|e| format!("failed to create state dir: {}", e))?;
+    /// Persist the config as the last-known-good snapshot under `state_dir`.
+    fn persist_lkg_in(state_dir: &Path, config: &GantryConfig) -> Result<(), String> {
+        fs::create_dir_all(state_dir).map_err(|e| format!("failed to create state dir: {}", e))?;
 
         // Serialize config to TOML.
         let toml_content = toml::to_string_pretty(&Self::to_raw(config))
             .map_err(|e| format!("failed to serialize config: {}", e))?;
 
         // Write the snapshot.
-        let lkg_path = Self::lkg_path()?;
+        let lkg_path = Self::lkg_path_in(state_dir);
         fs::write(&lkg_path, toml_content)
             .map_err(|e| format!("failed to write LKG snapshot: {}", e))?;
 
@@ -660,53 +858,72 @@ impl GantryConfig {
         };
         let meta_json = serde_json::to_string_pretty(&meta)
             .map_err(|e| format!("failed to serialize metadata: {}", e))?;
-        fs::write(Self::lkg_meta_path()?, meta_json)
+        fs::write(Self::lkg_meta_path_in(state_dir), meta_json)
             .map_err(|e| format!("failed to write LKG metadata: {}", e))?;
 
         Ok(())
     }
 
-    /// Load the last-known-good snapshot.
-    fn load_lkg(
+    /// Load the last-known-good snapshot from `state_dir`, maintaining the
+    /// escalating broken-config banner state as a side effect.
+    fn load_lkg_in(
+        state_dir: &Path,
         warnings: &mut Vec<String>,
         broken_banner: &mut Option<BrokenBanner>,
     ) -> Result<GantryConfig, String> {
-        let lkg_path = Self::lkg_path()?;
-        let meta_path = Self::lkg_meta_path()?;
-        let marker_path = Self::broken_marker_path()?;
+        let lkg_path = Self::lkg_path_in(state_dir);
+        let meta_path = Self::lkg_meta_path_in(state_dir);
+        let marker_path = Self::broken_marker_path_in(state_dir);
 
-        // Check for broken-config marker and load banner state.
-        if marker_path.exists() {
-            if let Ok(content) = fs::read_to_string(&marker_path) {
-                if let Ok(marker) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let count = marker["count"].as_u64().unwrap_or(1);
-                    let since_ts = marker["since"].as_u64().unwrap_or(0);
-                    *broken_banner = Some(BrokenBanner {
-                        count: count + 1,
-                        since: SystemTime::UNIX_EPOCH + Duration::from_secs(since_ts),
-                    });
+        // The state dir is normally created by persist_lkg_in on an earlier
+        // clean load — but a config that has never loaded cleanly reaches
+        // here with no state dir, and the marker must land anyway or the
+        // banner can never escalate across runs.
+        let _ = fs::create_dir_all(state_dir);
 
-                    // Update marker with incremented count.
-                    let updated = serde_json::json!({
-                        "count": count + 1,
-                        "since": since_ts,
-                    });
-                    let _ = fs::write(&marker_path, updated.to_string());
+        // Escalating banner state: a fresh corruption starts the count at 1
+        // and stamps "broken since"; every further degraded run increments
+        // the count but keeps the original timestamp. A marker that cannot
+        // be read as {count, since} is treated as a fresh detection and
+        // overwritten — a broken marker must never suppress the banner,
+        // because silence is the one failure mode Q-7 forbids.
+        let banner = match fs::read_to_string(&marker_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|marker| {
+                let count = marker["count"].as_u64()?;
+                let since = marker["since"].as_u64()?;
+                Some((count, since))
+            }) {
+            Some((count, since_ts)) => {
+                let banner = BrokenBanner {
+                    count: count + 1,
+                    since: SystemTime::UNIX_EPOCH + Duration::from_secs(since_ts),
+                };
+
+                // Update marker with incremented count.
+                let updated = serde_json::json!({
+                    "count": banner.count,
+                    "since": since_ts,
+                });
+                let _ = fs::write(&marker_path, updated.to_string());
+                banner
+            }
+            None => {
+                // First detection (or unreadable marker) - create marker.
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let marker = serde_json::json!({ "count": 1, "since": now });
+                let _ = fs::write(&marker_path, marker.to_string());
+                BrokenBanner {
+                    count: 1,
+                    since: SystemTime::UNIX_EPOCH + Duration::from_secs(now),
                 }
             }
-        } else {
-            // First detection - create marker.
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let marker = serde_json::json!({ "count": 1, "since": now });
-            let _ = fs::write(&marker_path, marker.to_string());
-            *broken_banner = Some(BrokenBanner {
-                count: 1,
-                since: SystemTime::UNIX_EPOCH + Duration::from_secs(now),
-            });
-        }
+        };
+        *broken_banner = Some(banner);
 
         // Read and validate metadata.
         let meta_content = fs::read_to_string(&meta_path)
@@ -726,13 +943,26 @@ impl GantryConfig {
         Ok(config)
     }
 
+    /// Remove the broken-config marker after a clean load.
+    ///
+    /// The banner runs "until fixed" (plan Q-7): a config that parses must
+    /// stop the escalation, and the next corruption must start a fresh count
+    /// and "since" rather than inheriting the previous incident's. Best
+    /// effort — failing to remove the marker must never fail the load.
+    fn clear_broken_marker_in(state_dir: &Path) {
+        let _ = fs::remove_file(Self::broken_marker_path_in(state_dir));
+    }
+
     /// Convert Config to RawConfig for serialization.
     fn to_raw(config: &GantryConfig) -> RawConfig {
         RawConfig {
             local: Some(RawLocal {
-                cpu_quota_pct: config.local.cpu_quota_pct,
-                memory_max: config.local.memory_max.clone(),
-                cap_passthrough: config.local.cap_passthrough,
+                cpu_quota_pct: Some(config.local.cpu_quota_pct),
+                memory_max: Some(config.local.memory_max.clone()),
+                cap_passthrough: Some(config.local.cap_passthrough),
+                fallback_slots: Some(config.local.fallback_slots),
+                fallback_wait_secs: Some(config.local.fallback_wait_secs),
+                unknown: HashMap::new(),
             }),
             tool: config
                 .tools
@@ -741,41 +971,76 @@ impl GantryConfig {
                     (
                         name.clone(),
                         RawTool {
-                            intercept: tool.intercept.clone(),
+                            intercept: Some(tool.intercept.clone()),
                             real_binary: tool
                                 .real_binary
                                 .as_ref()
                                 .map(|p| p.to_string_lossy().to_string()),
+                            unknown: HashMap::new(),
                         },
                     )
                 })
                 .collect(),
             remote: Some(RawRemote {
-                backend: match &config.remote.backend {
+                backend: Some(match &config.remote.backend {
                     Backend::None => "none".to_string(),
                     Backend::Argo => "argo".to_string(),
                     Backend::Command => "command".to_string(),
-                },
-                ci_remote: config.remote.ci_remote.clone(),
-                push_mode: match &config.remote.push_mode {
+                }),
+                ci_remote: Some(config.remote.ci_remote.clone()),
+                push_mode: Some(match &config.remote.push_mode {
                     PushMode::Ref => "ref".to_string(),
                     PushMode::Branch => "branch".to_string(),
-                },
-                deadline_minutes: config.remote.deadline_minutes,
+                }),
+                deadline_minutes: Some(config.remote.deadline_minutes),
                 argo: config.remote.argo.as_ref().map(|a| RawArgo {
-                    kubeconfig: a.kubeconfig.to_string_lossy().to_string(),
-                    namespace: a.namespace.clone(),
-                    template: a.template.clone(),
-                    generate_name: a.generate_name.clone(),
+                    kubectl_path: Some(a.kubectl_path.clone()),
+                    kubeconfig: Some(a.kubeconfig.to_string_lossy().to_string()),
+                    namespace: Some(a.namespace.clone()),
+                    template: Some(a.template.clone()),
+                    generate_name: Some(a.generate_name.clone()),
+                    builder_image: a.builder_image.clone(),
                     base_url: a.base_url.clone(),
+                    unknown: HashMap::new(),
                 }),
                 command: config.remote.command.as_ref().map(|c| RawCommand {
                     submit: c.submit.clone(),
                     logs: c.logs.clone(),
                     wait: c.wait.clone(),
+                    unknown: HashMap::new(),
                 }),
+                unknown: HashMap::new(),
             }),
-            _unknown: HashMap::new(),
+            unknown: HashMap::new(),
+        }
+    }
+}
+
+// ============================================================================
+// Unknown-key warnings
+// ============================================================================
+
+/// Emit one warning per unknown key captured by a raw struct's flatten map.
+///
+/// Forward compatibility: keys from a newer config schema (or plain typos)
+/// never fail the load — they are reported and ignored. Keys are sorted so
+/// warning output is deterministic for a given file.
+fn warn_unknown_keys(
+    unknown: &HashMap<String, toml::Value>,
+    section: &str,
+    layer: ConfigLayer,
+    warnings: &mut Vec<String>,
+) {
+    let mut keys: Vec<&String> = unknown.keys().collect();
+    keys.sort();
+    for key in keys {
+        if section.is_empty() {
+            warnings.push(format!("unknown key '{key}' in {} config, ignoring", layer));
+        } else {
+            warnings.push(format!(
+                "unknown key '{section}.{key}' in {} config, ignoring",
+                layer
+            ));
         }
     }
 }
@@ -804,6 +1069,8 @@ mod tests {
         assert_eq!(cfg.local.cpu_quota_pct, 200);
         assert_eq!(cfg.local.memory_max, "6G");
         assert!(cfg.local.cap_passthrough);
+        assert_eq!(cfg.local.fallback_slots, DEFAULT_FALLBACK_SLOTS);
+        assert_eq!(cfg.local.fallback_wait_secs, DEFAULT_FALLBACK_WAIT_SECS);
         assert!(cfg.intercepts("cargo", "test"));
     }
 
@@ -1044,6 +1311,126 @@ mod tests {
         assert_eq!(cfg, Config::tier_0_defaults());
     }
 
+    /// The [remote.argo] block deserializes with its documented defaults:
+    /// kubectl resolved via PATH, builder-image omitted so the
+    /// WorkflowTemplate default applies (backend/argo.rs drops the parameter
+    /// from the manifest when it is None).
+    #[test]
+    fn merge_layer_argo_defaults_kubectl_path_and_builder_image() {
+        let mut cfg = Config::tier_0_defaults();
+        let temp = TempDir::new().unwrap();
+        let config = write_test_config(
+            temp.path(),
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            "#,
+        );
+
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
+
+        let argo = cfg.remote.argo.as_ref().expect("argo config present");
+        assert_eq!(argo.kubectl_path, "kubectl");
+        assert_eq!(argo.builder_image, None);
+        assert_eq!(argo.template, "gantry-verify");
+        assert_eq!(argo.generate_name, "gantry-");
+        assert_eq!(argo.base_url, None);
+    }
+
+    /// Explicit kubectl_path and builder_image values flow through the merge
+    /// untouched — these are user-layer (trusted) knobs per S-2.
+    #[test]
+    fn merge_layer_argo_explicit_kubectl_path_and_builder_image() {
+        let mut cfg = Config::tier_0_defaults();
+        let temp = TempDir::new().unwrap();
+        let config = write_test_config(
+            temp.path(),
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            kubectl_path = "/usr/local/bin/kubectl"
+            builder_image = "ronaldraygun/gantry-builder:1.83"
+            base_url = "https://argo-ci.example.com"
+            "#,
+        );
+
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
+
+        let argo = cfg.remote.argo.as_ref().expect("argo config present");
+        assert_eq!(argo.kubectl_path, "/usr/local/bin/kubectl");
+        assert_eq!(
+            argo.builder_image,
+            Some("ronaldraygun/gantry-builder:1.83".to_string())
+        );
+        assert_eq!(
+            argo.base_url,
+            Some("https://argo-ci.example.com".to_string())
+        );
+    }
+
+    /// The last-known-good snapshot path — to_raw, TOML serialize, reparse at
+    /// the Defaults layer — preserves the full [remote.argo] block. A field
+    /// added to RawArgo but missed in to_raw would otherwise drop silently
+    /// from every snapshot persist_lkg writes.
+    #[test]
+    fn argo_config_survives_lkg_snapshot_round_trip() {
+        let mut cfg = Config::tier_0_defaults();
+        let temp = TempDir::new().unwrap();
+        let config = write_test_config(
+            temp.path(),
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            kubectl_path = "/usr/local/bin/kubectl"
+            kubeconfig = "/etc/gantry-test/kubeconfig"
+            namespace = "argo-workflows"
+            template = "gantry-verify"
+            generate_name = "gantry-"
+            builder_image = "ronaldraygun/gantry-builder:1.83"
+            base_url = "https://argo-ci.example.com"
+            "#,
+        );
+        let mut warnings = Vec::new();
+        Config::merge_layer(&mut cfg, &config, ConfigLayer::User, &mut warnings).unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+
+        // Exactly what persist_lkg and load_lkg do around the snapshot file.
+        let serialized = toml::to_string_pretty(&Config::to_raw(&cfg)).expect("serialize snapshot");
+        let snapshot_path = temp.path().join("last-known-good.toml");
+        fs::write(&snapshot_path, &serialized).unwrap();
+
+        let mut restored = Config::tier_0_defaults();
+        let mut warnings = Vec::new();
+        Config::merge_layer(
+            &mut restored,
+            &snapshot_path,
+            ConfigLayer::Defaults,
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+
+        let argo = restored.remote.argo.as_ref().expect("argo config restored");
+        assert_eq!(argo.kubectl_path, "/usr/local/bin/kubectl");
+        assert_eq!(
+            argo.builder_image,
+            Some("ronaldraygun/gantry-builder:1.83".to_string())
+        );
+        assert_eq!(
+            restored.remote.argo.as_ref(),
+            cfg.remote.argo.as_ref(),
+            "argo block drifted across the LKG round trip"
+        );
+    }
+
     #[test]
     fn trust_boundary_blocks_repo_ci_remote() {
         let mut cfg = Config::tier_0_defaults();
@@ -1175,5 +1562,938 @@ mod tests {
             cfg.real_binary("cargo"),
             Some(&PathBuf::from("/custom/cargo"))
         );
+    }
+
+    // ========================================================================
+    // Three-layer merging end-to-end (bf-37ng)
+    // ========================================================================
+
+    /// Helper: write a layer file and return its path (None = layer absent).
+    fn layer_file(dir: &Path, name: &str, content: &str) -> Option<PathBuf> {
+        if content.is_empty() {
+            return None;
+        }
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        Some(path)
+    }
+
+    #[test]
+    fn layering_composes_across_all_three_layers() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(
+            temp.path(),
+            "system.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 100
+            "#,
+        );
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            memory_max = "12G"
+
+            [tool.cargo]
+            intercept = ["test", "check"]
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [tool.nextest]
+
+            [remote]
+            deadline_minutes = 55
+            "#,
+        );
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        // Keys set by different layers all land: layers compose key by key,
+        // they do not replace each other section by section.
+        assert_eq!(result.config.local.cpu_quota_pct, 100, "system layer");
+        assert_eq!(result.config.local.memory_max, "12G", "user layer");
+        assert_eq!(result.config.remote.deadline_minutes, 55, "repo layer");
+        assert!(result.config.intercepts("cargo", "test"));
+        assert!(result.config.intercepts("cargo", "check"));
+        assert!(result.config.intercepts("nextest", "test"));
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    // ========================================================================
+    // Fallback admission semaphore config (plan Component 6, bf-299)
+    // ========================================================================
+
+    #[test]
+    fn fallback_semaphore_keys_merge_from_user_layer() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            fallback_slots = 5
+            fallback_wait_secs = 600
+            "#,
+        );
+        let repo = layer_file(temp.path(), "repo.toml", "");
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.local.fallback_slots, 5);
+        assert_eq!(result.config.local.fallback_wait_secs, 600);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn repo_layer_cannot_touch_fallback_semaphore_keys() {
+        // Box-overload protection is not the cloned repo's to weaken: raising
+        // slots or zeroing the bounded wait from the repo layer is the same
+        // class of overreach as redirecting pushes (S-2).
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            fallback_slots = 3
+            fallback_wait_secs = 3600
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [local]
+            fallback_slots = 1000
+            fallback_wait_secs = 1
+
+            [tool.cargo]
+            intercept = ["test", "check"]
+            "#,
+        );
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(
+            result.config.local.fallback_slots, 3,
+            "repo layer must not raise the slot count"
+        );
+        assert_eq!(
+            result.config.local.fallback_wait_secs, 3600,
+            "repo layer must not shrink the bounded wait"
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.contains("fallback_slots")),
+            "a warning must name the ignored key: {:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("fallback_wait_secs")),
+            "a warning must name the ignored key: {:?}",
+            result.warnings
+        );
+        // The stray restricted key must not discard the repo's own narrowing.
+        assert!(result.config.intercepts("cargo", "check"));
+    }
+
+    #[test]
+    fn zero_fallback_values_are_rejected_from_any_layer() {
+        // fallback_slots = 0 could never admit anyone; fallback_wait_secs = 0
+        // would make the bounded wait a no-op. Both are invalid everywhere.
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(
+            temp.path(),
+            "system.toml",
+            r#"
+            [local]
+            fallback_slots = 0
+            fallback_wait_secs = 0
+            "#,
+        );
+        let user = layer_file(temp.path(), "user.toml", "");
+        let repo = layer_file(temp.path(), "repo.toml", "");
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.local.fallback_slots, DEFAULT_FALLBACK_SLOTS);
+        assert_eq!(
+            result.config.local.fallback_wait_secs,
+            DEFAULT_FALLBACK_WAIT_SECS
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.contains("fallback_slots")),
+            "warnings: {:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("fallback_wait_secs")),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn fallback_semaphore_keys_round_trip_through_the_lkg_snapshot() {
+        // The LKG path serializes via to_raw and reparses via merge_layer; a
+        // key missing from either side would silently reset to the default
+        // exactly when the config is broken — the worst moment to lose a cap.
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            fallback_slots = 7
+            fallback_wait_secs = 1200
+            "#,
+        );
+        let repo = layer_file(temp.path(), "repo.toml", "");
+
+        let loaded =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        let raw = Config::to_raw(&loaded.config);
+        let serialized = toml::to_string_pretty(&raw).unwrap();
+        let mut reparsed = Config::tier_0_defaults();
+        let mut warnings = Vec::new();
+        let snapshot = temp.path().join("snapshot.toml");
+        fs::write(&snapshot, serialized).unwrap();
+        Config::merge_layer(
+            &mut reparsed,
+            &snapshot,
+            ConfigLayer::Defaults,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(reparsed.local.fallback_slots, 7);
+        assert_eq!(reparsed.local.fallback_wait_secs, 1200);
+    }
+
+    #[test]
+    fn layering_same_key_repo_beats_user_beats_system() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(
+            temp.path(),
+            "system.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 100
+
+            [remote]
+            ci_remote = "upstream"
+            "#,
+        );
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 150
+
+            [remote]
+            ci_remote = "mirror"
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 175
+            "#,
+        );
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.local.cpu_quota_pct, 175);
+        assert_eq!(result.config.remote.ci_remote, "mirror");
+    }
+
+    #[test]
+    fn layering_absent_middle_layer_is_skipped() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(
+            temp.path(),
+            "system.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 100
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+            deadline_minutes = 50
+            "#,
+        );
+
+        // User layer absent (None): system and repo still compose.
+        let result = Config::load_layers(system.as_deref(), None, repo.as_deref()).unwrap();
+        assert_eq!(result.config.local.cpu_quota_pct, 100);
+        assert_eq!(result.config.remote.deadline_minutes, 50);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn layering_no_layers_yields_tier0_with_no_warnings() {
+        // All layers absent, and paths that simply do not exist.
+        let missing = TempDir::new().unwrap().path().join("nope.toml");
+        for (system, user, repo) in [
+            (None, None, None),
+            (
+                Some(missing.as_path()),
+                Some(missing.as_path()),
+                Some(missing.as_path()),
+            ),
+        ] {
+            let result = Config::load_layers(system, user, repo).unwrap();
+            assert_eq!(result.config, Config::tier_0_defaults());
+            assert!(
+                result.warnings.is_empty(),
+                "warnings: {:?}",
+                result.warnings
+            );
+            assert!(result.broken_banner.is_none());
+        }
+    }
+
+    /// The point of key-granular merging: a repo `[remote]` that touches one
+    /// key must not reset the backend a user layer chose (the old
+    /// section-granular merge clobbered it back to Tier-0's "none").
+    #[test]
+    fn layering_remote_sections_compose_key_by_key() {
+        let temp = TempDir::new().unwrap();
+        let system = layer_file(temp.path(), "system.toml", "");
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "argo"
+            deadline_minutes = 10
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+            deadline_minutes = 50
+            "#,
+        );
+
+        let result =
+            Config::load_layers(system.as_deref(), user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.remote.backend, Backend::Argo);
+        assert_eq!(result.config.remote.deadline_minutes, 50);
+    }
+
+    #[test]
+    fn layering_argo_block_composes_across_layers() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "argo"
+
+            [remote.argo]
+            kubectl_path = "/usr/local/bin/kubectl"
+            template = "user-template"
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+
+            [remote.argo]
+            template = "repo-template"
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), repo.as_deref()).unwrap();
+
+        let argo = result.config.remote.argo.as_ref().expect("argo config");
+        assert_eq!(argo.kubectl_path, "/usr/local/bin/kubectl", "user key kept");
+        assert_eq!(argo.template, "repo-template", "repo key wins");
+        assert_eq!(argo.namespace, "argo-workflows", "default fills the rest");
+    }
+
+    #[test]
+    fn layering_tool_config_composes_across_layers() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [tool.cargo]
+            intercept = ["test", "check"]
+            real_binary = "/custom/cargo"
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [tool.cargo]
+            intercept = ["test", "clippy"]
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), repo.as_deref()).unwrap();
+
+        let cargo = result.config.tools.get("cargo").expect("cargo tool");
+        assert_eq!(cargo.intercept, vec!["test", "clippy"], "repo narrows");
+        // real_binary not repeated by the repo layer — the user's choice holds.
+        assert_eq!(cargo.real_binary, Some(PathBuf::from("/custom/cargo")));
+    }
+
+    /// Repo-level narrowing all the way down: an explicit empty intercept
+    /// list disables interception for that tool.
+    #[test]
+    fn layering_explicit_empty_intercept_narrows_tool_to_never() {
+        let temp = TempDir::new().unwrap();
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [tool.cargo]
+            intercept = []
+            "#,
+        );
+
+        let result = Config::load_layers(None, None, repo.as_deref()).unwrap();
+
+        let cargo = result.config.tools.get("cargo").expect("cargo tool");
+        assert!(cargo.intercept.is_empty());
+        assert!(!result.config.intercepts("cargo", "test"));
+    }
+
+    /// Full resolution path, no injected shortcuts: the cwd-style upward walk
+    /// finds the repo root's .gantry.toml from a nested directory, and the
+    /// found file merges under the system layer with the trust boundary.
+    #[test]
+    fn repo_walk_feeds_repo_layer_end_to_end() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().join("walker");
+        let deep = repo_root.join("src").join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir(repo_root.join(".git")).unwrap();
+        fs::write(
+            repo_root.join(".gantry.toml"),
+            r#"
+            [tool.cargo]
+            intercept = ["test", "clippy"]
+            "#,
+        )
+        .unwrap();
+
+        let resolved = Config::repo_config_path_in(&deep).expect("walk finds repo config");
+
+        let result = Config::load_layers(None, None, Some(resolved.as_path())).unwrap();
+        assert!(result.config.intercepts("cargo", "clippy"));
+        assert!(result.config.intercepts("cargo", "test"));
+        assert!(!result.config.intercepts("cargo", "build"));
+    }
+
+    // ========================================================================
+    // Trust boundary (S-2) with warnings
+    // ========================================================================
+
+    /// Restricted keys in `.gantry.toml` are ignored with a loud warning,
+    /// but the rest of the repo layer still applies — a stray `ci_remote`
+    /// must not discard the repo's own intercept narrowing.
+    #[test]
+    fn trust_boundary_repo_restricted_keys_ignored_with_warning() {
+        let temp = TempDir::new().unwrap();
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+            ci_remote = "attacker-controlled"
+            push_mode = "branch"
+
+            [tool.cargo]
+            intercept = ["test", "clippy"]
+            "#,
+        );
+
+        let result = Config::load_layers(None, None, repo.as_deref()).unwrap();
+
+        assert_eq!(
+            result.config.remote.ci_remote, "origin",
+            "ci_remote blocked"
+        );
+        assert_eq!(
+            result.config.remote.push_mode,
+            PushMode::Ref,
+            "push_mode blocked"
+        );
+        assert!(result.config.intercepts("cargo", "clippy"), "rest applies");
+
+        let ci = result
+            .warnings
+            .iter()
+            .any(|w| w.contains("ci_remote") && w.contains("trust boundary"));
+        let push = result
+            .warnings
+            .iter()
+            .any(|w| w.contains("push_mode") && w.contains("trust boundary"));
+        assert!(ci, "ci_remote warning missing: {:?}", result.warnings);
+        assert!(push, "push_mode warning missing: {:?}", result.warnings);
+    }
+
+    /// The boundary is one-way: trusted layers may still set both keys.
+    #[test]
+    fn trust_boundary_trusted_layers_can_set_ci_remote_and_push_mode() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            ci_remote = "upstream"
+            push_mode = "branch"
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        assert_eq!(result.config.remote.ci_remote, "upstream");
+        assert_eq!(result.config.remote.push_mode, PushMode::Branch);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    /// Repo layer restricting the backend to Tier-0 (narrowing) is allowed.
+    #[test]
+    fn trust_boundary_repo_can_narrow_backend_to_none() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [remote]
+            backend = "argo"
+            "#,
+        );
+        let repo = layer_file(
+            temp.path(),
+            "repo.toml",
+            r#"
+            [remote]
+            backend = "none"
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), repo.as_deref()).unwrap();
+
+        assert_eq!(result.config.remote.backend, Backend::None);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    // ========================================================================
+    // Unknown keys — warn, never error
+    // ========================================================================
+
+    #[test]
+    fn unknown_top_level_keys_warn_but_config_loads() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            banana = true
+
+            [other_bogus]
+            key = 1
+
+            [local]
+            cpu_quota_pct = 120
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        // Recognized keys still apply.
+        assert_eq!(result.config.local.cpu_quota_pct, 120);
+
+        let banana = result
+            .warnings
+            .iter()
+            .any(|w| w.contains("unknown key 'banana'") && w.contains("user"));
+        let bogus = result
+            .warnings
+            .iter()
+            .any(|w| w.contains("unknown key 'other_bogus'"));
+        assert!(banana, "banana warning missing: {:?}", result.warnings);
+        assert!(bogus, "other_bogus warning missing: {:?}", result.warnings);
+    }
+
+    #[test]
+    fn unknown_nested_keys_warn_with_section_path() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            [local]
+            cpu_quota_pct = 120
+            memry_max = "8G"
+
+            [tool.cargo]
+            intercept = ["test"]
+            interceptt = ["chek"]
+
+            [remote]
+            backend = "argo"
+            deadline_minuts = 5
+
+            [remote.argo]
+            namespaces = "wrong"
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        assert_eq!(result.config.local.cpu_quota_pct, 120, "known keys apply");
+        assert_eq!(result.config.remote.backend, Backend::Argo);
+
+        for expected in [
+            "local.memry_max",
+            "tool.cargo.interceptt",
+            "remote.deadline_minuts",
+            "remote.argo.namespaces",
+        ] {
+            let found = result
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("unknown key '{expected}'")));
+            assert!(
+                found,
+                "warning for '{expected}' missing: {:?}",
+                result.warnings
+            );
+        }
+    }
+
+    /// Unknown keys must never fail the load regardless of value shape —
+    /// including TOML datetimes, which is why the flatten maps hold
+    /// `toml::Value` rather than `serde_json::Value`.
+    #[test]
+    fn unknown_keys_with_exotic_values_warn_but_never_error() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            r#"
+            created = 1979-05-27T07:32:00Z
+            tags = ["a", "b"]
+            nested = { x = 1 }
+
+            [local]
+            cap_passthrough = false
+            "#,
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        assert!(!result.config.local.cap_passthrough, "known keys apply");
+        for expected in ["created", "tags", "nested"] {
+            let found = result
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("unknown key '{expected}'")));
+            assert!(
+                found,
+                "warning for '{expected}' missing: {:?}",
+                result.warnings
+            );
+        }
+    }
+
+    /// Warnings come out in a stable order (sorted keys) so logs are
+    /// diffable across runs.
+    #[test]
+    fn unknown_key_warnings_are_deterministic() {
+        let temp = TempDir::new().unwrap();
+        let user = layer_file(
+            temp.path(),
+            "user.toml",
+            "zebra = 1\napple = 2\nmango = 3\n",
+        );
+
+        let result = Config::load_layers(None, user.as_deref(), None).unwrap();
+
+        let keys: Vec<&str> = result
+            .warnings
+            .iter()
+            .filter_map(|w| {
+                w.split("unknown key '")
+                    .nth(1)
+                    .map(|rest| rest.split('\'').next().unwrap())
+            })
+            .collect();
+        assert_eq!(keys, vec!["apple", "mango", "zebra"]);
+    }
+
+    // ========================================================================
+    // Last-known-good snapshot + escalating banner (bf-10pd, Q-7)
+    // ========================================================================
+
+    /// Config content that always fails to parse — the corruption fixture.
+    /// Unknown keys would only warn, so a broken config must be a structural
+    /// one.
+    const CORRUPT_TOML: &str = ":: definitely not toml ::";
+
+    /// A healthy user config loads clean and leaves an LKG snapshot behind:
+    /// no banner, and both snapshot files in the state dir.
+    #[test]
+    fn lkg_clean_load_refreshes_snapshot_without_banner() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+        fs::write(
+            &user,
+            r#"
+            [local]
+            cpu_quota_pct = 150
+            memory_max = "12G"
+            "#,
+        )
+        .unwrap();
+
+        let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        assert!(result.broken_banner.is_none(), "clean load: no banner");
+        assert_eq!(result.config.local.cpu_quota_pct, 150);
+        assert!(state.join("last-known-good.toml").exists(), "snapshot");
+        assert!(
+            state.join("last-known-good.meta.json").exists(),
+            "snapshot metadata"
+        );
+        assert!(!state.join("broken-config.marker").exists());
+    }
+
+    /// The Q-7 acceptance pair: a corrupted config serves the persisted
+    /// last-known-good snapshot with a broken-config banner — degraded
+    /// service, but never silence and never a hard failure.
+    #[test]
+    fn lkg_corrupted_config_serves_snapshot_with_banner() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+
+        // First run: healthy config loads clean and (exactly what load()
+        // does on success) leaves a snapshot of itself behind.
+        fs::write(
+            &user,
+            r#"
+            [local]
+            cpu_quota_pct = 150
+            memory_max = "12G"
+            "#,
+        )
+        .unwrap();
+        let good = Config::load_with_paths(None, Some(&user), None, Some(&state));
+        assert!(good.broken_banner.is_none());
+
+        // Second run: the user config has since been corrupted.
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        let degraded = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        // The snapshot is served, not Tier-0 defaults: every value it
+        // captured stays in force.
+        assert_eq!(degraded.config.local.cpu_quota_pct, 150);
+        assert_eq!(degraded.config.local.memory_max, "12G");
+
+        // And the degradation is loud: banner shown, first detection = 1.
+        let banner = degraded.broken_banner.expect("broken banner shown");
+        assert_eq!(banner.count, 1);
+    }
+
+    /// The banner escalates: each consecutive degraded run increments the
+    /// count while "broken since" stays pinned to the first detection.
+    #[test]
+    fn lkg_banner_count_escalates_across_degraded_runs() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+        fs::write(&user, CORRUPT_TOML).unwrap();
+
+        let mut first_since = None;
+        for expected in 1..=3u64 {
+            let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+            let banner = result
+                .broken_banner
+                .unwrap_or_else(|| panic!("run {expected}: banner missing"));
+            assert_eq!(banner.count, expected, "run {expected}");
+            match first_since {
+                None => first_since = Some(banner.since),
+                Some(prev) => assert_eq!(banner.since, prev, "since must not drift"),
+            }
+        }
+    }
+
+    /// With no snapshot on disk, a broken config fails open to Tier-0
+    /// defaults — but still banners (plan Q-7: "plain passthrough + banner
+    /// if no snapshot exists (never silent)").
+    #[test]
+    fn lkg_no_snapshot_falls_back_to_tier0_with_banner() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state"); // never populated
+        let user = temp.path().join("config.toml");
+        fs::write(&user, CORRUPT_TOML).unwrap();
+
+        let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        assert_eq!(result.config, Config::tier_0_defaults());
+        let banner = result
+            .broken_banner
+            .expect("banner even without a snapshot");
+        assert_eq!(banner.count, 1);
+
+        // With no state dir at all there is nowhere to track escalation, so
+        // the banner struct is None — the stderr line is then the only
+        // signal, which is why load_with_paths prints before falling back.
+        let result = Config::load_with_paths(None, Some(&user), None, None);
+        assert_eq!(result.config, Config::tier_0_defaults());
+        assert!(result.broken_banner.is_none());
+    }
+
+    /// A fix stops the banner and resets escalation: the clean load removes
+    /// the marker and refreshes the snapshot, so a later corruption starts a
+    /// fresh count and serves the fixed config — not the pre-fix snapshot.
+    #[test]
+    fn lkg_clean_load_resets_broken_state() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+        let marker = state.join("broken-config.marker");
+
+        // Break, then verify the marker exists (escalation state on disk).
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        let broken = Config::load_with_paths(None, Some(&user), None, Some(&state));
+        assert_eq!(broken.broken_banner.as_ref().unwrap().count, 1);
+        assert!(marker.exists(), "marker written on first detection");
+
+        // Fix: the banner stops and the marker is retired.
+        fs::write(
+            &user,
+            r#"
+            [local]
+            cpu_quota_pct = 90
+            "#,
+        )
+        .unwrap();
+        let fixed = Config::load_with_paths(None, Some(&user), None, Some(&state));
+        assert!(fixed.broken_banner.is_none(), "fix stops the banner");
+        assert!(!marker.exists(), "fix clears the marker");
+
+        // Break again: fresh incident — count restarts at 1, and the
+        // snapshot served is the fixed config (cpu_quota_pct = 90).
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        let again = Config::load_with_paths(None, Some(&user), None, Some(&state));
+        let banner = again.broken_banner.expect("second incident banner");
+        assert_eq!(banner.count, 1, "escalation restarted");
+        assert_eq!(again.config.local.cpu_quota_pct, 90, "refreshed snapshot");
+    }
+
+    /// An unusable snapshot (corrupt metadata) degrades to Tier-0 with a
+    /// banner rather than panicking or serving silence. The marker is still
+    /// written, so repeated runs keep escalating.
+    #[test]
+    fn lkg_unusable_snapshot_degrades_to_tier0_with_banner() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+
+        // Produce a snapshot, then maim its metadata.
+        fs::write(&user, "[local]\ncpu_quota_pct = 150\n").unwrap();
+        Config::load_with_paths(None, Some(&user), None, Some(&state));
+        fs::write(state.join("last-known-good.meta.json"), "{oops").unwrap();
+
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        assert_eq!(result.config, Config::tier_0_defaults());
+        let banner = result.broken_banner.expect("banner on unusable snapshot");
+        assert_eq!(banner.count, 1);
+    }
+
+    /// A corrupt or unreadable marker must not suppress the banner: the run
+    /// is treated as a fresh detection and the marker is rewritten into a
+    /// readable shape so the next run can escalate from it.
+    #[test]
+    fn lkg_corrupt_marker_still_banners_as_fresh_detection() {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let user = temp.path().join("config.toml");
+
+        // Healthy config -> snapshot; then corrupt both the config and the
+        // escalation marker.
+        fs::write(&user, "[local]\ncpu_quota_pct = 150\n").unwrap();
+        Config::load_with_paths(None, Some(&user), None, Some(&state));
+        fs::write(&user, CORRUPT_TOML).unwrap();
+        fs::write(state.join("broken-config.marker"), "not json {").unwrap();
+
+        let result = Config::load_with_paths(None, Some(&user), None, Some(&state));
+
+        // The snapshot is still served and the banner still shown.
+        assert_eq!(result.config.local.cpu_quota_pct, 150);
+        let banner = result.broken_banner.expect("banner despite corrupt marker");
+        assert_eq!(banner.count, 1);
+
+        // The marker was rewritten readably, ready to escalate.
+        let marker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(state.join("broken-config.marker")).unwrap())
+                .expect("marker rewritten as JSON");
+        assert_eq!(marker["count"], 1);
     }
 }

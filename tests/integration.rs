@@ -11,6 +11,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use tempfile::TempDir;
+
 /// Path to the gantry binary (built with `cargo build --bin gantry`).
 fn gantry_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_gantry"))
@@ -41,6 +43,23 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
     let fixture_path = fixtures_dir().join(fixture_name);
     let gantry = gantry_binary();
 
+    // Explicit command-backend opt-in via the USER config layer. Tier-0 is the
+    // zero-config default (bf-2pad): a fixture relying on no config anywhere
+    // would now run the suite locally instead of exercising the remote round
+    // trip these tests exist for. The repo layer cannot make this choice
+    // (trust boundary S-2 reserves `backend = "command"` for system/user
+    // config), so the opt-in rides in an isolated HOME. That HOME also gives
+    // the run its own state dir, keeping the runlog out of the invoking
+    // user's ~/.local/state/gantry.
+    let home = TempDir::new().expect("create isolated HOME");
+    let gantry_config = home.path().join(".config/gantry");
+    fs::create_dir_all(&gantry_config).expect("create user config dir");
+    fs::write(
+        gantry_config.join("config.toml"),
+        "[remote]\nbackend = \"command\"\n",
+    )
+    .expect("write user config opting into the command backend");
+
     // Create a symlink named "cargo" that points to the gantry binary
     // This ensures argv[0] is "cargo" when the shim runs
     let cargo_link = fixture_path.join("cargo");
@@ -53,6 +72,11 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
     fs::create_dir_all(&state_dir).unwrap();
 
     let remote_dir = state_dir.join("bare-remote.git");
+    // Recreate the bare remote from scratch: `git init --bare` over an existing
+    // repo merely reinitializes it, so refs from earlier runs (epoch refs, and
+    // any refs/heads/* left by an older era of this suite) survive and break
+    // the INV-2 assertion below ("only refs/gantry/* exist after the run").
+    let _ = fs::remove_dir_all(&remote_dir);
     Command::new("git")
         .args(["init", "--bare", remote_dir.to_str().unwrap()])
         .output()
@@ -134,6 +158,11 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
     let output = Command::new(&cargo_link)
         .current_dir(&fixture_path)
         .env("GANTRY_EXEC_PATH", executor_path())
+        .env("HOME", home.path())
+        // XDG overrides would redirect the user config layer away from the
+        // isolated HOME, so they are stripped rather than set.
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
         .args(["test"])
         .output()
         .expect("cargo test failed");

@@ -4,14 +4,21 @@
 //
 // This module defines:
 // - Verdict: the full verdict ladder (Pass/TestFailure/GateFailure/InfraFailure/Cancelled/Superseded)
-// - FailureClass: detailed failure classification from verdict.json
-// - VerdictJson: versioned verdict.json parsing structure
 // - BackendError: minimal error type for backend operations
+// - BackendResult: Result alias used by every RemoteBackend method signature
 // - RunHandle: opaque handle returned by submit() and consumed by wait()
-// - RemoteBackend trait: submit / stream_logs / wait / describe / cancel
+// - RunStatus: coarse run-state query result (Pending/Running/Completed/Unknown)
+// - RemoteBackend trait: submit / stream_logs / wait / describe / cancel / status
+//
+// The verdict.json parsing types (FailureClass, VerdictJson) are defined in
+// [`crate::verdict`] — their single definition site — and re-exported here so
+// call sites that predate the extraction compile unchanged.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::PathBuf;
+
+pub use crate::verdict::{FailureClass, VerdictJson};
 
 /// Verdict: the terminal classification of a run (plan §"Data models", "Verdict semantics").
 ///
@@ -73,6 +80,22 @@ impl Verdict {
         matches!(self, Verdict::InfraFailure)
     }
 
+    /// Interpret a finished run's outcome: verdict.json when the remote produced
+    /// one, exit-code-only otherwise.
+    ///
+    /// This is the shared degradation contract (plan §"argo": "an absent
+    /// verdict.json degrades gracefully to exit-code-only interpretation").
+    /// `None` and an unparseable/mismatched-schema document both land on
+    /// [`Verdict::from_exit_code`]; a document that parses is authoritative —
+    /// its own exit code, infra signals, and failure class decide, even where
+    /// they disagree with `exit_code`.
+    pub fn interpret(exit_code: i32, verdict_json: Option<&str>) -> Self {
+        match verdict_json.map(VerdictJson::parse) {
+            Some(Ok(vj)) => vj.to_verdict(),
+            _ => Verdict::from_exit_code(exit_code),
+        }
+    }
+
     /// Check if this verdict means the tests actually ran (Pass, TestFailure, GateFailure).
     pub fn has_test_result(&self) -> bool {
         matches!(
@@ -122,6 +145,14 @@ impl fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// BackendResult: the Result alias behind every RemoteBackend method.
+///
+/// Defined once so trait signatures, implementations, and call sites agree on
+/// the error channel ([`BackendError`]) without re-spelling the full Result
+/// type. Type aliases are transparent — an implementation may write the
+/// expanded `Result<T, BackendError>` and still be a valid trait impl.
+pub type BackendResult<T> = Result<T, BackendError>;
+
 /// RunHandle: opaque handle returned by submit() and consumed by wait().
 ///
 /// Phase 0.5: the handle is the stdout of the submit command (a string identifier
@@ -145,11 +176,29 @@ impl RunHandle {
     }
 }
 
+/// RunStatus: coarse, non-terminal run state returned by status().
+///
+/// This is a point-in-time snapshot for polling, not a verdict — wait() remains
+/// the authoritative source for the run's outcome. Unknown covers both states
+/// a backend cannot determine (handle not recognized, query unsupported) so
+/// callers can distinguish "still going" from "no answer".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    /// The run is submitted but has not started executing yet.
+    Pending,
+    /// The run is currently executing.
+    Running,
+    /// The run reached a terminal state (see wait() for the verdict).
+    Completed,
+    /// The backend cannot determine the run's state.
+    Unknown,
+}
+
 /// RemoteBackend trait: the interface all remote executors must implement.
 ///
 /// Phase 0.5: only submit() and wait() need real bodies; stream_logs, describe,
-/// and cancel may panic. The command backend implements this trait using hardcoded
-/// argv arrays that invoke a local bash executor.
+/// cancel, and status may panic. The command backend implements this trait using
+/// hardcoded argv arrays that invoke a local bash executor.
 ///
 /// Phase 1a will add streaming, cancellation, and describe support; the Argo
 /// backend will implement the full trait.
@@ -161,13 +210,13 @@ pub trait RemoteBackend {
     ///
     /// Phase 0.5: submit runs the configured submit argv and captures its stdout
     /// as the handle. Failure (argv not found, non-zero exit) returns Err.
-    fn submit(&self, spec: &RunSpec) -> Result<RunHandle, BackendError>;
+    fn submit(&self, spec: &RunSpec) -> BackendResult<RunHandle>;
 
     /// Stream logs from the remote run to a writer (best-effort).
     ///
     /// Phase 0.5: may panic — this is not implemented in the skeleton.
     /// Phase 1a will implement this for both command and Argo backends.
-    fn stream_logs(&self, h: &RunHandle, out: &mut dyn std::io::Write) -> Result<(), BackendError> {
+    fn stream_logs(&self, h: &RunHandle, out: &mut dyn std::io::Write) -> BackendResult<()> {
         let _ = (h, out);
         panic!("stream_logs is not implemented in Phase 0.5");
     }
@@ -179,7 +228,7 @@ pub trait RemoteBackend {
     ///
     /// Phase 0.5: wait runs the configured wait argv with the handle and maps
     /// the exit code to a Verdict using the minimal ladder.
-    fn wait(&self, h: &RunHandle, deadline: std::time::Instant) -> Result<Verdict, BackendError>;
+    fn wait(&self, h: &RunHandle, deadline: std::time::Instant) -> BackendResult<Verdict>;
 
     /// Describe a run for human consumption (e.g., a URL to view logs).
     ///
@@ -196,145 +245,33 @@ pub trait RemoteBackend {
     /// Phase 0.5: may panic — this is not implemented in the skeleton.
     /// Phase 1a will implement cancellation for both backends (kubectl delete
     /// for Argo, a cancel argv for command templates).
-    fn cancel(&self, h: &RunHandle) -> Result<(), BackendError> {
+    fn cancel(&self, h: &RunHandle) -> BackendResult<()> {
         let _ = h;
         panic!("cancel is not implemented in Phase 0.5");
     }
-}
 
-/// FailureClass: detailed failure classification from verdict.json.
-///
-/// Derived from cargo's stable `--message-format json` stream in the remote
-/// executor. Allows agents to branch on failure type without parsing logs.
-///
-/// Phase 1a: supports compile-error, test-failure, doctest, harness-panic, gate-failure.
-/// Absent verdict.json = exit-code-only interpretation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum FailureClass {
-    /// Compilation error (cargo build/cargo check failed).
-    CompileError,
-    /// Test failure (cargo test found failing tests).
-    TestFailure,
-    /// Doctest failure.
-    Doctest,
-    /// Test harness panic (the test harness itself crashed).
-    HarnessPanic,
-    /// Quality gate failure (clippy, fmt, etc.) while tests passed.
-    GateFailure,
-}
-
-/// VerdictJson: versioned verdict.json structure from remote executor.
-///
-/// Emitted as a Workflow output parameter by the remote template. Contains
-/// the authoritative classification of the run outcome, including optional
-/// failure class and infrastructure signals (OOM, deadline exceeded).
-///
-/// Consumers ignore unknown fields; absent verdict.json degrades gracefully
-/// to exit-code-only interpretation (command contract).
-///
-/// Phase 1a: implements schema_version 1 with phase, exit_code, oom, deadline,
-/// and optional failure_class. Later versions may add fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerdictJson {
-    /// Schema version for backward compatibility.
-    #[serde(rename = "schema_version")]
-    pub schema_version: u32,
-
-    /// Workflow phase from status.phase (Succeeded, Failed, Error, etc.).
-    /// authoritative source for workflow-level outcome.
-    pub phase: String,
-
-    /// Exit code from the cargo/test run.
-    pub exit_code: i32,
-
-    /// Whether the pod was OOMKilled (InfraFailure signal).
-    #[serde(default)]
-    pub oom: bool,
-
-    /// Whether the workflow exceeded its deadline (InfraFailure signal).
-    #[serde(default)]
-    pub deadline_exceeded: bool,
-
-    /// Optional failure class from cargo --message-format json analysis.
-    /// Absent means exit-code-only interpretation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure_class: Option<FailureClass>,
-}
-
-impl VerdictJson {
-    /// Parse verdict.json from a JSON string.
+    /// Query the current status of a run without waiting for it to complete.
     ///
-    /// Returns Err if JSON is malformed or schema_version is unsupported.
-    pub fn parse(json: &str) -> Result<Self, BackendError> {
-        let parsed: Self = serde_json::from_str(json)
-            .map_err(|e| BackendError::new(&format!("failed to parse verdict.json: {}", e)))?;
-
-        // Validate schema version (Phase 1a only supports version 1)
-        if parsed.schema_version != 1 {
-            return Err(BackendError::new(&format!(
-                "unsupported verdict.json schema version: {}",
-                parsed.schema_version
-            )));
-        }
-
-        Ok(parsed)
-    }
-
-    /// Check if this verdict represents a gate failure.
+    /// This is a best-effort point-in-time snapshot — unlike wait() it never
+    /// blocks on the run and returns no verdict. Backends that cannot answer
+    /// should report RunStatus::Unknown rather than error, so polling callers
+    /// treat an unanswerable query as "no news" instead of a hard failure.
     ///
-    /// Gate failures occur when quality gates (clippy, fmt, etc.) fail
-    /// while the actual test suite passed. The remote contract attributes
-    /// these explicitly via failure_class or workflow phase semantics.
-    fn is_gate_failure(&self) -> bool {
-        // Explicit failure_class attribution takes precedence
-        if let Some(fc) = &self.failure_class {
-            if matches!(fc, FailureClass::GateFailure) {
-                return true;
-            }
-        }
-
-        // Phase-based detection: if workflow Failed but exit code suggests
-        // test pass (0) while overall phase is Failed, this is a gate failure
-        if self.phase == "Failed" && self.exit_code != 0 {
-            // Check if we have a failure_class that indicates test passed
-            // If failure_class is absent, we can't distinguish gate from test failure
-            // in exit-code-only mode, so we assume test failure (conservative)
-            false
-        } else {
-            false
-        }
-    }
-
-    /// Convert the verdict.json to a Verdict using full ladder semantics.
-    ///
-    /// Applies infra-failure classification (OOM, deadline) before gate failure
-    /// detection, then maps to test failures. Failure class provides authoritative
-    /// gate failure attribution; absent verdict.json degrades to exit-code-only.
-    pub fn to_verdict(&self) -> Verdict {
-        // InfraFailure signals take precedence (OOM, deadline exceeded)
-        if self.oom || self.deadline_exceeded {
-            return Verdict::InfraFailure;
-        }
-
-        // Gate failure detection (quality gate failed while tests passed)
-        if self.is_gate_failure() {
-            return Verdict::GateFailure;
-        }
-
-        // Standard exit code mapping for test failures and pass
-        match self.exit_code {
-            0 => Verdict::Pass,
-            1 => Verdict::TestFailure,
-            _ => Verdict::InfraFailure,
-        }
+    /// Phase 0.5: may panic — this is not implemented in the skeleton.
+    /// Later phases will map backend state onto RunStatus (Argo status.phase,
+    /// command-backend process liveness).
+    fn status(&self, h: &RunHandle) -> BackendResult<RunStatus> {
+        let _ = h;
+        panic!("status is not implemented in Phase 0.5");
     }
 }
 
 /// RunSpec: the specification of a run to submit to the remote backend.
 ///
-/// Phase 0.5: minimal struct with repo URL, SHA, and args.
-/// Phase 1a will expand this to include tool, subcommand, cwd_rel, and more.
+/// All six fields are plan-mandated (plan §"Data models" → RunSpec). `cwd_rel`
+/// is the caller's directory relative to the repo root; remote executors `cd`
+/// into it before running the argv, so workspace-member invocations behave
+/// identically remote and local.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunSpec {
     /// Tool to run (e.g., "cargo", "pytest").
@@ -348,11 +285,14 @@ pub struct RunSpec {
     /// Commit SHA to run (the content the executor checks out).
     pub sha: String,
     /// Working directory relative to repo root (e.g., "", "crates/foo").
-    pub cwd_rel: String,
+    pub cwd_rel: PathBuf,
 }
 
 impl RunSpec {
     /// Create a new RunSpec.
+    ///
+    /// `cwd_rel` takes a string path relative to the repo root ("" = root) and
+    /// is stored as a `PathBuf`, per plan §"Data models".
     pub fn new(
         tool: &str,
         subcommand: &str,
@@ -367,7 +307,7 @@ impl RunSpec {
             args,
             repo_url: repo_url.to_string(),
             sha: sha.to_string(),
-            cwd_rel: cwd_rel.to_string(),
+            cwd_rel: PathBuf::from(cwd_rel),
         }
     }
 }
@@ -466,5 +406,209 @@ mod tests {
                 v
             );
         }
+    }
+
+    #[test]
+    fn display_matches_variant_names_exactly() {
+        // Display output is user-facing (banner, logs, close reasons), so the
+        // spelling is contractual: assert each variant's exact string rather
+        // than something loosely derived from Debug.
+        let cases = [
+            (Verdict::Pass, "Pass"),
+            (Verdict::TestFailure, "TestFailure"),
+            (Verdict::GateFailure, "GateFailure"),
+            (Verdict::InfraFailure, "InfraFailure"),
+            (Verdict::Cancelled, "Cancelled"),
+            (Verdict::Superseded, "Superseded"),
+        ];
+        for (v, expected) in cases {
+            assert_eq!(v.to_string(), expected, "Display for {}", v);
+        }
+    }
+
+    #[test]
+    fn run_handle_new_maps_the_handle_string() {
+        let h = RunHandle::new("gantry-abc123");
+        assert_eq!(h.handle, "gantry-abc123");
+        // The handle is opaque — no mangling, trimming, or validation expected.
+        let weird = RunHandle::new("  spaced/raw !handle ");
+        assert_eq!(weird.handle, "  spaced/raw !handle ");
+    }
+
+    #[test]
+    fn run_spec_new_maps_every_field() {
+        let args = vec!["--".to_string(), "--nocapture".to_string()];
+        let spec = RunSpec::new(
+            "cargo",
+            "test",
+            args.clone(),
+            "file:///tmp/repo",
+            "0123456789abcdef",
+            "crates/foo",
+        );
+        assert_eq!(spec.tool, "cargo");
+        assert_eq!(spec.subcommand, "test");
+        assert_eq!(spec.args, args);
+        assert_eq!(spec.repo_url, "file:///tmp/repo");
+        assert_eq!(spec.sha, "0123456789abcdef");
+        assert_eq!(spec.cwd_rel, PathBuf::from("crates/foo"));
+    }
+
+    #[test]
+    fn backend_error_new_maps_reason_and_impls_error() {
+        let e = BackendError::new("workflow vanished");
+        assert_eq!(e.reason, "workflow vanished");
+        // Display delegates to the reason, so `e` formats as the bare message.
+        assert_eq!(e.to_string(), "workflow vanished");
+        // std::error::Error is a marker today; exercise it through the trait
+        // object so the impl cannot silently disappear.
+        let boxed: Box<dyn std::error::Error> = Box::new(e.clone());
+        assert_eq!(boxed.to_string(), "workflow vanished");
+    }
+
+    /// A backend that does not override status() inherits the Phase-0.5 default
+    /// body (same convention as stream_logs/describe/cancel) and keeps compiling
+    /// unchanged until it implements the query. SkeletonBackend implements only
+    /// the two required methods, so every default — status included — is the
+    /// inherited body.
+    struct SkeletonBackend;
+
+    impl RemoteBackend for SkeletonBackend {
+        fn submit(&self, _spec: &RunSpec) -> BackendResult<RunHandle> {
+            Err(BackendError::new("skeleton backend submits nothing"))
+        }
+
+        fn wait(&self, _h: &RunHandle, _deadline: std::time::Instant) -> BackendResult<Verdict> {
+            Err(BackendError::new("skeleton backend waits on nothing"))
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "status is not implemented in Phase 0.5")]
+    fn default_status_follows_phase05_panic_convention() {
+        let backend = SkeletonBackend;
+        let _ = backend.status(&RunHandle::new("unused"));
+    }
+
+    /// A stub that answers from the handle string alone: submit() encodes the
+    /// spec's sha into the handle, and status()/wait() consume it. Holds no
+    /// state and touches no filesystem or environment, so the tests below are
+    /// safe under parallel execution.
+    struct StubBackend;
+
+    impl StubBackend {
+        fn run_spec(sha: &str) -> RunSpec {
+            RunSpec::new("cargo", "test", vec![], "file:///tmp/gantry-stub", sha, "")
+        }
+
+        fn deadline_ahead() -> std::time::Instant {
+            std::time::Instant::now() + std::time::Duration::from_secs(60)
+        }
+    }
+
+    impl RemoteBackend for StubBackend {
+        fn submit(&self, spec: &RunSpec) -> BackendResult<RunHandle> {
+            Ok(RunHandle::new(&format!("stub-{}", spec.sha)))
+        }
+
+        fn status(&self, h: &RunHandle) -> BackendResult<RunStatus> {
+            match h.handle.as_str() {
+                "stub-pass" | "stub-fail" => Ok(RunStatus::Running),
+                other => Err(BackendError::new(&format!("unknown handle {other:?}"))),
+            }
+        }
+
+        fn wait(&self, h: &RunHandle, deadline: std::time::Instant) -> BackendResult<Verdict> {
+            if std::time::Instant::now() > deadline {
+                return Err(BackendError::new("deadline passed"));
+            }
+            match h.handle.as_str() {
+                "stub-pass" => Ok(Verdict::Pass),
+                "stub-fail" => Ok(Verdict::TestFailure),
+                other => Err(BackendError::new(&format!("unknown handle {other:?}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn backend_result_alias_is_transparent_with_result() {
+        // Compile-level contract: a BackendResult flows into and out of
+        // positions expecting the spelled-out Result type unchanged.
+        fn take_result(r: Result<Verdict, BackendError>) -> BackendResult<Verdict> {
+            r
+        }
+        let alias: BackendResult<Verdict> = Ok(Verdict::Pass);
+        assert_eq!(take_result(alias), Ok(Verdict::Pass));
+
+        let err: BackendResult<Verdict> = Err(BackendError::new("no run"));
+        assert_eq!(
+            take_result(err).err().map(|e| e.reason),
+            Some("no run".to_string())
+        );
+    }
+
+    #[test]
+    fn dyn_backend_submit_returns_a_run_handle() {
+        let backend: &dyn RemoteBackend = &StubBackend;
+        let h = backend
+            .submit(&StubBackend::run_spec("pass"))
+            .expect("stub submit succeeds");
+        assert_eq!(
+            h.handle, "stub-pass",
+            "handle carries the submitted sha for status()/wait() to consume"
+        );
+    }
+
+    #[test]
+    fn dyn_backend_status_consumes_the_handle() {
+        let backend: Box<dyn RemoteBackend> = Box::new(StubBackend);
+        let h = backend
+            .submit(&StubBackend::run_spec("pass"))
+            .expect("submit");
+        assert_eq!(
+            backend.status(&h).expect("status"),
+            RunStatus::Running,
+            "submitted run reports Running"
+        );
+
+        // A handle the backend did not issue is an Err, not a fabricated state.
+        let err = backend
+            .status(&RunHandle::new("stub-never-submitted"))
+            .expect_err("unknown handle errors");
+        assert!(
+            err.reason.contains("unknown handle"),
+            "unexpected error: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn dyn_backend_wait_consumes_the_handle_and_yields_the_verdict() {
+        let backend: &dyn RemoteBackend = &StubBackend;
+        let deadline = StubBackend::deadline_ahead();
+
+        let h = backend
+            .submit(&StubBackend::run_spec("pass"))
+            .expect("submit");
+        assert_eq!(backend.wait(&h, deadline).expect("wait"), Verdict::Pass);
+
+        let h = backend
+            .submit(&StubBackend::run_spec("fail"))
+            .expect("submit");
+        assert_eq!(
+            backend.wait(&h, deadline).expect("wait"),
+            Verdict::TestFailure
+        );
+    }
+
+    #[test]
+    fn dyn_backend_wait_honours_an_elapsed_deadline() {
+        let backend: &dyn RemoteBackend = &StubBackend;
+        let h = backend
+            .submit(&StubBackend::run_spec("pass"))
+            .expect("submit");
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let err = backend.wait(&h, past).expect_err("elapsed deadline errors");
+        assert_eq!(err.reason, "deadline passed");
     }
 }
