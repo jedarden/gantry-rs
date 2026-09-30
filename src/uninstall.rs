@@ -436,17 +436,24 @@ pub fn execute(targets: &UninstallTargets, path_var: &str, opts: &Options) -> Ou
     //    see), and resolve where `cargo` lands now — the positive half of
     //    "no shim directory shadowing the real toolchain".
     //
+    //    The survivor sweep runs on real runs only: a dry run removed
+    //    nothing, so every classified artifact is still on PATH by design —
+    //    reporting it as a leftover would make --dry-run exit 1 precisely
+    //    when the uninstall it previews would be clean.
+    //
     //    The content-identical copy check needs the live binary; once the
     //    binary is gone, surviving symlinks are still caught by link-text
     //    matching, and a surviving *copy* (removal failed while the binary's
     //    succeeded) is caught here only when the binary still exists — the
     //    first scan already handled the normal case.
-    let survivors = scan_path(path_var, &targets.self_binary, self_alt);
-    for survivor in survivors {
-        out.leftovers.push(format!(
-            "leftover: gantry shim still on PATH: {}",
-            survivor.display()
-        ));
+    if !opts.dry_run {
+        let survivors = scan_path(path_var, &targets.self_binary, self_alt);
+        for survivor in survivors {
+            out.leftovers.push(format!(
+                "leftover: gantry shim still on PATH: {}",
+                survivor.display()
+            ));
+        }
     }
     out.cargo_resolves_to = resolve_cargo_after(path_var, &targets.self_binary, self_alt);
 
@@ -618,7 +625,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// The fake gantry binary: a regular file with known bytes, named
-    /// `gantry` so the binary-name rule allows its deletion.
+    /// exactly `gantry` — the binary-name rule only deletes that name —
+    /// inside a per-test temp dir, which is what keeps installs distinct.
     struct FakeInstall {
         // Held so the tree outlives the test body's assertions.
         _dir: tempfile::TempDir,
@@ -628,7 +636,7 @@ mod tests {
     impl FakeInstall {
         fn new(tag: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let binary = dir.path().join(format!("gantry-{tag}"));
+            let binary = dir.path().join("gantry");
             fs::write(&binary, format!("gantry-binary-{tag}")).unwrap();
             FakeInstall { _dir: dir, binary }
         }
@@ -689,12 +697,12 @@ mod tests {
 
     #[test]
     fn relative_symlink_to_self_is_an_artifact() {
-        // `ln -s gantry-… cargo` inside the binary's own directory — the
+        // `ln -s gantry cargo` inside the binary's own directory — the
         // link text is relative and must still classify.
         let fake = FakeInstall::new("b");
         let dir = fake.binary.parent().unwrap();
         let link = dir.join("cargo");
-        symlink(Path::new(fake.binary.file_name().unwrap()), &link);
+        symlink(&link, Path::new(fake.binary.file_name().unwrap()));
         assert!(is_gantry_artifact(&link, &fake.binary, &fake.binary));
     }
 
@@ -705,7 +713,7 @@ mod tests {
         let fake = FakeInstall::new("c");
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("cargo");
-        symlink(&fake.binary, &link);
+        symlink(&link, &fake.binary);
         fs::remove_file(&fake.binary).unwrap();
         assert!(is_gantry_artifact(&link, &fake.binary, &fake.binary));
     }
@@ -732,7 +740,7 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         let real_bin = script(other.path(), "real-cargo", "#!/bin/sh\nexit 0\n");
         let linked = dir.path().join("cargo.exe");
-        symlink(&real_bin, &linked);
+        symlink(&linked, &real_bin);
         assert!(!is_gantry_artifact(&linked, &fake.binary, &fake.binary));
     }
 
@@ -967,7 +975,7 @@ mod tests {
         let fake = FakeInstall::new("m");
         let bin_dir = tempfile::tempdir().unwrap();
         let wrapper = bin_dir.path().join("gantry");
-        symlink(&fake.binary, &wrapper);
+        symlink(&wrapper, &fake.binary);
 
         let targets = UninstallTargets {
             self_binary: fake.binary.clone(),
