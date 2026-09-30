@@ -436,6 +436,87 @@ fn infra_failure_round_trips_to_a_readable_redacted_report() {
     );
 }
 
+/// The packaging leg on its own (parent acceptance AS-2, bead
+/// gantry-f6c93e5a; packaging bead gantry-4736e7ed). The round trip above
+/// packages once inline on its way past; this test drives `--package` to a
+/// fresh temp destination and holds the PACKAGED BYTES — the actual artifact
+/// read back out of the destination, not the source bundle — to the same
+/// two-sided bar: readable (every recorded artifact survives the package
+/// round trip byte-for-byte, manifest and verdict content included) and
+/// credential-clean (the redaction mark is present, and no drill literal
+/// appears anywhere in the packaged artifact).
+#[test]
+fn packaged_bundle_is_readable_and_credential_clean() {
+    let world = CrashWorld::new("package");
+
+    // The same synthetic InfraFailure as the round trip: the intercepted run
+    // dies at push, lands in decision.rs's record call site, exits non-zero.
+    let (code, stdout, stderr) = world.run_shim();
+    assert_eq!(code, 1, "push-rejected run exits 1; stdout:\n{stdout}");
+    assert!(
+        stderr.contains("[gantry] verdict: PushFailed"),
+        "the shim must announce the push failure; stderr:\n{stderr}"
+    );
+    let (run_id, dir) = world.bundle();
+
+    // Package to a temp destination — neither the state dir nor the source
+    // bundle (packaging refuses to clobber, so the destination is fresh).
+    let scratch = TempDir::new().expect("create package scratch dir");
+    let dest = scratch.path().join("packaged-bundle");
+    let (code, stdout, _) =
+        world.run_cli(&["report", &run_id, "--package", dest.to_str().unwrap()]);
+    assert_eq!(code, 0, "--package exits 0; stdout:\n{stdout}");
+    assert!(
+        stdout.contains("packaged crash bundle"),
+        "--package announces the copy; got:\n{stdout}"
+    );
+
+    // Read the packaged artifact back and prove nothing was lost in the
+    // package round trip: same artifact set, same names, byte-identical
+    // contents. The packaged copy is what would be attached to an issue, so
+    // it must stand alone — manifest still self-identifying, verdict content
+    // (the push stage and the pusher's reason) still readable.
+    let packaged = read_bundle(&dest);
+    let on_disk = read_bundle(&dir);
+    assert_eq!(
+        packaged.len(),
+        on_disk.len(),
+        "packaging must carry every recorded artifact; packaged {:?}",
+        packaged.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    for ((name, packaged_text), (source_name, source_text)) in packaged.iter().zip(&on_disk) {
+        assert_eq!(name, source_name, "packaged artifact set differs from the bundle");
+        assert_eq!(
+            packaged_text, source_text,
+            "packaged {name} must be byte-identical to the recorded artifact"
+        );
+    }
+    let manifest = &packaged.iter().find(|(n, _)| n == "manifest.json").unwrap().1;
+    assert!(
+        manifest.contains(&run_id),
+        "packaged manifest is self-identifying; got:\n{manifest}"
+    );
+    let events = &packaged.iter().find(|(n, _)| n == "events.jsonl").unwrap().1;
+    assert!(
+        events.contains("\"stage\":\"push\""),
+        "verdict content survives packaging: the push stage; got:\n{events}"
+    );
+    let push_artifact = &packaged
+        .iter()
+        .find(|(n, _)| n == "backend-push.txt")
+        .unwrap()
+        .1;
+    assert!(
+        push_artifact.contains("git push failed"),
+        "verdict content survives packaging: the pusher's reason; got:\n{push_artifact}"
+    );
+
+    // Credential-clean against the packaged bytes themselves: the mark is
+    // present (the redactor engaged before write) and no drill literal
+    // survives anywhere in the artifact.
+    assert_redacted(&packaged, "packaged artifact bytes");
+}
+
 /// A run id with no bundle is a clean miss: exit 1, a stated reason, not a
 /// panic and not a silent zero.
 #[test]
