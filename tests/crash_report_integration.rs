@@ -485,18 +485,29 @@ fn packaged_bundle_is_readable_and_credential_clean() {
         packaged.iter().map(|(n, _)| n).collect::<Vec<_>>()
     );
     for ((name, packaged_text), (source_name, source_text)) in packaged.iter().zip(&on_disk) {
-        assert_eq!(name, source_name, "packaged artifact set differs from the bundle");
+        assert_eq!(
+            name, source_name,
+            "packaged artifact set differs from the bundle"
+        );
         assert_eq!(
             packaged_text, source_text,
             "packaged {name} must be byte-identical to the recorded artifact"
         );
     }
-    let manifest = &packaged.iter().find(|(n, _)| n == "manifest.json").unwrap().1;
+    let manifest = &packaged
+        .iter()
+        .find(|(n, _)| n == "manifest.json")
+        .unwrap()
+        .1;
     assert!(
         manifest.contains(&run_id),
         "packaged manifest is self-identifying; got:\n{manifest}"
     );
-    let events = &packaged.iter().find(|(n, _)| n == "events.jsonl").unwrap().1;
+    let events = &packaged
+        .iter()
+        .find(|(n, _)| n == "events.jsonl")
+        .unwrap()
+        .1;
     assert!(
         events.contains("\"stage\":\"push\""),
         "verdict content survives packaging: the push stage; got:\n{events}"
