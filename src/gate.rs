@@ -79,9 +79,19 @@ fn is_inside_work_tree_in(dir: &Path) -> Result<bool, String> {
     let output = git_output(dir, &["rev-parse", "--is-inside-work-tree"])?;
 
     if !output.status.success() {
+        // Outside any repository rev-parse exits non-zero with "fatal: not
+        // a git repository" — the routine "no" answer, not a git failure.
+        // Fold it into the ordinary Ok(false) so the gate rejects with the
+        // work-tree reason and the fallback ladder runs; panicking here
+        // would crash `gantry run` (and the unit suite) from every
+        // non-repo cwd instead of falling back locally.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not a git repository") {
+            return Ok(false);
+        }
         return Err(format!(
             "git rev-parse --is-inside-work-tree failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr
         ));
     }
 
@@ -548,6 +558,42 @@ mod tests {
         git_cmd(repo_dir.path(), &["commit", "-m", "Initial commit"]).expect("git commit");
 
         (repo_dir, remote_dir.0.clone())
+    }
+
+    #[test]
+    fn plain_directory_answers_not_inside_work_tree() {
+        // Check 1's other "no" case: a directory that is not a repository
+        // at all. rev-parse exits non-zero there; the helper must fold that
+        // into the ordinary Ok(false) answer so the gate can reject with
+        // the work-tree reason instead of surfacing an Err (EC: non-repo
+        // cwd degrades to the local fallback, it does not crash).
+        let plain_dir = TempDir::new("not-a-repo");
+
+        assert_eq!(is_inside_work_tree_in(plain_dir.path()), Ok(false));
+    }
+
+    #[test]
+    fn gate_on_a_plain_directory_rejects_without_panicking() {
+        // The decision fallback ladder only engages on an Eligibility
+        // rejection, so check 1 must produce one outside any repository
+        // rather than panicking — otherwise `gantry run` from a non-repo
+        // cwd (an extraction dir, /tmp, $HOME) dies instead of running the
+        // wrapped command locally.
+        let plain_dir = TempDir::new("gate-not-a-repo");
+
+        let result = check_git_gate_in(plain_dir.path(), "origin");
+
+        assert!(!result.eligible, "non-repo directory must be ineligible");
+        assert!(
+            result.reason.contains("work tree"),
+            "reason should mention the work tree, got: {}",
+            result.reason
+        );
+        assert!(
+            !result.next_action.is_empty(),
+            "next_action should not be empty for ineligibility, got: {}",
+            result.next_action
+        );
     }
 
     #[test]
