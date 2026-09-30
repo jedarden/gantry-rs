@@ -232,7 +232,24 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     }
 
     // Step 4: Submit to command backend
-    let backend = CommandBackend::new();
+    //
+    // The backend runs the argv templates the config resolved (user layer —
+    // the repo layer cannot set them, trust boundary S-2). Before
+    // gantry-f6c93e5a this site built the default-templated backend
+    // unconditionally, so a
+    // configured `[remote.command]` was silently dead: every submit ran the
+    // `./contrib/gantry-exec.sh` default and failed with "command not found"
+    // no matter what the user configured. `command: None` (backend = command
+    // with no template table) keeps the default templates.
+    let backend = match &config.remote.command {
+        Some(c) => CommandBackend::with_config(crate::backend::command::CommandConfig {
+            submit: c.submit.clone(),
+            logs: c.logs.clone(),
+            wait: c.wait.clone(),
+            status: None, // the config schema carries no status step (RawCommand)
+        }),
+        None => CommandBackend::new(),
+    };
 
     // Extract tool, subcommand, and args from the intercepted command
     // Phase 0.5: tool is always "cargo", cwd_rel is empty (repo root)
