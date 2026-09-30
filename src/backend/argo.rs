@@ -881,7 +881,10 @@ impl RemoteBackend for ArgoBackend {
     /// is deadline-aware in both directions: it re-checks the deadline before
     /// every poll, and each pending sleep is clamped to the time remaining —
     /// wait() can never loop (or sleep) past its deadline. Expiry is a loud
-    /// [`BackendError`], which the caller classifies as InfraFailure.
+    /// [`BackendError`] (structured `deadline_exceeded`, so the caller
+    /// classifies it InfraFailure — never a fabricated verdict) carrying
+    /// [`Self::describe`]: the watch is abandoned, the workflow itself keeps
+    /// running on the cluster, and the run URL is how the operator finds it.
     ///
     /// The phase ladder is explicit ([`WorkflowPhase`]): no status / bare
     /// status / Pending / Running are pending; Succeeded / Failed / Error are
@@ -910,11 +913,18 @@ impl RemoteBackend for ArgoBackend {
     ) -> Result<Verdict, BackendError> {
         loop {
             // Deadline first: no poll, sleep, or verdict may happen past it.
+            // The expiry abandons the watch — it does not cancel the
+            // workflow — so the error carries describe(): the run URL (or
+            // bare identifier) the operator needs once gantry stops
+            // watching (features.md v1.x "here's-the-run-URL message").
             if Instant::now() >= deadline {
-                return Err(BackendError::new(&format!(
-                    "workflow {} deadline exceeded while polling status.phase",
-                    h.handle
-                )));
+                return Err(BackendError::deadline_with_url(
+                    &format!(
+                        "workflow {} deadline exceeded while polling status.phase",
+                        h.handle
+                    ),
+                    &self.describe(h),
+                ));
             }
 
             // The `status` stanza is absent until the controller first
@@ -2004,7 +2014,7 @@ mod tests {
     fn wait_unsupported_schema_version_degrades_to_exit_code_only() {
         // Claims exit 1 — but a document this parser rejects is not
         // interpreted at all: the Succeeded phase decides, and that is Pass.
-        let future = r#"{"schema_version": 2, "phase": "Succeeded", "exit_code": 1}"#;
+        let future = r#"{"schema_version": 3, "phase": "Succeeded", "exit_code": 1}"#;
         let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json_with_verdict(
             "Succeeded",
             future,
@@ -2030,7 +2040,7 @@ mod tests {
             None,
             Some("{not json".to_string()),
             Some(String::new()),
-            Some(r#"{"schema_version": 2, "phase": "Succeeded", "exit_code": 1}"#.to_string()),
+            Some(r#"{"schema_version": 3, "phase": "Succeeded", "exit_code": 1}"#.to_string()),
         ];
         for shape in &shapes {
             let status_for = |terminal: &str| match shape {
@@ -2084,6 +2094,97 @@ mod tests {
         // Exactly one poll happened: the clamped sleep lands at (or past)
         // the deadline, so the loop errors before a second kubectl call.
         assert_eq!(calls_of(&calls).len(), 1, "wait polled past its deadline");
+    }
+
+    /// The expiry error is the structured deadline expiry AND it names the
+    /// run URL: the watch is abandoned, the workflow keeps running on the
+    /// cluster, and the operator needs describe() to find it (features.md
+    /// v1.x "a clear timed-out, here's-the-run-URL message").
+    #[test]
+    fn wait_expiry_error_is_structured_and_carries_the_run_url() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(tmp.path(), "#!/usr/bin/env bash\nexit 1\n");
+        let base = "https://argo.example.com";
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            base_url: Some(base.to_string()),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .wait(&handle, Instant::now() - Duration::from_secs(1))
+            .expect_err("wait must fail once the deadline has passed");
+        assert!(
+            err.deadline_exceeded,
+            "expiry must be the structured deadline error, got: {}",
+            err.reason
+        );
+        let expected_url = format!("{}/workflows/{}/gantry-abc123", base, backend.config.namespace);
+        assert_eq!(
+            err.run_url.as_deref(),
+            Some(expected_url.as_str()),
+            "the expiry error must carry describe()'s run URL"
+        );
+    }
+
+    /// A run that never reaches a terminal phase stops being watched at the
+    /// deadline: the structured expiry (with the run URL) comes out, and no
+    /// poll happens past the deadline — the watch loop cannot hang forever
+    /// on a workflow that never finishes.
+    #[test]
+    fn wait_midpoll_expiry_stops_watching_and_names_the_run_url() {
+        let (fake, _calls) = FakeKubectl::serving(vec![ok_outcome(&status_json("Running"))]);
+        let base = "https://argo.example.com";
+        let backend = ArgoBackend::with_runner(
+            ArgoConfig {
+                base_url: Some(base.to_string()),
+                ..ArgoConfig::default()
+            },
+            fake,
+        );
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .wait(&handle, Instant::now() + Duration::from_millis(150))
+            .expect_err("a never-finishing run must hit the deadline");
+        assert!(
+            err.deadline_exceeded,
+            "mid-poll expiry must be the structured deadline error, got: {}",
+            err.reason
+        );
+        assert!(
+            err.run_url
+                .as_deref()
+                .is_some_and(|u| u.contains("/workflows/") && u.ends_with("/gantry-abc123")),
+            "the expiry must carry describe()'s run URL, got: {:?}",
+            err.run_url
+        );
+    }
+
+    /// Without a configured base_url, describe() degrades to the bare
+    /// `workflow/<name>` identifier — the timeout line still points the
+    /// operator at something findable (`kubectl get workflow <name>`),
+    /// never at nothing.
+    #[test]
+    fn wait_expiry_without_base_url_falls_back_to_the_workflow_identifier() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(tmp.path(), "#!/usr/bin/env bash\nexit 1\n");
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .wait(&handle, Instant::now() - Duration::from_secs(1))
+            .expect_err("wait must fail once the deadline has passed");
+        assert!(err.deadline_exceeded);
+        assert_eq!(
+            err.run_url.as_deref(),
+            Some("workflow/gantry-abc123"),
+            "no base_url must degrade to the workflow identifier"
+        );
     }
 
     /// An unrecognized phase string is a loud error naming the value — not a

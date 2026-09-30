@@ -476,6 +476,24 @@ pub struct VerdictRecord {
     /// Exit code from the run.
     pub exit_code: i32,
 
+    /// Failure taxonomy class (verdict.json v2, plan §Component 5): what the
+    /// remote run died of — compile-error / test-failure / doctest /
+    /// harness-panic — when it ran to completion, failed, and was
+    /// instrumented with `--message-format json`. `None` for passes, infra,
+    /// cancels, local runs, and uninstrumented producers; `gate-failure` is
+    /// never derived, only attributed by the producer.
+    ///
+    /// Lenient on read, exactly like verdict.json: a class string a newer
+    /// producer coined reads as absent rather than failing the record parse.
+    /// Additive on write (skipped when absent), so records from either
+    /// schema parse everywhere the ledger does — `SCHEMA_VERSION` stays 1.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::verdict::deserialize_lenient_failure_class"
+    )]
+    pub failure_class: Option<crate::verdict::FailureClass>,
+
     /// Backend handle (workflow name, etc.) for `gantry why`.
     pub handle: String,
 
@@ -504,6 +522,7 @@ impl VerdictRecord {
             verdict,
             ran,
             exit_code,
+            failure_class: None,
             handle,
             durations_ms,
         }

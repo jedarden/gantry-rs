@@ -134,6 +134,13 @@ pub struct BackendError {
     /// timeout elapsed before a verdict). Never true for spawn errors,
     /// parse errors, or remote test results.
     pub deadline_exceeded: bool,
+    /// Where the abandoned run can still be watched — the backend's own run
+    /// URL/identifier (the argo UI URL for the argo backend). Deadline
+    /// expiry stops the watch but leaves the run alive on the remote, so
+    /// the `[gantry] timeout` line appends this to point the operator at
+    /// it. `None` on every other error, and on a backend with no watchable
+    /// URL (the line then names the run by handle alone).
+    pub run_url: Option<String>,
 }
 
 impl BackendError {
@@ -142,6 +149,7 @@ impl BackendError {
         BackendError {
             reason: reason.to_string(),
             deadline_exceeded: false,
+            run_url: None,
         }
     }
 
@@ -151,6 +159,19 @@ impl BackendError {
         BackendError {
             reason: reason.to_string(),
             deadline_exceeded: true,
+            run_url: None,
+        }
+    }
+
+    /// Create a deadline-expiry BackendError carrying the run URL: like
+    /// [`BackendError::deadline`], plus where the abandoned run can still
+    /// be watched (features.md v1.x "a clear timed-out, here's-the-run-URL
+    /// message"). Expiry stops the watch; it does not cancel the run.
+    pub fn deadline_with_url(reason: &str, run_url: &str) -> Self {
+        BackendError {
+            reason: reason.to_string(),
+            deadline_exceeded: true,
+            run_url: Some(run_url.to_string()),
         }
     }
 }
@@ -482,6 +503,32 @@ mod tests {
         // object so the impl cannot silently disappear.
         let boxed: Box<dyn std::error::Error> = Box::new(e.clone());
         assert_eq!(boxed.to_string(), "workflow vanished");
+    }
+
+    #[test]
+    fn backend_error_deadline_constructors_flag_expiry_and_carry_the_url() {
+        // Only the expiry constructors raise the flag — a spawn error or a
+        // parse error must never print the timeout line — and the run URL
+        // rides only the constructor built for it: the plain expiry keeps
+        // the bare timeout line (the command backend's contract), the
+        // with-url expiry hands the operator something to watch.
+        let plain = BackendError::new("pod vanished");
+        assert!(!plain.deadline_exceeded);
+        assert_eq!(plain.run_url, None);
+
+        let expiry = BackendError::deadline("run h-1 deadline exceeded");
+        assert!(expiry.deadline_exceeded);
+        assert_eq!(expiry.run_url, None);
+
+        let with_url = BackendError::deadline_with_url(
+            "run h-2 deadline exceeded",
+            "https://argo.example.com/workflows/ns/h-2",
+        );
+        assert!(with_url.deadline_exceeded);
+        assert_eq!(
+            with_url.run_url.as_deref(),
+            Some("https://argo.example.com/workflows/ns/h-2")
+        );
     }
 
     /// A backend that does not override status() inherits the Phase-0.5 default

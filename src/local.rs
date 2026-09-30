@@ -999,6 +999,48 @@ pub fn run_fallback(
     infra_reason: &str,
     ctx: &FallbackContext<'_>,
 ) -> i32 {
+    // Same resolution contract as every local tail: the shim's rules, never
+    // a fallback-to-self (plan §1).
+    let real = match crate::shim::resolve_real_binary(config) {
+        Ok(path) => path,
+        Err(why) => {
+            eprintln!("[gantry] {why}");
+            // Flight recorder (plan Component 7): the fallback is an
+            // InfraFailure tail like the remote stages, so the bundle is
+            // written before the verdict record closes the run.
+            crate::crash::record_stage(
+                config,
+                ctx.run_id,
+                "fallback-resolve",
+                &why.to_string(),
+                None,
+                None,
+                None,
+            );
+            record_fallback_verdict(ctx, Verdict::InfraFailure, 1, 0, 0);
+            eprintln!("[gantry] verdict: InfraFailure");
+            return 1;
+        }
+    };
+    run_fallback_program(config, &real, args, infra_reason, ctx)
+}
+
+/// The fallback tail for an already-resolved program — [`run_fallback`] with
+/// the spawn target supplied by the caller instead of resolved `cargo`.
+///
+/// `gantry run` lands here on every remote-path infra failure: the wrapped
+/// command is not cargo, so resolution is the caller's business (it applies
+/// [`crate::shim::resolve_command_binary`] to the wrapped argv's own program
+/// and owns the resolve-failure contract); this tail is everything after —
+/// the loud infra lines, the admission slot, the capped spawn, and the
+/// `ran: local_after_infra` verdict record.
+pub fn run_fallback_program(
+    config: &Config,
+    program: &Path,
+    args: &[String],
+    infra_reason: &str,
+    ctx: &FallbackContext<'_>,
+) -> i32 {
     // Repo URL and sha need no re-passing: the intent written upstream already
     // carries them, and the verdict record below closes that same run id.
     eprintln!("[gantry] infra: {infra_reason}");
@@ -1038,36 +1080,8 @@ pub fn run_fallback(
     }
     let queue_ms = queue_start.elapsed().as_millis() as u64;
 
-    // Same resolution contract as every local tail: the shim's rules, never
-    // a fallback-to-self (plan §1).
     let run_start = Instant::now();
-    let real = match crate::shim::resolve_real_binary(config) {
-        Ok(path) => path,
-        Err(why) => {
-            eprintln!("[gantry] {why}");
-            // Flight recorder (plan Component 7): the fallback is an
-            // InfraFailure tail like the remote stages, so the bundle is
-            // written before the verdict record closes the run.
-            crate::crash::record_stage(
-                config,
-                ctx.run_id,
-                "fallback-resolve",
-                &why.to_string(),
-                None,
-                None,
-                None,
-            );
-            record_fallback_verdict(
-                ctx,
-                Verdict::InfraFailure,
-                1,
-                queue_ms,
-                run_start.elapsed().as_millis() as u64,
-            );
-            eprintln!("[gantry] verdict: InfraFailure");
-            return 1;
-        }
-    };
+    let real = program.to_path_buf();
 
     // Slice-placed and per-run-capped (plan Component 6): the capped fallback
     // is exactly the run class the boxwide slice exists to bound.
