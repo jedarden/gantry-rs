@@ -351,13 +351,16 @@ pub fn execute(targets: &UninstallTargets, path_var: &str, opts: &Options) -> Ou
     // 2b. A wrapper symlink onto the binary (distinct pre-canonicalization
     //     executable path) dangles once the binary is gone — remove it too.
     if let Some(wrapper) = &targets.self_wrapper {
-        if wrapper != &targets.self_binary && is_gantry_artifact(wrapper, &targets.self_binary, wrapper)
+        if wrapper != &targets.self_binary
+            && is_gantry_artifact(wrapper, &targets.self_binary, wrapper)
         {
             if opts.dry_run {
                 out.removed_wrapper = Some(wrapper.clone());
             } else if let Err(e) = fs::remove_file(wrapper) {
-                out.leftovers
-                    .push(format!("leftover: could not remove {}: {e}", wrapper.display()));
+                out.leftovers.push(format!(
+                    "leftover: could not remove {}: {e}",
+                    wrapper.display()
+                ));
             } else {
                 out.removed_wrapper = Some(wrapper.clone());
             }
@@ -558,7 +561,11 @@ pub fn cli(args: &[String]) -> i32 {
 /// future tense on a dry run — the same list, so a dry run is exactly the
 /// preview of the run.
 fn print_report(outcome: &Outcome) {
-    let verb = if outcome.dry_run { "would remove" } else { "removed" };
+    let verb = if outcome.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
     for shim in &outcome.removed_shims {
         println!("{verb} shim {}", shim.display());
     }
@@ -649,7 +656,10 @@ mod tests {
     }
 
     fn options(dry_run: bool, keep_config: bool) -> Options {
-        Options { dry_run, keep_config }
+        Options {
+            dry_run,
+            keep_config,
+        }
     }
 
     /// A throwaway install tree: state dir with ledger + kill switch, user
@@ -741,10 +751,7 @@ mod tests {
         let found = scan_path(&path_var, &fake.binary, &fake.binary);
         assert_eq!(
             found,
-            vec![
-                shim_a.path().join("cargo"),
-                shim_b.path().join("cargo.exe")
-            ]
+            vec![shim_a.path().join("cargo"), shim_b.path().join("cargo.exe")]
         );
     }
 

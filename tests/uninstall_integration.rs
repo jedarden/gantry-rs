@@ -80,7 +80,11 @@ impl Fixture {
         fs::create_dir_all(&unit_dir).unwrap();
         fs::write(state_dir.join("runs.jsonl"), "{\"schema_version\":1}\n").unwrap();
         fs::write(state_dir.join("state.toml"), "schema_version = 1\n").unwrap();
-        fs::write(config_dir.join("config.toml"), "[remote]\nbackend = \"none\"\n").unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            "[remote]\nbackend = \"none\"\n",
+        )
+        .unwrap();
         let slice_unit = unit_dir.join("gantry.slice");
         fs::write(&slice_unit, "# Managed by gantry\n[Slice]\n").unwrap();
 
@@ -90,11 +94,7 @@ impl Fixture {
         let env = vec![
             (
                 "PATH".to_string(),
-                format!(
-                    "{}:{}",
-                    shims.path().display(),
-                    real.path().display()
-                ),
+                format!("{}:{}", shims.path().display(), real.path().display()),
             ),
             ("HOME".to_string(), home.path().display().to_string()),
             (
@@ -162,7 +162,10 @@ fn uninstall_removes_everything_and_unshadows_the_toolchain() {
     assert!(!fx.shim_link.exists(), "shim symlink must be gone");
     assert!(!fx.gantry.exists(), "binary must be gone");
     assert!(
-        text.contains(&format!("cargo now resolves to: {}", fx.real_cargo.display())),
+        text.contains(&format!(
+            "cargo now resolves to: {}",
+            fx.real_cargo.display()
+        )),
         "{text}"
     );
     assert!(fx.real_cargo.exists(), "the real toolchain must survive");
@@ -199,7 +202,10 @@ fn keep_config_preserves_the_user_config() {
     assert!(out.status.success(), "{}", stdout(&out));
     let text = stdout(&out);
     assert!(text.contains("kept config"), "{text}");
-    assert!(fx.config_toml.exists(), "--keep-config must keep the config");
+    assert!(
+        fx.config_toml.exists(),
+        "--keep-config must keep the config"
+    );
     // The rest of the uninstall still happened.
     assert!(!fx.shim_link.exists());
     assert!(!fx.state_dir.exists());
@@ -245,7 +251,10 @@ fn uninstall_over_a_clean_box_is_still_clean() {
         "nothing left to remove: {text}"
     );
     assert!(
-        text.contains(&format!("cargo now resolves to: {}", fx.real_cargo.display())),
+        text.contains(&format!(
+            "cargo now resolves to: {}",
+            fx.real_cargo.display()
+        )),
         "{text}"
     );
 }
