@@ -24,7 +24,9 @@
 // outside the seam: streaming needs live process stdout to copy from as the
 // run progresses, not a captured end-of-run result.
 
-use crate::backend::{BackendError, RemoteBackend, RunSpec, RunStatus, Verdict, VerdictJson};
+use crate::backend::{
+    BackendError, FailureClass, RemoteBackend, RunSpec, RunStatus, Verdict, VerdictJson,
+};
 use crate::verdict::CONTRACT_VERSION;
 use std::io::{Read, Write};
 use std::process::{Command, Output};
@@ -874,14 +876,29 @@ impl RemoteBackend for ArgoBackend {
         }
     }
 
-    /// Wait for the workflow to complete and return its verdict.
+    /// Wait for the workflow to complete and return its bare verdict.
+    ///
+    /// Thin wrapper over [`Self::wait_outcome`] that drops the failure
+    /// class: the shape every verdict-only consumer compiles against.
+    fn wait(
+        &self,
+        h: &crate::backend::RunHandle,
+        deadline: Instant,
+    ) -> Result<Verdict, BackendError> {
+        self.wait_outcome(h, deadline)
+            .map(|(verdict, _failure_class)| verdict)
+    }
+
+    /// Wait for the workflow to complete and return its outcome: the
+    /// verdict plus the failure class the parsed verdict.json attributes
+    /// to it ([`RemoteBackend::wait_outcome`]'s contract).
     ///
     /// Polls `kubectl get workflow -o json` until `status.phase` reaches a
     /// terminal rung or the deadline expires, whichever comes first. The loop
     /// is deadline-aware in both directions: it re-checks the deadline before
     /// every poll, and each pending sleep is clamped to the time remaining —
-    /// wait() can never loop (or sleep) past its deadline. Expiry is a loud
-    /// [`BackendError`] (structured `deadline_exceeded`, so the caller
+    /// wait_outcome() can never loop (or sleep) past its deadline. Expiry is
+    /// a loud [`BackendError`] (structured `deadline_exceeded`, so the caller
     /// classifies it InfraFailure — never a fabricated verdict) carrying
     /// [`Self::describe`]: the watch is abandoned, the workflow itself keeps
     /// running on the cluster, and the run URL is how the operator finds it.
@@ -906,11 +923,17 @@ impl RemoteBackend for ArgoBackend {
     /// contract-version echo this client does not speak surfaces as the
     /// explicit "contract drift" message the plan's versioning section
     /// requires before its InfraFailure classification.
-    fn wait(
+    ///
+    /// The failure class rides along only when a parsed document vouches
+    /// for it: a document carrying the v2 `failure_class` taxonomy pairs
+    /// the class with the verdict it produced, while every shape of "no
+    /// usable document" — and a contract-drift echo, which poisons every
+    /// other claim the document makes — yields `None`.
+    fn wait_outcome(
         &self,
         h: &crate::backend::RunHandle,
         deadline: Instant,
-    ) -> Result<Verdict, BackendError> {
+    ) -> Result<(Verdict, Option<FailureClass>), BackendError> {
         loop {
             // Deadline first: no poll, sleep, or verdict may happen past it.
             // The expiry abandons the watch — it does not cancel the
@@ -966,7 +989,17 @@ impl RemoteBackend for ArgoBackend {
                         if verdict == Verdict::GateFailure {
                             eprintln!("[gantry] gate: quality gate failed");
                         }
-                        return Ok(verdict);
+                        // The class rides with the verdict only when the
+                        // document is trustworthy: a drift echo poisons
+                        // every other claim the document makes, its failure
+                        // class included — drift surfaces as
+                        // (InfraFailure, None).
+                        let failure_class = if vj.contract_drift().is_none() {
+                            vj.failure_class
+                        } else {
+                            None
+                        };
+                        return Ok((verdict, failure_class));
                     }
                     Err(e) => {
                         // The typed parse error (malformed JSON, unsupported
@@ -983,7 +1016,8 @@ impl RemoteBackend for ArgoBackend {
             // exit-code-only classifier ([`VerdictJson::from_exit_code`], via
             // [`WorkflowPhase::fallback_verdict`]) — the same ladder a parsed
             // document runs, fed only what the terminal phase can vouch for.
-            return Ok(phase.fallback_verdict());
+            // There is no document to attribute a class from, so none rides.
+            return Ok((phase.fallback_verdict(), None));
         }
     }
 
@@ -2060,6 +2094,183 @@ mod tests {
             assert_eq!(wait("Failed"), Verdict::TestFailure, "shape {shape:?}");
             assert_eq!(wait("Error"), Verdict::InfraFailure, "shape {shape:?}");
         }
+    }
+
+    // --- wait_outcome: the failure class rides with the verdict -------------
+
+    /// The schema-1 verdict.json for a run the remote attributed `class`
+    /// (the kebab wire name), with the matching contract echo — the same
+    /// document idiom src/verdict.rs's verdict_doc helper builds.
+    fn classified_verdict_json(phase: &str, exit_code: i32, class: &str) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "phase": phase,
+            "exit_code": exit_code,
+            "oom": false,
+            "deadline_exceeded": false,
+            "contract_version": CONTRACT_VERSION,
+            "failure_class": class,
+        })
+        .to_string()
+    }
+
+    /// A terminal workflow whose verdict.json carries
+    /// `failure_class: "test-failure"` yields
+    /// wait_outcome (TestFailure, Some(TestFailure)): the class the remote
+    /// attributed travels with the verdict it produced.
+    #[test]
+    fn wait_outcome_pairs_test_failure_class_with_the_verdict() {
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json_with_verdict(
+            "Failed",
+            &classified_verdict_json("Failed", 1, "test-failure"),
+        ))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let (verdict, class) = backend
+            .wait_outcome(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("wait_outcome must return the terminal outcome");
+        assert_eq!(verdict, Verdict::TestFailure);
+        assert_eq!(class, Some(FailureClass::TestFailure));
+    }
+
+    /// The gate-failure variant: a document attributing
+    /// `failure_class: "gate-failure"` yields
+    /// wait_outcome (GateFailure, Some(GateFailure)) — on a *passing*
+    /// document (Succeeded, exit 0), so the test also pins that the
+    /// attribution is what drives the GateFailure classification the same
+    /// way it drives the paired class.
+    #[test]
+    fn wait_outcome_pairs_gate_failure_class_with_the_verdict() {
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json_with_verdict(
+            "Succeeded",
+            &classified_verdict_json("Succeeded", 0, "gate-failure"),
+        ))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let (verdict, class) = backend
+            .wait_outcome(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("wait_outcome must return the terminal outcome");
+        assert_eq!(verdict, Verdict::GateFailure);
+        assert_eq!(class, Some(FailureClass::GateFailure));
+    }
+
+    /// A parsed document that carries no `failure_class` — the schema-1
+    /// producer predating the taxonomy — pairs its verdict with `None`:
+    /// absent means unknown, never guessed.
+    #[test]
+    fn wait_outcome_yields_no_class_when_the_document_has_none() {
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json_with_verdict(
+            "Succeeded",
+            &passing_verdict_json(),
+        ))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let (verdict, class) = backend
+            .wait_outcome(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("wait_outcome must return the terminal outcome");
+        assert_eq!(verdict, Verdict::Pass);
+        assert_eq!(class, None);
+    }
+
+    /// Every shape of "no usable verdict.json" — parameter absent, malformed
+    /// JSON, empty string, unsupported schema_version — pairs the phase
+    /// ladder's verdict with `None`: there is no document to attribute a
+    /// class from. (The verdict side of this matrix is pinned by
+    /// [`wait_degradation_shapes_all_land_on_the_phase_ladder`].)
+    #[test]
+    fn wait_outcome_yields_no_class_on_every_no_usable_document_shape() {
+        let shapes: Vec<Option<String>> = vec![
+            None,
+            Some("{not json".to_string()),
+            Some(String::new()),
+            Some(r#"{"schema_version": 3, "phase": "Succeeded", "exit_code": 1}"#.to_string()),
+        ];
+        for shape in &shapes {
+            let status_for = |terminal: &str| match shape {
+                None => status_json(terminal),
+                Some(value) => status_json_with_verdict(terminal, value),
+            };
+            let outcome = |terminal: &str| -> (Verdict, Option<FailureClass>) {
+                let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_for(terminal))]);
+                backend_with_runner(fake)
+                    .wait_outcome(
+                        &RunHandle::new("gantry-abc123"),
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                    .expect("degradation must return an outcome, not an error")
+            };
+            for (terminal, verdict) in [
+                ("Succeeded", Verdict::Pass),
+                ("Failed", Verdict::TestFailure),
+                ("Error", Verdict::InfraFailure),
+            ] {
+                let (v, class) = outcome(terminal);
+                assert_eq!(v, verdict, "shape {shape:?} phase {terminal}");
+                assert_eq!(class, None, "shape {shape:?} phase {terminal}");
+            }
+        }
+    }
+
+    /// A contract-drift echo suppresses the class even when the document
+    /// carries one: nothing else a drifted document claims can be trusted,
+    /// its `failure_class` included — drift surfaces as (InfraFailure,
+    /// None), never as an InfraFailure verdict wearing a test-failure
+    /// class.
+    #[test]
+    fn wait_outcome_yields_no_class_on_contract_drift_even_when_the_document_carries_one() {
+        let drifted = r#"{"schema_version":1,"phase":"Failed","exit_code":1,"oom":false,"deadline_exceeded":false,"contract_version":"9","failure_class":"test-failure"}"#;
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json_with_verdict(
+            "Failed", drifted,
+        ))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let (verdict, class) = backend
+            .wait_outcome(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("wait_outcome must return the terminal outcome");
+        assert_eq!(verdict, Verdict::InfraFailure);
+        assert_eq!(class, None);
+    }
+
+    /// wait() keeps its shape on a class-bearing document: the bare verdict
+    /// comes back, the class dropped — existing verdict-only consumers
+    /// compile and behave unchanged.
+    #[test]
+    fn wait_still_returns_the_bare_verdict_when_the_document_carries_a_class() {
+        let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json_with_verdict(
+            "Succeeded",
+            &classified_verdict_json("Succeeded", 0, "gate-failure"),
+        ))]);
+        let backend = backend_with_runner(fake);
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict = backend
+            .wait(&handle, Instant::now() + Duration::from_secs(30))
+            .expect("wait must return the terminal verdict");
+        assert_eq!(verdict, Verdict::GateFailure);
+    }
+
+    /// The deadline pin holds through the outcome shape too: an expired
+    /// deadline is the same loud structured error — classified InfraFailure
+    /// by the caller — never an Ok outcome with a fabricated verdict.
+    #[test]
+    fn wait_outcome_deadline_expiry_errors_without_fabricating_an_outcome() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(tmp.path(), "#!/usr/bin/env bash\nexit 1\n");
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .wait_outcome(&handle, Instant::now() - Duration::from_secs(1))
+            .expect_err("wait_outcome must fail once the deadline has passed");
+        assert!(err.deadline_exceeded, "{}", err.reason);
+        assert!(err.reason.contains("deadline"), "{}", err.reason);
     }
 
     /// Deadline expiry during polling: a workflow that stays Running forever
