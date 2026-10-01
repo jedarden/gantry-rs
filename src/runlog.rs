@@ -789,7 +789,11 @@ mod tests {
             "clean".to_string(),
             "argo".to_string(),
         );
-        assert!(!intent.repo.contains("gantry-synthetic-pw"), "{}", intent.repo);
+        assert!(
+            !intent.repo.contains("gantry-synthetic-pw"),
+            "{}",
+            intent.repo
+        );
         assert_eq!(intent.repo, "https://[REDACTED]@git.example/repo.git");
 
         // A clean URL is stored as given — S-5 strips userinfo, nothing else.

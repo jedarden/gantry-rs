@@ -1243,7 +1243,9 @@ mod tests {
 
     #[test]
     fn a_value_redacted_mid_json_keeps_the_rest_of_the_line() {
-        let out = redact("{\"namespace\": \"iad-ci\", \"token\": \"gantry-synthetic-kv-body\", \"n\": 4}");
+        let out = redact(
+            "{\"namespace\": \"iad-ci\", \"token\": \"gantry-synthetic-kv-body\", \"n\": 4}",
+        );
         assert!(out.contains("\"namespace\": \"iad-ci\""), "{out}");
         assert!(out.contains("\"token\": \"[REDACTED]\""), "{out}");
         assert!(out.contains("\"n\": 4"), "{out}");
@@ -1282,11 +1284,7 @@ mod tests {
         // redact. The last line is the exact shape write_manifest re-reads
         // from events.jsonl — a stored mark beside a live value, proving the
         // guard skips only the mark and still redacts its neighbor.
-        let gh_kv = format!(
-            "{k}={v}",
-            k = "GITHUB_TOKEN",
-            v = github_token_drill()
-        );
+        let gh_kv = format!("{k}={v}", k = "GITHUB_TOKEN", v = github_token_drill());
         let aws = format!("creds {} in env", aws_key_id_drill());
         let bearer_line = curl_bearer_drill();
         let remote_drill = format!(
@@ -1343,10 +1341,7 @@ mod tests {
         // chars), which threw the scheme scan's indexes off `line` and
         // panicked the redactor on a non-char-boundary — on the
         // InfraFailure tail, where such backend text lands.
-        let line = format!(
-            "\u{130} bearer \u{e9}tok {}",
-            github_token_drill()
-        );
+        let line = format!("\u{130} bearer \u{e9}tok {}", github_token_drill());
         let out = redact(&line); // must not panic
         assert!(out.contains("bearer [REDACTED]"), "{out}");
         assert!(!out.contains(&marker_body(36)), "{out}");
@@ -1562,8 +1557,14 @@ mod tests {
         let everything = read_bundle_text(&dir);
         // Nothing secret survives — not from the config argv, not from the
         // backend response, not from a git remote URL if one had leaked in.
-        assert!(!everything.contains(&argv_credential_drill()), "{everything}");
-        assert!(!everything.contains("gantry-synthetic-userinfo"), "{everything}");
+        assert!(
+            !everything.contains(&argv_credential_drill()),
+            "{everything}"
+        );
+        assert!(
+            !everything.contains("gantry-synthetic-userinfo"),
+            "{everything}"
+        );
         // The redactor's fingerprints are everywhere they should be.
         assert!(everything.contains("[REDACTED]"), "{everything}");
         // The planned artifacts are all present.

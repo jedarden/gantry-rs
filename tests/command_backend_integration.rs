@@ -274,8 +274,9 @@ fn wait_exit_2_and_higher_map_to_infra_failure() {
             write_wait_mock(dir.path(), code),
             logs.clone(),
         );
-        let verdict = with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), generous_deadline()))
-            .expect("wait should succeed");
+        let verdict =
+            with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), generous_deadline()))
+                .expect("wait should succeed");
         assert_eq!(verdict, Verdict::InfraFailure, "exit {}", code);
     }
 }
@@ -336,8 +337,8 @@ fn round_trip_submit_then_wait_passes() {
     );
 
     let handle = with_exec_retry(|| backend.submit(&spec())).expect("submit should succeed");
-    let verdict =
-        with_exec_retry(|| backend.wait(&handle, generous_deadline())).expect("wait should succeed");
+    let verdict = with_exec_retry(|| backend.wait(&handle, generous_deadline()))
+        .expect("wait should succeed");
     assert_eq!(verdict, Verdict::Pass);
 }
 
@@ -351,8 +352,8 @@ fn round_trip_submit_then_wait_fails() {
     );
 
     let handle = with_exec_retry(|| backend.submit(&spec())).expect("submit should succeed");
-    let verdict =
-        with_exec_retry(|| backend.wait(&handle, generous_deadline())).expect("wait should succeed");
+    let verdict = with_exec_retry(|| backend.wait(&handle, generous_deadline()))
+        .expect("wait should succeed");
     assert_eq!(verdict, Verdict::TestFailure);
 }
 

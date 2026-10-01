@@ -1396,7 +1396,11 @@ mod tests {
             // what an intercepted `cargo test -- --nocapture` submits, so a
             // backend cannot tell the two apart (and the shipped executor's
             // cargo-test contract applies unchanged).
-            let tail = vec!["test".to_string(), "--".to_string(), "--nocapture".to_string()];
+            let tail = vec![
+                "test".to_string(),
+                "--".to_string(),
+                "--nocapture".to_string(),
+            ];
             let (tool, subcommand, args) = explicit_run_spec_fields("cargo", &tail);
             assert_eq!(tool, "cargo");
             assert_eq!(subcommand, "test");

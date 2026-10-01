@@ -309,7 +309,11 @@ fn read_bundle(dir: &Path) -> Vec<(String, String)> {
 /// The bundle carries none of the drill credentials, and the redactor
 /// demonstrably engaged (at least one `[REDACTED]` mark landed).
 fn assert_redacted(files: &[(String, String)], where_: &str) {
-    for secret in [DRILL_URL_PASSPHRASE, DRILL_KV_SECRET, drill_token().as_str()] {
+    for secret in [
+        DRILL_URL_PASSPHRASE,
+        DRILL_KV_SECRET,
+        drill_token().as_str(),
+    ] {
         for (name, text) in files {
             assert!(
                 !text.contains(secret),

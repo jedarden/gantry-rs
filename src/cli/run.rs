@@ -175,7 +175,8 @@ mod tests {
 
     #[test]
     fn backend_override_takes_both_spellings() {
-        let parsed = parse(&argv(&["--backend", "none", "--", "sh", "-c", "exit 0"])).expect("parses");
+        let parsed =
+            parse(&argv(&["--backend", "none", "--", "sh", "-c", "exit 0"])).expect("parses");
         assert_eq!(parsed.backend_override, Some(Backend::None));
 
         let parsed = parse(&argv(&["--backend=command", "--", "true"])).expect("parses");

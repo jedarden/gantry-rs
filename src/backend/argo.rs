@@ -2120,7 +2120,10 @@ mod tests {
             "expiry must be the structured deadline error, got: {}",
             err.reason
         );
-        let expected_url = format!("{}/workflows/{}/gantry-abc123", base, backend.config.namespace);
+        let expected_url = format!(
+            "{}/workflows/{}/gantry-abc123",
+            base, backend.config.namespace
+        );
         assert_eq!(
             err.run_url.as_deref(),
             Some(expected_url.as_str()),

@@ -748,7 +748,10 @@ mod tests {
     /// `exit < 128` gate draws it.
     #[test]
     fn classify_stack_overflow_harness_panic_from_the_run_log() {
-        let messages = format!("{}\n", compiler_message_line("warning", "warning: unused\n"));
+        let messages = format!(
+            "{}\n",
+            compiler_message_line("warning", "warning: unused\n")
+        );
         let run_log = "running 4 tests\n\
                        test coords ... ok\n\
                        thread 'big_stack' has overflowed its stack\n\
@@ -770,7 +773,10 @@ mod tests {
     /// instrumented run.
     #[test]
     fn classify_doctest_when_only_the_doc_section_failed() {
-        let messages = format!("{}\n", compiler_message_line("warning", "warning: unused\n"));
+        let messages = format!(
+            "{}\n",
+            compiler_message_line("warning", "warning: unused\n")
+        );
         let run_log = "running 12 tests\n\
                        test result: ok. 12 passed; 0 failed; 0 ignored\n\
                        \n\
@@ -791,7 +797,10 @@ mod tests {
     /// no compile error, no panic, no Doc-tests section.
     #[test]
     fn classify_test_failure_is_the_fallthrough_class() {
-        let messages = format!("{}\n", compiler_message_line("warning", "warning: unused\n"));
+        let messages = format!(
+            "{}\n",
+            compiler_message_line("warning", "warning: unused\n")
+        );
         let run_log = "running 2 tests\n\
                        test parser::tests::rejects_bad ... FAILED\n\
                        failures:\n\
@@ -861,10 +870,10 @@ mod tests {
     /// whatever failed after it is noise.
     #[test]
     fn classify_compile_error_outranks_later_stream_evidence() {
-        let messages = format!("{}\n", compiler_message_line(
-            "error",
-            "error[E0432]: unresolved import `nope`\n"
-        ));
+        let messages = format!(
+            "{}\n",
+            compiler_message_line("error", "error[E0432]: unresolved import `nope`\n")
+        );
         let run_log = "thread 'big_stack' has overflowed its stack\n\
                           Doc-tests gantry\n\
                        test result: FAILED. 0 passed; 1 failed\n";
@@ -927,7 +936,12 @@ mod tests {
             // (exit, instrumented, messages, run_log) — every fixture in this suite.
             (101, true, "", "error: could not compile\n"),
             (1, true, "", "test result: FAILED. 0 passed; 1 failed\n"),
-            (1, true, "", "   Doc-tests gantry\ntest result: FAILED. 0 passed; 1 failed\n"),
+            (
+                1,
+                true,
+                "",
+                "   Doc-tests gantry\ntest result: FAILED. 0 passed; 1 failed\n",
+            ),
             (134, true, "", "thread 'x' has overflowed its stack\n"),
             (0, true, "", "test result: ok. 12 passed\n"),
         ];

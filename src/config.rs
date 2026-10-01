@@ -1627,10 +1627,17 @@ mod tests {
 
         let result = Config::load_layers(None, user.as_deref(), repo.as_deref()).unwrap();
         let argo = result.config.remote.argo.expect("argo config present");
-        assert_eq!(argo.deadline_minutes, Some(15), "repo layer overrides user layer");
+        assert_eq!(
+            argo.deadline_minutes,
+            Some(15),
+            "repo layer overrides user layer"
+        );
 
         // The global deadline is untouched by a per-backend override.
-        assert_eq!(result.config.remote.deadline_minutes, DEFAULT_DEADLINE_MINUTES);
+        assert_eq!(
+            result.config.remote.deadline_minutes,
+            DEFAULT_DEADLINE_MINUTES
+        );
     }
 
     /// Same plumbing for the command-template backend's deadline override.
@@ -1653,9 +1660,16 @@ mod tests {
         );
 
         let result = Config::load_layers(None, user.as_deref(), None).unwrap();
-        let command = result.config.remote.command.expect("command config present");
+        let command = result
+            .config
+            .remote
+            .command
+            .expect("command config present");
         assert_eq!(command.deadline_minutes, Some(25));
-        assert_eq!(result.config.remote.deadline_minutes, DEFAULT_DEADLINE_MINUTES);
+        assert_eq!(
+            result.config.remote.deadline_minutes,
+            DEFAULT_DEADLINE_MINUTES
+        );
     }
 
     /// A config that never mentions a deadline loads with the Tier-0 default:
