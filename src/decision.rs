@@ -344,6 +344,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                     &rl,
                     run_id.clone(),
                     Verdict::InfraFailure,
+                    None,
                     RanLocation::Remote,
                     1,
                     handle.handle.clone(),
@@ -384,6 +385,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             &rl,
             run_id.clone(),
             verdict,
+            None,
             RanLocation::Remote,
             exit_code,
             handle.handle.clone(),
@@ -715,6 +717,7 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
             &rl,
             run_id,
             verdict,
+            None,
             RanLocation::Remote,
             exit_code,
             handle.handle.clone(),
@@ -801,18 +804,46 @@ fn resolve_and_fall_back(
 }
 
 /// Write a verdict record for a remote execution.
+///
+/// `failure_class` follows the contract on the
+/// [`crate::runlog::VerdictRecord::failure_class`] field: a class belongs to
+/// failed remote outcomes only — TestFailure, and GateFailure with its
+/// attributed class — so Pass, InfraFailure, Cancelled, and Superseded
+/// records stay null even when a class arrived. Local runs never carry one
+/// ([`write_local_verdict`] takes none).
+#[allow(clippy::too_many_arguments)]
 fn write_verdict(
     runlog: &RunLog,
     run_id: String,
     verdict: Verdict,
+    failure_class: Option<crate::verdict::FailureClass>,
     ran: RanLocation,
     exit_code: i32,
     handle: String,
     durations_ms: Option<Durations>,
 ) -> Result<(), crate::runlog::RunLogError> {
     let runlog_verdict = convert_backend_verdict_to_runlog(verdict);
-    let record = VerdictRecord::new(run_id, runlog_verdict, ran, exit_code, handle, durations_ms);
+    let record = VerdictRecord::new(run_id, runlog_verdict, ran, exit_code, handle, durations_ms)
+        .with_failure_class(gate_failure_class(runlog_verdict, failure_class));
     runlog.close_verdict(&record)
+}
+
+/// The field contract gate ([`crate::runlog::VerdictRecord::failure_class`]):
+/// a stamped class belongs only to failed remote outcomes — TestFailure, and
+/// GateFailure with its attributed class. Pass, InfraFailure, Cancelled, and
+/// Superseded records keep null even when a class arrived. Exhaustive on
+/// purpose: a new verdict must decide here whether it can carry a class.
+fn gate_failure_class(
+    verdict: crate::runlog::Verdict,
+    failure_class: Option<crate::verdict::FailureClass>,
+) -> Option<crate::verdict::FailureClass> {
+    match verdict {
+        crate::runlog::Verdict::TestFailure | crate::runlog::Verdict::GateFailure => failure_class,
+        crate::runlog::Verdict::Pass
+        | crate::runlog::Verdict::InfraFailure
+        | crate::runlog::Verdict::Cancelled
+        | crate::runlog::Verdict::Superseded => None,
+    }
 }
 
 /// Write a verdict record for a local execution.
@@ -1566,6 +1597,83 @@ mod tests {
                 .status()
                 .unwrap();
             assert_eq!(status_to_i32(status), 42);
+        }
+    }
+
+    mod verdict_failure_class {
+        use super::*;
+        use crate::runlog::Verdict as RunLogVerdict;
+        use crate::verdict::FailureClass;
+
+        /// Build the record `write_verdict` assembles for `verdict` — the
+        /// same constructor, contract gate, and builder — without the ledger
+        /// append: `RunLog::open()` resolves the state dir from the
+        /// process-wide HOME, which a parallel unit test must not mutate.
+        fn record_for(verdict: RunLogVerdict, class: Option<FailureClass>) -> VerdictRecord {
+            VerdictRecord::new(
+                format!("run-{verdict:?}"),
+                verdict,
+                RanLocation::Remote,
+                1,
+                "workflow-abc".to_string(),
+                None,
+            )
+            .with_failure_class(gate_failure_class(verdict, class))
+        }
+
+        #[test]
+        fn class_bearing_test_failure_stamps_the_kebab_class() {
+            let record = record_for(RunLogVerdict::TestFailure, Some(FailureClass::TestFailure));
+            assert_eq!(record.failure_class, Some(FailureClass::TestFailure));
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                json.contains("\"failure_class\":\"test-failure\""),
+                "TestFailure record must stamp the kebab class, got: {json}"
+            );
+        }
+
+        #[test]
+        fn gate_failure_stamps_its_attributed_class() {
+            let record = record_for(RunLogVerdict::GateFailure, Some(FailureClass::GateFailure));
+            assert_eq!(record.failure_class, Some(FailureClass::GateFailure));
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                json.contains("\"failure_class\":\"gate-failure\""),
+                "GateFailure record must stamp its attributed class, got: {json}"
+            );
+        }
+
+        #[test]
+        fn non_failure_verdicts_keep_null_even_when_handed_a_class() {
+            // The field contract: Pass, InfraFailure, Cancelled, and
+            // Superseded records stay null even when a class arrived — and
+            // the null field is additive-absent on write, so nothing leaks
+            // into the ledger line either.
+            for verdict in [
+                RunLogVerdict::Pass,
+                RunLogVerdict::InfraFailure,
+                RunLogVerdict::Cancelled,
+                RunLogVerdict::Superseded,
+            ] {
+                let record = record_for(verdict, Some(FailureClass::CompileError));
+                assert_eq!(
+                    record.failure_class, None,
+                    "{verdict} keeps failure_class null even when handed a class"
+                );
+                let json = serde_json::to_string(&record).unwrap();
+                assert!(
+                    !json.contains("failure_class"),
+                    "{verdict} must not serialize a failure_class field, got: {json}"
+                );
+            }
+        }
+
+        #[test]
+        fn stamped_class_round_trips_through_the_lenient_ledger_reader() {
+            let record = record_for(RunLogVerdict::TestFailure, Some(FailureClass::HarnessPanic));
+            let json = serde_json::to_string(&record).unwrap();
+            let parsed: VerdictRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.failure_class, Some(FailureClass::HarnessPanic));
         }
     }
 }

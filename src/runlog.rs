@@ -528,6 +528,19 @@ impl VerdictRecord {
         }
     }
 
+    /// Stamp the failure taxonomy class onto the record, per the contract on
+    /// the [`VerdictRecord::failure_class`] field. The caller gates — only
+    /// failed remote outcomes (TestFailure, and GateFailure with its
+    /// attributed class) hand a class — so this builder takes the gated value
+    /// as-is rather than re-deriving eligibility.
+    pub fn with_failure_class(
+        mut self,
+        failure_class: Option<crate::verdict::FailureClass>,
+    ) -> Self {
+        self.failure_class = failure_class;
+        self
+    }
+
     /// Get current Unix timestamp in milliseconds.
     fn now_ms() -> u64 {
         SystemTime::now()
@@ -776,7 +789,10 @@ mod tests {
         let intent = IntentRecord::new(
             "cargo".to_string(),
             vec!["test".to_string()],
-            format!("https://ci:{}@git.example/repo.git", ["gantry", "synthetic", "pw"].join("-")),
+            format!(
+                "https://ci:{}@git.example/repo.git",
+                ["gantry", "synthetic", "pw"].join("-")
+            ),
             "abc123".to_string(),
             PathBuf::from("."),
             GateInputs {
