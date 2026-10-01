@@ -24,7 +24,7 @@
         "$comment": "Same run shape as why-v1.json; duplicated inline because the published schemas are standalone files.",
         "type": "object",
         "additionalProperties": false,
-        "required": ["run_id", "ts", "tool", "args", "repo", "sha", "cwd_rel", "gate", "decision", "reason", "backend", "verdict", "orphaned"],
+        "required": ["run_id", "ts", "tool", "args", "repo", "sha", "cwd_rel", "gate", "decision", "reason", "backend", "verdict", "failure_class", "orphaned"],
         "properties": {
           "run_id": {
             "type": "string"
@@ -115,6 +115,11 @@
                 }
               }
             }
+          },
+          "failure_class": {
+            "type": ["string", "null"],
+            "enum": ["compile-error", "test-failure", "doctest", "harness-panic", "gate-failure", null],
+            "description": "The failure taxonomy class the run died of (plan §Component 5); null when no class was recorded — passes, infra, cancels, superseded, local runs, uninstrumented producers, in-flight and lost runs, and every pre-taxonomy record whose entry lacks the field."
           },
           "orphaned": {
             "type": "boolean"
@@ -128,7 +133,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["run_id", "ts", "tool", "args", "repo", "sha", "cwd_rel", "gate", "decision", "reason", "backend", "verdict", "orphaned"],
+        "required": ["run_id", "ts", "tool", "args", "repo", "sha", "cwd_rel", "gate", "decision", "reason", "backend", "verdict", "failure_class", "orphaned"],
         "properties": {
           "run_id": {
             "type": "string"
@@ -219,6 +224,11 @@
                 }
               }
             }
+          },
+          "failure_class": {
+            "type": ["string", "null"],
+            "enum": ["compile-error", "test-failure", "doctest", "harness-panic", "gate-failure", null],
+            "description": "The failure taxonomy class the run died of (plan §Component 5); null when no class was recorded — passes, infra, cancels, superseded, local runs, uninstrumented producers, in-flight and lost runs, and every pre-taxonomy record whose entry lacks the field."
           },
           "orphaned": {
             "type": "boolean"

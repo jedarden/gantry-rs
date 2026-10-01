@@ -89,6 +89,15 @@ pub struct RunJson {
     /// or lost (SIGKILL, crash). Agents branch on `verdict.verdict` — the
     /// AS-2 failure class — without parsing logs.
     pub verdict: Option<VerdictJson>,
+    /// The failure taxonomy class the run died of (plan §Component 5):
+    /// "compile-error" / "test-failure" / "doctest" / "harness-panic" /
+    /// "gate-failure" — the kebab strings the ledger's verdict record
+    /// carries — or `null` when none was recorded. Read straight off the
+    /// runs.jsonl entry, never re-derived, so it is null for exactly the
+    /// records that carry no class: passes, infra, cancels, superseded,
+    /// local runs, uninstrumented producers, in-flight and lost runs, and
+    /// every pre-taxonomy entry whose record simply lacks the field.
+    pub failure_class: Option<crate::verdict::FailureClass>,
     /// True when the intent never got a verdict: in flight, or a lost run
     /// (`gantry doctor` reports the latter as an orphan).
     pub orphaned: bool,
@@ -110,6 +119,10 @@ impl RunJson {
             reason: entry.intent.reason.clone(),
             backend: entry.intent.backend.clone(),
             verdict: entry.verdict.as_ref().map(VerdictJson::from),
+            failure_class: entry
+                .verdict
+                .as_ref()
+                .and_then(|verdict| verdict.failure_class.clone()),
             orphaned: entry.verdict.is_none(),
         }
     }
@@ -223,6 +236,21 @@ pub fn ran_name(ran: crate::runlog::RanLocation) -> &'static str {
         crate::runlog::RanLocation::Remote => "remote",
         crate::runlog::RanLocation::Local => "local",
         crate::runlog::RanLocation::LocalAfterInfra => "local_after_infra",
+    }
+}
+
+/// The serde wire spelling of a failure class ("test-failure"), same stance
+/// as [`ran_name`] — the kebab string the `--json` contract and the ledger
+/// both carry, so human text and the document it renders can never disagree
+/// about a name.
+pub fn failure_class_name(class: &crate::verdict::FailureClass) -> &'static str {
+    use crate::verdict::FailureClass;
+    match class {
+        FailureClass::CompileError => "compile-error",
+        FailureClass::TestFailure => "test-failure",
+        FailureClass::Doctest => "doctest",
+        FailureClass::HarnessPanic => "harness-panic",
+        FailureClass::GateFailure => "gate-failure",
     }
 }
 
@@ -378,6 +406,122 @@ mod tests {
         assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601_utc(1_700_000_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(iso8601_utc(1_789_000_000_000), "2026-09-10T00:26:40Z");
+    }
+
+    #[test]
+    fn failure_class_name_is_the_serde_wire_spelling() {
+        for (class, wire) in [
+            (crate::verdict::FailureClass::CompileError, "compile-error"),
+            (crate::verdict::FailureClass::TestFailure, "test-failure"),
+            (crate::verdict::FailureClass::Doctest, "doctest"),
+            (crate::verdict::FailureClass::HarnessPanic, "harness-panic"),
+            (crate::verdict::FailureClass::GateFailure, "gate-failure"),
+        ] {
+            assert_eq!(failure_class_name(&class), wire);
+            // The whole point of the helper: what human text prints is what
+            // the --json contract carries.
+            assert_eq!(serde_json::to_value(&class).unwrap(), wire);
+        }
+    }
+
+    /// A verdict record as a pre-taxonomy producer wrote it: no
+    /// `failure_class` key on disk.
+    const LEGACY_VERDICT_LINE: &str = r#"{"rec":"verdict","schema_version":1,"run_id":"legacy","ts":2,"verdict":"test_failure","ran":"remote","exit_code":101,"handle":"gantry-x7k2p"}"#;
+
+    #[test]
+    fn run_json_carries_failure_class_straight_off_the_verdict_record() {
+        let intent = crate::runlog::IntentRecord::new(
+            "cargo".to_string(),
+            vec!["test".to_string()],
+            "https://example.com/repo".to_string(),
+            "abc123".to_string(),
+            PathBuf::from("."),
+            GateInputs {
+                worktree: true,
+                head: true,
+                remote: true,
+                clean: true,
+            },
+            Decision::Remote,
+            String::new(),
+            "argo".to_string(),
+        );
+
+        // A class-bearing record projects to the kebab string. The class is
+        // the plain pub field the ledger carries; tests stamp it the same way
+        // an instrumented producer's record arrives.
+        let mut record = VerdictRecord::new(
+            intent.run_id.clone(),
+            Verdict::TestFailure,
+            RanLocation::Remote,
+            101,
+            "gantry-x7k2p".to_string(),
+            None,
+        );
+        record.failure_class = Some(crate::verdict::FailureClass::TestFailure);
+        let classified = RunEntry {
+            intent: intent.clone(),
+            verdict: Some(record),
+        };
+        let doc = serde_json::to_value(RunJson::from_entry(&classified)).unwrap();
+        assert_eq!(doc["failure_class"], "test-failure");
+
+        // The same verdict with no class — a pass, infra, an uninstrumented
+        // producer — projects to null, and the field is always present for
+        // the published schema's `required`.
+        let unclassified = RunEntry {
+            intent,
+            verdict: Some(VerdictRecord::new(
+                "r2".to_string(),
+                Verdict::TestFailure,
+                RanLocation::Remote,
+                101,
+                "gantry-x7k2p".to_string(),
+                None,
+            )),
+        };
+        let doc = serde_json::to_value(RunJson::from_entry(&unclassified)).unwrap();
+        assert_eq!(doc["failure_class"], serde_json::Value::Null);
+
+        // And an in-flight run (no verdict at all) reads as null too.
+        let orphan = RunEntry {
+            intent: unclassified.intent,
+            verdict: None,
+        };
+        let doc = serde_json::to_value(RunJson::from_entry(&orphan)).unwrap();
+        assert_eq!(doc["failure_class"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn run_json_reads_a_pre_taxonomy_record_as_a_null_class_not_an_error() {
+        let legacy: VerdictRecord =
+            serde_json::from_str(LEGACY_VERDICT_LINE).expect("legacy record parses");
+        assert!(legacy.failure_class.is_none());
+
+        let entry = RunEntry {
+            intent: crate::runlog::IntentRecord::new(
+                "cargo".to_string(),
+                vec!["test".to_string()],
+                "https://example.com/repo".to_string(),
+                "abc123".to_string(),
+                PathBuf::from("."),
+                GateInputs {
+                    worktree: true,
+                    head: true,
+                    remote: true,
+                    clean: true,
+                },
+                Decision::Remote,
+                String::new(),
+                "argo".to_string(),
+            ),
+            verdict: Some(legacy),
+        };
+        let run = RunJson::from_entry(&entry);
+        assert!(run.failure_class.is_none());
+        // The projection still emits the field — null, not absent.
+        let doc = serde_json::to_value(&run).unwrap();
+        assert_eq!(doc["failure_class"], serde_json::Value::Null);
     }
 
     #[test]
