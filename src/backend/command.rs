@@ -15,7 +15,13 @@
 use crate::backend::{BackendError, RemoteBackend, RunHandle, RunSpec, RunStatus, Verdict};
 use std::io::Write;
 use std::process::{Command, Output};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Poll interval while the wait command runs — the granularity of the
+/// deadline check. Frequent enough to expire promptly, cheap enough (one
+/// `try_wait` syscall per tick) to never matter against a 40-minute budget.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Configuration for command-template backend.
 ///
@@ -142,6 +148,14 @@ impl CommandBackend {
         CommandBackend { config }
     }
 
+    /// The structured deadline-expiry error for a run's wait command.
+    fn deadline_error(h: &RunHandle) -> BackendError {
+        BackendError::deadline(&format!(
+            "run {} deadline exceeded before the wait command returned a verdict",
+            h.handle
+        ))
+    }
+
     /// Create a new CommandBackend with a custom executor path (for testing).
     #[cfg(test)]
     pub fn with_executor(executor: &str) -> Self {
@@ -189,6 +203,32 @@ impl CommandBackend {
                 }
                 // Everything else (permission denied, ...) keeps the
                 // descriptive form: program name plus the underlying io error.
+                _ => BackendError::new(&format!("failed to run command {}: {}", cmd, e)),
+            })
+    }
+
+    /// Spawn a command with arguments without waiting for it.
+    ///
+    /// Same argv and error mapping as [`Self::run_command`]; the child
+    /// inherits this process's stdio, so a wait command that streams remote
+    /// logs keeps flowing to the caller's transcript instead of being
+    /// captured and discarded — and there is no pipe to fill, so a chatty
+    /// child can never deadlock itself into an artificial deadline expiry.
+    fn spawn_command(&self, argv: &[String]) -> Result<std::process::Child, BackendError> {
+        if argv.is_empty() {
+            return Err(BackendError::new("command argv is empty"));
+        }
+
+        let cmd = &argv[0];
+        let args = &argv[1..];
+
+        Command::new(cmd)
+            .args(args)
+            .spawn()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    BackendError::new(&format!("command not found: {}", cmd))
+                }
                 _ => BackendError::new(&format!("failed to run command {}: {}", cmd, e)),
             })
     }
@@ -260,21 +300,59 @@ impl RemoteBackend for CommandBackend {
     /// Runs the configured wait argv with {handle} placeholder.
     /// The command's exit code maps to a Verdict using the full ladder.
     ///
+    /// The wait command is bounded by `deadline` (features.md v1.x
+    /// "timeout/deadline config per backend"): the backend polls the child's
+    /// exit status and, when the deadline passes first, kills the wait
+    /// command and returns the structured [`BackendError::deadline`] — expiry
+    /// classifies as InfraFailure upstream (plan DD-4), never as an
+    /// exit-code-derived verdict. A deadline that is already elapsed when
+    /// wait() is entered skips the spawn entirely.
+    ///
     /// ## Parameters
     ///
     /// - `h`: The RunHandle returned by submit().
-    /// - `deadline`: The deadline for the run (ignored in Phase 1a — the command
-    ///   manages its own timeout).
-    fn wait(&self, h: &RunHandle, _deadline: Instant) -> Result<Verdict, BackendError> {
+    /// - `deadline`: The wall-clock instant past which the run must produce
+    ///   no more polls, sleeps, or verdicts.
+    fn wait(&self, h: &RunHandle, deadline: Instant) -> Result<Verdict, BackendError> {
+        // Deadline first: an elapsed budget never spawns the wait command.
+        if Instant::now() >= deadline {
+            return Err(Self::deadline_error(h));
+        }
+
         let argv = substitute_placeholders(&self.config.wait, "", "", "", Some(&h.handle));
+        let mut child = self.spawn_command(&argv)?;
 
-        let output = self.run_command(&argv)?;
-
-        // The command's exit code is the run's exit code
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Map to verdict using the full ladder
-        Ok(Verdict::from_exit_code(exit_code))
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // The command's exit code is the run's exit code; map it
+                    // using the full ladder.
+                    return Ok(Verdict::from_exit_code(status.code().unwrap_or(-1)));
+                }
+                Ok(None) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        // The run outlived its deadline: kill the wait
+                        // command (nothing it returns past this point is a
+                        // verdict) and surface the expiry. The reap keeps
+                        // the killed child from lingering as a zombie.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(Self::deadline_error(h));
+                    }
+                    // Sleep toward the next poll, but never past the
+                    // deadline — the clamp makes the next loop-top check
+                    // land on time.
+                    thread::sleep(WAIT_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+                }
+                Err(e) => {
+                    return Err(BackendError::new(&format!(
+                        "failed to wait on command: {}",
+                        e
+                    )));
+                }
+            }
+        }
     }
 
     /// Describe the run for human consumption.
@@ -403,6 +481,13 @@ esac
         tempfile::tempdir_in("/tmp").expect("create temp dir")
     }
 
+    /// A deadline comfortably past every mock's runtime — for the tests that
+    /// assert verdict mapping, where the budget must never bite. Expiry
+    /// behaviour gets its own dedicated tests below.
+    fn generous_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
     #[test]
     fn test_command_backend_submit_returns_handle() {
         let _lock = FS_MUTEX.lock().unwrap();
@@ -432,7 +517,7 @@ esac
         let backend = CommandBackend::with_executor(executor.to_str().unwrap());
         let handle = RunHandle::new("handle-pass");
 
-        let result = backend.wait(&handle, Instant::now());
+        let result = backend.wait(&handle, generous_deadline());
 
         assert!(result.is_ok(), "wait should succeed, got: {:?}", result);
         let verdict = result.unwrap();
@@ -448,7 +533,7 @@ esac
         let backend = CommandBackend::with_executor(executor.to_str().unwrap());
         let handle = RunHandle::new("handle-fail");
 
-        let result = backend.wait(&handle, Instant::now());
+        let result = backend.wait(&handle, generous_deadline());
 
         assert!(result.is_ok(), "wait should succeed, got: {:?}", result);
         let verdict = result.unwrap();
@@ -473,7 +558,7 @@ esac
 
         // Wait on the handle
         let verdict = backend
-            .wait(&handle, Instant::now())
+            .wait(&handle, generous_deadline())
             .expect("wait should succeed");
 
         assert_eq!(verdict, Verdict::Pass, "round-trip should return Pass");
@@ -493,7 +578,7 @@ esac
 
         // Wait on the handle
         let verdict = backend
-            .wait(&handle, Instant::now())
+            .wait(&handle, generous_deadline())
             .expect("wait should succeed");
 
         assert_eq!(
@@ -560,7 +645,7 @@ esac
         // wait() is what actually performs the run and decides the verdict.
         let start = Instant::now();
         let verdict = backend
-            .wait(&handle, Instant::now())
+            .wait(&handle, generous_deadline())
             .expect("wait should succeed");
         let wait_elapsed = start.elapsed();
 
@@ -605,7 +690,7 @@ esac
             );
 
             let verdict = backend
-                .wait(&handle, Instant::now())
+                .wait(&handle, generous_deadline())
                 .expect("wait should succeed");
             assert_eq!(
                 verdict,
@@ -884,7 +969,7 @@ esac
         });
 
         let verdict = backend
-            .wait(&RunHandle::new(expected), Instant::now())
+            .wait(&RunHandle::new(expected), generous_deadline())
             .expect("wait should run the compare executor");
         assert_eq!(
             verdict,
@@ -1324,12 +1409,116 @@ esac
         let backend = CommandBackend::with_config(empty_config());
 
         let err = backend
-            .wait(&RunHandle::new("run-1"), Instant::now())
+            .wait(&RunHandle::new("run-1"), generous_deadline())
             .expect_err("empty wait argv must Err");
         assert!(
             err.reason.contains("argv is empty"),
             "error should name the empty argv, got: {}",
             err.reason
+        );
+    }
+
+    // --- deadline enforcement (features.md v1.x per-backend deadline) -------
+
+    #[test]
+    fn wait_with_an_elapsed_deadline_never_spawns_the_wait_command() {
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("deadline-elapsed");
+
+        // The wait subcommand would prove it ran by leaving a marker behind;
+        // an already-spent budget must skip the spawn entirely, so the
+        // marker stays absent and the structured expiry error comes back.
+        let marker = temp_dir.path().join("wait-ran-marker");
+        let executor = write_script(
+            temp_dir.path(),
+            "test-executor",
+            &format!(
+                r#"case "$1" in
+    wait)
+        touch "{}"
+        exit 0
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        exit 1
+        ;;
+esac
+"#,
+                marker.display()
+            ),
+        );
+
+        let backend = CommandBackend::with_executor(executor.to_str().unwrap());
+        let err = backend
+            .wait(
+                &RunHandle::new("handle-late"),
+                Instant::now() - Duration::from_secs(1),
+            )
+            .expect_err("an elapsed deadline must Err, never run the wait command");
+
+        assert!(
+            err.deadline_exceeded,
+            "the error must be the structured deadline expiry, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("handle-late"),
+            "the deadline error must name the run, got: {}",
+            err.reason
+        );
+        assert!(
+            !marker.exists(),
+            "an elapsed budget must never spawn the wait command"
+        );
+    }
+
+    #[test]
+    fn wait_kills_a_run_that_outlives_its_deadline_and_returns_no_verdict() {
+        let _lock = FS_MUTEX.lock().unwrap();
+        let temp_dir = create_temp_dir("deadline-expires");
+
+        // The wait subcommand sleeps far past the deadline: expiry must kill
+        // it promptly (no orphan left behind) and surface the structured
+        // error — never an exit-code-derived verdict (DD-4).
+        let executor = write_script(
+            temp_dir.path(),
+            "test-executor",
+            r#"case "$1" in
+    wait)
+        sleep 30
+        exit 0
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        exit 1
+        ;;
+esac
+"#,
+        );
+
+        let backend = CommandBackend::with_executor(executor.to_str().unwrap());
+        let start = Instant::now();
+        let err = backend
+            .wait(
+                &RunHandle::new("handle-slow"),
+                Instant::now() + Duration::from_millis(250),
+            )
+            .expect_err("a run past its deadline must Err, not return a verdict");
+        let elapsed = start.elapsed();
+
+        assert!(
+            err.deadline_exceeded,
+            "the error must be the structured deadline expiry, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("handle-slow"),
+            "the deadline error must name the run, got: {}",
+            err.reason
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "expiry must kill the wait command promptly, took {elapsed:?}"
         );
     }
 

@@ -14,8 +14,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendError, Verdict};
 
-/// The only verdict.json schema_version this build knows (Phase 1a).
-const SCHEMA_VERSION: u32 = 1;
+/// The verdict.json schema versions this build parses (plan §"Versioning &
+/// compatibility"). Version 1 is the pre-taxonomy producer: `failure_class`
+/// was an optional refinement a template chose to emit (in practice, only
+/// for gate attribution). Version 2 is the failure-taxonomy contract: a
+/// producer that instruments the suite with `--message-format json` derives
+/// the class for every suite that ran to completion and failed, not just for
+/// gates. The shape is identical — v2 is a semantics bump, which is exactly
+/// what the version field exists to carry — and both parse the same here.
+///
+/// A version outside this list is a loud parse error (never silently read as
+/// a known one) and degrades the caller to exit-code-only.
+const SUPPORTED_SCHEMA_VERSIONS: [u32; 2] = [1, 2];
+
+/// The schema_version this build fabricates when it must construct a document
+/// itself ([`VerdictJson::from_exit_code`]): the current version.
+const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+/// The remote contract version this client speaks (plan §"Versioning &
+/// compatibility", "Remote contract").
+///
+/// The Argo backend sends it as the Workflow's `contract-version` parameter
+/// (src/backend/argo.rs `Workflow::new`); the contrib template echoes it back
+/// verbatim in verdict.json. A document that echoes a *different* version
+/// claims a contract this client cannot interpret — that is contract drift,
+/// and it classifies as [`Verdict::InfraFailure`] (never a misread verdict).
+/// An *absent* echo is not drift: the field is an additive-evolution
+/// addition, so a schema-1 producer that predates the handshake simply omits
+/// it, and this client knows the schema-1 document completely.
+pub const CONTRACT_VERSION: &str = "1";
 
 /// FailureClass: detailed failure classification from verdict.json.
 ///
@@ -57,16 +84,127 @@ impl FailureClass {
             _ => None,
         }
     }
+
+    /// Classify a failed suite from cargo's `--message-format json` stream —
+    /// the reference implementation of the remote failure taxonomy
+    /// (ideas-ledger finalist 7, adopted 2026-07-22; plan §Component 5
+    /// "verdict.json v2 failure taxonomy").
+    ///
+    /// This is the normative form of the algorithm the reference producer
+    /// (`contrib/argo/gantry-verify-workflowtemplate.yml`) executes in jq/awk
+    /// when it stamps `failure_class` into verdict.json; the fixture tests
+    /// below pin both to the same semantics. Inputs are exactly what the
+    /// producer has:
+    ///
+    /// - `exit_code` — the *raw* cargo exit code (0–255 shell domain), not
+    ///   the client-ladder code verdict.json carries.
+    /// - `instrumented` — false when the caller chose their own
+    ///   `--message-format`, in which case the raw protocol was never
+    ///   captured and no class is derivable (instrumentation must not fight
+    ///   the argv).
+    /// - `messages` — the archived cargo JSON protocol stream (one JSON
+    ///   object per line, mixed with the harness's human lines that share
+    ///   stdout). Read line-wise and leniently on purpose: `jq -s` would
+    ///   need the whole file to parse, and it never does.
+    /// - `run_log` — the human-visible run output (rendered diagnostics and
+    ///   harness lines), which doctest and harness-panic detection read.
+    ///
+    /// Returns `None` outside the classifiable window: a passing suite (exit
+    /// 0) has no failure to name, a signal-killed suite (≥128) is infra and
+    /// is classified by the verdict ladder, not a failure class, and an
+    /// uninstrumented run has no protocol stream. `GateFailure` is never
+    /// derived here — gates run only after a passing suite and are
+    /// attributed explicitly by the producer, never read off the stream.
+    ///
+    /// Detection order mirrors the producer exactly:
+    /// 1. **compile-error** — any protocol line is a compiler-message whose
+    ///    diagnostic level is `error` (rustc never finished; outranks
+    ///    everything a later stage printed).
+    /// 2. **harness-panic** — the run log reports a stack overflow (a test
+    ///    binary crashed the harness).
+    /// 3. **doctest** — the only `test result: FAILED` lines are the ones
+    ///    following a `Doc-tests` section header.
+    /// 4. **test-failure** — everything else.
+    pub fn classify(
+        exit_code: i32,
+        instrumented: bool,
+        messages: &str,
+        run_log: &str,
+    ) -> Option<Self> {
+        // The classifiable window: a suite that ran to completion and failed.
+        // (The producer additionally never reads the class it derives for
+        // exit 127 — command-not-found is intercepted as infra downstream —
+        // but the window predicate itself is `!= 0 && < 128` on both sides.)
+        if exit_code == 0 || exit_code >= 128 || !instrumented {
+            return None;
+        }
+
+        // 1. compile-error: a compiler-message diagnostic at level `error`.
+        //    Lenient per line — a line that is not a JSON object (the
+        //    harness's human output shares the stream) is skipped, not an
+        //    error, so one garbled line cannot blind the classifier.
+        let compile_error = messages.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .filter(|value| value.is_object())
+                .is_some_and(|value| {
+                    value.get("reason").and_then(|r| r.as_str()) == Some("compiler-message")
+                        && value
+                            .get("message")
+                            .and_then(|m| m.get("level"))
+                            .and_then(|l| l.as_str())
+                            == Some("error")
+                })
+        });
+        if compile_error {
+            return Some(FailureClass::CompileError);
+        }
+
+        // 2. harness-panic: a test binary overflowed its stack.
+        if run_log.contains("has overflowed its stack") {
+            return Some(FailureClass::HarnessPanic);
+        }
+
+        // 3. doctest: every `test result: FAILED` line comes after a
+        //    `Doc-tests` section header — the lib/integration sections print
+        //    theirs first, so a failed unit test sets `other_failed` and the
+        //    run stays a plain test failure.
+        let mut docs_seen = false;
+        let mut doc_failed = false;
+        let mut other_failed = false;
+        for line in run_log.lines() {
+            if line.contains("Doc-tests") {
+                docs_seen = true;
+            }
+            if line.starts_with("test result: FAILED") {
+                if docs_seen {
+                    doc_failed = true;
+                } else {
+                    other_failed = true;
+                }
+            }
+        }
+        if doc_failed && !other_failed {
+            return Some(FailureClass::Doctest);
+        }
+
+        // 4. test-failure: the fallthrough class.
+        Some(FailureClass::TestFailure)
+    }
 }
 
 /// Deserialize `failure_class` leniently: an unrecognized class string (or
-/// null) reads as absent instead of failing the whole verdict.json parse.
+/// null) reads as absent instead of failing the whole document parse.
 ///
 /// The core signals in the document (oom, deadline_exceeded, exit_code) must
 /// survive a producer adding a class this version doesn't know — dropping just
 /// the class keeps an OOM run classifying as InfraFailure rather than
 /// misreading it as a test failure.
-fn deserialize_lenient_failure_class<'de, D>(
+///
+/// `pub(crate)` because the runs.jsonl verdict record carries the same class
+/// under the same leniency contract (src/runlog.rs `VerdictRecord`): one
+/// deserializer, one semantics, two documents.
+pub(crate) fn deserialize_lenient_failure_class<'de, D>(
     deserializer: D,
 ) -> Result<Option<FailureClass>, D::Error>
 where
@@ -74,6 +212,24 @@ where
 {
     let raw = Option::<String>::deserialize(deserializer)?;
     Ok(raw.as_deref().and_then(FailureClass::from_kebab))
+}
+
+/// Deserialize `contract_version` leniently by value *shape*:
+/// absent/null reads as `None` (a schema-1 producer predating the handshake),
+/// a string reads as itself, and any other JSON shape reads as the empty
+/// string — a present-but-uninterpretable echo that can never equal
+/// [`CONTRACT_VERSION`], so it lands on contract drift rather than failing
+/// the whole document parse. That mirrors `failure_class` leniency: a
+/// producer fumbling one field must not cost the document its infra signals.
+fn deserialize_lenient_contract_version<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(_) => Ok(Some(String::new())),
+    }
 }
 
 /// VerdictJson: versioned verdict.json structure from remote executor.
@@ -88,10 +244,12 @@ where
 /// reads as absent rather than failing the parse, so a producer newer than
 /// this consumer can never cost the document its infra signals.
 ///
-/// Phase 1a: implements schema_version 1 with phase, exit_code, oom, deadline,
-/// and optional failure_class. Later versions may add fields; a
-/// schema_version this parser does not know is a loud parse error (and thus
-/// an exit-code-only degradation), never a guess.
+/// Parses every schema_version in [`SUPPORTED_SCHEMA_VERSIONS`] — 1 (the
+/// pre-taxonomy producer) and 2 (the failure-taxonomy contract; same shape,
+/// the class is derived for every instrumented failing suite, not just
+/// gates). Later versions may add fields; a schema_version this parser does
+/// not know is a loud parse error (and thus an exit-code-only degradation),
+/// never a guess.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerdictJson {
     /// Schema version for backward compatibility.
@@ -121,18 +279,34 @@ pub struct VerdictJson {
         skip_serializing_if = "Option::is_none"
     )]
     pub failure_class: Option<FailureClass>,
+
+    /// The `contract_version` echo (plan §"Versioning & compatibility",
+    /// "Remote contract"): the template echoes back verbatim the version the
+    /// client sent as the Workflow's `contract-version` parameter. Absent
+    /// means a schema-1 producer predating the handshake (additive evolution:
+    /// not drift); present and different from [`CONTRACT_VERSION`] — or
+    /// present in a shape this client cannot read — is contract drift, and
+    /// [`VerdictJson::to_verdict`] classifies the document as
+    /// [`Verdict::InfraFailure`] no matter what its other fields claim.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient_contract_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub contract_version: Option<String>,
 }
 
 impl VerdictJson {
     /// Parse verdict.json from a JSON string.
     ///
-    /// Returns Err if JSON is malformed or schema_version is unsupported.
+    /// Returns Err if JSON is malformed or schema_version is unsupported
+    /// (outside [`SUPPORTED_SCHEMA_VERSIONS`]).
     pub fn parse(json: &str) -> Result<Self, BackendError> {
         let parsed: Self = serde_json::from_str(json)
             .map_err(|e| BackendError::new(&format!("failed to parse verdict.json: {}", e)))?;
 
-        // Validate schema version (Phase 1a only supports version 1)
-        if parsed.schema_version != SCHEMA_VERSION {
+        // Validate schema version
+        if !SUPPORTED_SCHEMA_VERSIONS.contains(&parsed.schema_version) {
             return Err(BackendError::new(&format!(
                 "unsupported verdict.json schema version: {}",
                 parsed.schema_version
@@ -159,12 +333,16 @@ impl VerdictJson {
     /// none is known.
     pub fn from_exit_code(phase: &str, exit_code: i32) -> Verdict {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: CURRENT_SCHEMA_VERSION,
             phase: phase.to_string(),
             exit_code,
             oom: false,
             deadline_exceeded: false,
             failure_class: None,
+            // The client fabricated this document from the terminal phase —
+            // there is no remote echo to check, and none is needed: the
+            // ladder here runs on knowledge the client produced itself.
+            contract_version: None,
         }
         .to_verdict()
     }
@@ -179,15 +357,34 @@ impl VerdictJson {
         matches!(self.failure_class, Some(FailureClass::GateFailure))
     }
 
+    /// The contract-drift signal, shared by the verdict ladder and the
+    /// client's message: `Some(echo)` when the document echoes a
+    /// `contract_version` this client does not speak, `None` when the
+    /// handshake confirms (echo matches) or does not apply (absent — a
+    /// schema-1 producer predating the handshake; see [`CONTRACT_VERSION`]).
+    pub fn contract_drift(&self) -> Option<&str> {
+        self.contract_version
+            .as_deref()
+            .filter(|echo| *echo != CONTRACT_VERSION)
+    }
+
     /// Convert the verdict.json to a Verdict using full ladder semantics.
     ///
-    /// Precedence: infrastructure signals (OOMKilled, deadline exceeded, the
-    /// workflow itself erroring) classify as InfraFailure first — a cap firing
-    /// says nothing about the code, so it must never read as a test result —
-    /// then explicit gate attribution, then the exit-code ladder. An absent
-    /// verdict.json never reaches this method; it degrades to exit-code-only
-    /// via [`Verdict::interpret`].
+    /// Precedence: contract drift first — a document that echoes a contract
+    /// this client does not speak cannot vouch for anything its other fields
+    /// claim, so it classifies as InfraFailure ("contract drift", plan
+    /// §"Versioning & compatibility"), never a misread verdict — then
+    /// infrastructure signals (OOMKilled, deadline exceeded, the workflow
+    /// itself erroring), then explicit gate attribution, then the exit-code
+    /// ladder. An absent verdict.json never reaches this method; it degrades
+    /// to exit-code-only via [`Verdict::interpret`].
     pub fn to_verdict(&self) -> Verdict {
+        // Contract drift outranks everything: the document's own meaning is
+        // what is in question.
+        if self.contract_drift().is_some() {
+            return Verdict::InfraFailure;
+        }
+
         // InfraFailure signals take precedence (OOM, deadline, workflow Error)
         if self.oom || self.deadline_exceeded || self.phase == "Error" {
             return Verdict::InfraFailure;
@@ -214,7 +411,10 @@ mod tests {
     // --- verdict.json parsing: failure classes ------------------------------
 
     /// Build a schema-1 verdict.json document with the given fields
-    /// (`failure_class` omitted when None).
+    /// (`failure_class` omitted when None). Always carries the matching
+    /// `contract_version` echo: a post-handshake producer confirms the
+    /// contract, and the handshake tests below build their mismatching /
+    /// absent / garbled variants on top of this helper.
     fn verdict_doc(
         phase: &str,
         exit_code: i32,
@@ -228,6 +428,7 @@ mod tests {
             "exit_code": exit_code,
             "oom": oom,
             "deadline_exceeded": deadline,
+            "contract_version": CONTRACT_VERSION,
         });
         if let Some(class) = class {
             obj["failure_class"] = serde_json::Value::String(class.to_string());
@@ -333,6 +534,37 @@ mod tests {
         assert_eq!(vj.to_verdict(), Verdict::Pass);
     }
 
+    /// A `failure_class` whose value is not a JSON string is a malformed
+    /// document, not an unknown class: serde rejects it outright with the
+    /// document-level parse error, and the caller degrades to exit-code-only.
+    /// Leniency is reserved for class *strings* this build does not know —
+    /// see [`unknown_failure_class_degrades_to_absent_not_error`] — and for
+    /// null, which is the documented shape of "absent".
+    #[test]
+    fn invalid_failure_class_value_is_rejected_by_serde() {
+        let bad_values = [
+            "42",
+            "1.5",
+            "true",
+            "false",
+            "[]",
+            r#"{"class": "test-failure"}"#,
+        ];
+        for bad in bad_values {
+            let doc = format!(
+                r#"{{"schema_version": 1, "phase": "Failed", "exit_code": 1,
+                    "failure_class": {bad}}}"#
+            );
+            let err = VerdictJson::parse(&doc)
+                .expect_err(&format!("failure_class {bad} must be rejected by serde"));
+            assert!(
+                err.reason.starts_with("failed to parse verdict.json"),
+                "failure_class {bad}: wrong error: {}",
+                err.reason
+            );
+        }
+    }
+
     // --- verdict.json parsing: schema and defaults --------------------------
 
     /// Optional fields are truly optional: the minimal schema-1 document
@@ -391,6 +623,55 @@ mod tests {
         }
     }
 
+    /// Schema version 2 — the failure-taxonomy contract (verdict.json v2,
+    /// plan §Component 5) — parses with the exact same shape and ladder as
+    /// version 1: the bump is a *semantics* contract (a v2 producer derives
+    /// the failure class for every instrumented failing suite, not just
+    /// gates), which is precisely what the version field exists to carry. A
+    /// v2 document therefore needs no new fields to be fully interpretable.
+    #[test]
+    fn schema_version_two_the_taxonomy_contract_parses_like_one() {
+        let v2 = r#"{
+            "schema_version": 2,
+            "phase": "Failed",
+            "exit_code": 1,
+            "oom": false,
+            "deadline_exceeded": false,
+            "failure_class": "compile-error",
+            "contract_version": "1"
+        }"#;
+        let vj = VerdictJson::parse(v2).expect("schema_version 2 must parse");
+        assert_eq!(vj.schema_version, 2);
+        assert_eq!(vj.failure_class, Some(FailureClass::CompileError));
+        assert_eq!(vj.to_verdict(), Verdict::TestFailure);
+    }
+
+    /// The two schema versions outside [`SUPPORTED_SCHEMA_VERSIONS`] that a
+    /// producer is most likely to reach for — 0 (pre-versioning) and 3 (the
+    /// first future version) — are rejected with an error that names the
+    /// offending version, so a producer/consumer version mismatch is
+    /// diagnosable from the message alone and callers degrade to
+    /// exit-code-only rather than guessing.
+    #[test]
+    fn schema_version_zero_and_three_are_rejected_with_a_clear_error() {
+        for version in [0u32, 3] {
+            let doc =
+                format!(r#"{{"schema_version": {version}, "phase": "Succeeded", "exit_code": 0}}"#);
+            let err = VerdictJson::parse(&doc)
+                .expect_err(&format!("schema_version {version} must be rejected"));
+            assert!(
+                err.reason.contains("schema version"),
+                "{version}: wrong error: {}",
+                err.reason
+            );
+            assert!(
+                err.reason.contains(&version.to_string()),
+                "{version}: error must name the version: {}",
+                err.reason
+            );
+        }
+    }
+
     /// Unknown fields from a future schema version are ignored, wherever they
     /// appear in the document.
     #[test]
@@ -408,6 +689,269 @@ mod tests {
         let vj = VerdictJson::parse(doc).expect("unknown fields must be ignored");
         assert_eq!(vj.failure_class, Some(FailureClass::TestFailure));
         assert_eq!(vj.to_verdict(), Verdict::TestFailure);
+    }
+
+    // --- failure taxonomy: FailureClass::classify (verdict.json v2) ---------
+
+    // The fixtures below mirror exactly what the reference producer archives
+    // (contrib/argo/gantry-verify-workflowtemplate.yml): `messages` is the
+    // cargo JSON protocol stream (one object per line, as emitted under
+    // `--message-format json`), `run_log` is the human stream (harness lines,
+    // rendered diagnostics, stderr). Both sides of the pin — this classifier
+    // and the producer's jq/awk — must classify identically or agents branch
+    // on a class the run contradicts.
+
+    /// A compiler-message line the way cargo actually emits it: `level`
+    /// lives inside the `message` object, and the `rendered` diagnostics —
+    /// which carry real newlines — are JSON-escaped inside the string, one
+    /// line per protocol record.
+    fn compiler_message_line(level: &str, rendered: &str) -> String {
+        let rendered = rendered.replace('\n', "\\n");
+        format!(
+            r#"{{"reason":"compiler-message","package_id":"gantry 0.1.0 (path+file:///home/u/gantry)","target":{{"kind":["lib"],"name":"gantry","src_path":"/home/u/gantry/src/lib.rs"}},"message":{{"level":"{level}","message":"see rendered","rendered":"{rendered}","code":null,"spans":[],"children":[]}}}}"#
+        )
+    }
+
+    /// The compile-error fixture: rustc never finished, so the protocol
+    /// stream carries an error-level compiler-message (plus a warning and a
+    /// build-script line, the way a real failing build does), the run log
+    /// carries the rendered diagnostics, and there is no test result at all —
+    /// the suite never ran.
+    #[test]
+    fn classify_compilation_error_from_the_protocol_stream() {
+        let messages = format!(
+            "{}\n{}\n{}\n",
+            compiler_message_line("warning", "warning: unused import: `fmt`\n"),
+            compiler_message_line(
+                "error",
+                "error[E0432]: unresolved import `nope`\n --> src/lib.rs:2:5\n"
+            ),
+            r#"{"reason":"build-script-executed","package_id":"gantry 0.1.0"}"#
+        );
+        let run_log = "error[E0432]: unresolved import `nope`\n \
+                       error: could not compile `gantry` (lib) due to 1 previous error\n";
+
+        assert_eq!(
+            FailureClass::classify(101, true, &messages, run_log),
+            Some(FailureClass::CompileError),
+            "an error-level compiler-message is a compile error whatever else the stream shows"
+        );
+    }
+
+    /// The harness-panic fixture: a test binary crashed the harness (stack
+    /// overflow), which the protocol stream never names — the class is read
+    /// off the human run log, and it outranks the FAILED lines a partially-
+    /// completed target printed before dying. The exit code is cargo's (101:
+    /// "some test binary failed"), not the crashed binary's signal code —
+    /// the producer classifies cargo's exit, and the signal range (>=128)
+    /// stays outside the classifiable window exactly as the producer's
+    /// `exit < 128` gate draws it.
+    #[test]
+    fn classify_stack_overflow_harness_panic_from_the_run_log() {
+        let messages = format!(
+            "{}\n",
+            compiler_message_line("warning", "warning: unused\n")
+        );
+        let run_log = "running 4 tests\n\
+                       test coords ... ok\n\
+                       thread 'big_stack' has overflowed its stack\n\
+                       fatal runtime error: stack overflow\n\
+                       test result: FAILED. 1 passed; 0 failed; 0 ignored\n\
+                       error: test failed, to rerun pass `--lib`\n";
+
+        assert_eq!(
+            FailureClass::classify(101, true, &messages, run_log),
+            Some(FailureClass::HarnessPanic),
+            "a stack-overflowed test binary is a harness panic, not a test failure"
+        );
+    }
+
+    /// The doctest fixture: the lib target passed, and the only FAILED
+    /// `test result:` lines are the ones after the `Doc-tests` section
+    /// header. A failing doctest *assertion* never produces an error-level
+    /// compiler-message — the protocol stream is benign here, as in a real
+    /// instrumented run.
+    #[test]
+    fn classify_doctest_when_only_the_doc_section_failed() {
+        let messages = format!(
+            "{}\n",
+            compiler_message_line("warning", "warning: unused\n")
+        );
+        let run_log = "running 12 tests\n\
+                       test result: ok. 12 passed; 0 failed; 0 ignored\n\
+                       \n\
+                          Doc-tests gantry\n\
+                       running 3 tests\n\
+                       test src/lib.rs - read_config (line 20) ... FAILED\n\
+                       test result: FAILED. 2 passed; 1 failed; 0 ignored\n\
+                       error: doctest failed\n";
+
+        assert_eq!(
+            FailureClass::classify(1, true, &messages, run_log),
+            Some(FailureClass::Doctest),
+            "only the Doc-tests section failed: a doctest failure"
+        );
+    }
+
+    /// The test-failure fixture — the fallthrough class: a failed unit test,
+    /// no compile error, no panic, no Doc-tests section.
+    #[test]
+    fn classify_test_failure_is_the_fallthrough_class() {
+        let messages = format!(
+            "{}\n",
+            compiler_message_line("warning", "warning: unused\n")
+        );
+        let run_log = "running 2 tests\n\
+                       test parser::tests::rejects_bad ... FAILED\n\
+                       failures:\n\
+                       \n\
+                       failures: parser::tests::rejects_bad\n\
+                       test result: FAILED. 1 passed; 1 failed; 0 ignored\n\
+                       error: test failed\n";
+
+        assert_eq!(
+            FailureClass::classify(1, true, &messages, run_log),
+            Some(FailureClass::TestFailure),
+            "a failed unit test with nothing else wrong is a plain test failure"
+        );
+    }
+
+    /// The classifiable window (plan §Component 5): a suite that ran to
+    /// completion and failed under instrumentation. A passing suite has no
+    /// failure to name; a signal-killed suite (exit ≥ 128) is infra,
+    /// classified by the verdict ladder; an uninstrumented run (caller chose
+    /// their own `--message-format`) never captured the protocol stream, so
+    /// no class is derivable — the exit-code ladder decides, honestly.
+    #[test]
+    fn classify_outside_the_window_is_none() {
+        let messages = format!(
+            "{}\n",
+            compiler_message_line("error", "error[E0432]: unresolved import `nope`\n")
+        );
+        let run_log = "error: could not compile `gantry` (lib)\n";
+
+        // A passing suite: nothing to classify, even with errors archived.
+        assert_eq!(FailureClass::classify(0, true, &messages, run_log), None);
+
+        // Signal-killed suites: infra, the ladder's business.
+        for code in [128, 130, 137, 143, 255] {
+            assert_eq!(
+                FailureClass::classify(code, true, &messages, run_log),
+                None,
+                "exit {code} is infra, not a failure class"
+            );
+        }
+
+        // Even a stack-overflowed log stays unclassified out here: the
+        // producer derives classes only under its `exit < 128` gate, so a
+        // class read at >=128 would name a run the producer records as
+        // class-less — the ladder's InfraFailure is the whole story.
+        assert_eq!(
+            FailureClass::classify(
+                134,
+                true,
+                &messages,
+                "thread 'big_stack' has overflowed its stack\n"
+            ),
+            None,
+            "the signal range has no failure class even on overflow evidence"
+        );
+
+        // Uninstrumented runs: no protocol stream was captured.
+        assert_eq!(
+            FailureClass::classify(1, false, &messages, run_log),
+            None,
+            "a caller-chosen --message-format means no taxonomy"
+        );
+    }
+
+    /// Detection order is the producer's exactly: compile-error outranks
+    /// everything a later stage printed, because rustc never finished and
+    /// whatever failed after it is noise.
+    #[test]
+    fn classify_compile_error_outranks_later_stream_evidence() {
+        let messages = format!(
+            "{}\n",
+            compiler_message_line("error", "error[E0432]: unresolved import `nope`\n")
+        );
+        let run_log = "thread 'big_stack' has overflowed its stack\n\
+                          Doc-tests gantry\n\
+                       test result: FAILED. 0 passed; 1 failed\n";
+
+        assert_eq!(
+            FailureClass::classify(101, true, &messages, run_log),
+            Some(FailureClass::CompileError),
+            "compile-error outranks harness-panic and doctest evidence"
+        );
+    }
+
+    /// A run whose unit tests failed AND whose doctests failed is a plain
+    /// test failure: the doctest class names runs where the doc section was
+    /// the *only* thing that failed, so "also fix your doctests" never
+    /// hides the real signal.
+    #[test]
+    fn classify_mixed_unit_and_doc_failures_are_a_plain_test_failure() {
+        let messages = "";
+        let run_log = "running 2 tests\n\
+                       test a ... FAILED\n\
+                       test result: FAILED. 1 passed; 1 failed\n\
+                       \n\
+                          Doc-tests gantry\n\
+                       running 1 test\n\
+                       test doc ... FAILED\n\
+                       test result: FAILED. 0 passed; 1 failed\n";
+
+        assert_eq!(
+            FailureClass::classify(1, true, messages, run_log),
+            Some(FailureClass::TestFailure),
+            "doc failures beside unit failures are a plain test failure"
+        );
+    }
+
+    /// Leniency the classifier is documented for: a line in the archived
+    /// protocol stream that is not a JSON object (the harness's human output
+    /// shares stdout in instrumented mode) is skipped, not an error — one
+    /// garbled line cannot blind the classifier to the error that follows.
+    #[test]
+    fn classify_garbled_protocol_lines_cannot_blind_the_classifier() {
+        let messages = format!(
+            "running 12 tests\n{}\n{{not json}}\n{}\n",
+            compiler_message_line("warning", "warning: unused\n"),
+            compiler_message_line("error", "error[E0432]: unresolved import `nope`\n")
+        );
+
+        assert_eq!(
+            FailureClass::classify(101, true, &messages, ""),
+            Some(FailureClass::CompileError),
+            "garbled lines are skipped; the error-level diagnostic still classifies"
+        );
+    }
+
+    /// `GateFailure` is never derived from the stream: gates run only after a
+    /// passing suite and are attributed explicitly by the producer — a class
+    /// read off a failing suite's output could only conflate the two.
+    #[test]
+    fn classify_never_derives_gate_failure() {
+        let fixtures = [
+            // (exit, instrumented, messages, run_log) — every fixture in this suite.
+            (101, true, "", "error: could not compile\n"),
+            (1, true, "", "test result: FAILED. 0 passed; 1 failed\n"),
+            (
+                1,
+                true,
+                "",
+                "   Doc-tests gantry\ntest result: FAILED. 0 passed; 1 failed\n",
+            ),
+            (134, true, "", "thread 'x' has overflowed its stack\n"),
+            (0, true, "", "test result: ok. 12 passed\n"),
+        ];
+        for (exit, instrumented, messages, run_log) in fixtures {
+            assert_ne!(
+                FailureClass::classify(exit, instrumented, messages, run_log),
+                Some(FailureClass::GateFailure),
+                "gate-failure is attributed, never derived (exit {exit})"
+            );
+        }
     }
 
     // --- verdict ladder semantics -------------------------------------------
@@ -456,6 +1000,29 @@ mod tests {
         assert_eq!(verdict, Verdict::GateFailure);
         assert!(!verdict.is_infra_failure());
         assert!(verdict.has_test_result());
+    }
+
+    /// The other canonical gate shape (moved here from the argo backend's old
+    /// parser tests): the suite passed but the gate failed, so the remote
+    /// wraps the run as overall exit 1 with explicit gate attribution. The
+    /// attribution must survive that failing exit code — a GateFailure is a
+    /// test result (never the local-fallback InfraFailure) and it reports the
+    /// exit code a test failure would.
+    #[test]
+    fn gate_failure_attribution_survives_a_failing_exit_code() {
+        let vj = VerdictJson::parse(&verdict_doc(
+            "Failed",
+            1,
+            false,
+            false,
+            Some("gate-failure"),
+        ))
+        .expect("gate document must parse");
+        let verdict = vj.to_verdict();
+        assert_eq!(verdict, Verdict::GateFailure);
+        assert!(!verdict.is_infra_failure());
+        assert!(verdict.has_test_result());
+        assert_eq!(verdict.to_exit_code(), 1);
     }
 
     /// The exit-code ladder inside to_verdict: with no infra signals and no
@@ -527,10 +1094,10 @@ mod tests {
         assert_eq!(Verdict::interpret(0, Some("")), Verdict::Pass);
 
         let future = r#"{
-            "schema_version": 2,
+            "schema_version": 3,
             "phase": "Succeeded",
             "exit_code": 0,
-            "ladder": "v2"
+            "ladder": "v3"
         }"#;
         assert_eq!(Verdict::interpret(0, Some(future)), Verdict::Pass);
         assert_eq!(Verdict::interpret(1, Some(future)), Verdict::TestFailure);
@@ -547,12 +1114,13 @@ mod tests {
         for phase in ["Succeeded", "Failed", "Error", "Pending", "Running", ""] {
             for code in [0, 1, 2, 137, -1] {
                 let doc = VerdictJson {
-                    schema_version: SCHEMA_VERSION,
+                    schema_version: CURRENT_SCHEMA_VERSION,
                     phase: phase.to_string(),
                     exit_code: code,
                     oom: false,
                     deadline_exceeded: false,
                     failure_class: None,
+                    contract_version: None,
                 };
                 assert_eq!(
                     VerdictJson::from_exit_code(phase, code),
@@ -631,7 +1199,140 @@ mod tests {
         }
     }
 
-    // --- property tests ------------------------------------------------------
+    // --- the contract handshake (contract_version echo) ----------------------
+
+    /// Swap the helper's matching echo for `echo_json` (a raw JSON value
+    /// source). Matched against the compact form serde_json actually emits
+    /// (no space after the colon).
+    fn with_echo(doc: &str, echo_json: &str) -> String {
+        doc.replace(
+            &format!(r#""contract_version":"{}""#, CONTRACT_VERSION),
+            &format!(r#""contract_version":{echo_json}"#),
+        )
+    }
+
+    /// The drift signal fires exactly when a present echo differs from
+    /// [`CONTRACT_VERSION`] — a matching echo and an absent echo are both
+    /// "no drift" (the handshake confirmed, or a schema-1 producer predates
+    /// it; see [`CONTRACT_VERSION`] for why absence is tolerance, not drift).
+    #[test]
+    fn contract_drift_signals_exactly_the_mismatching_echo() {
+        let matching = VerdictJson::parse(&verdict_doc("Succeeded", 0, false, false, None))
+            .expect("matching echo must parse");
+        assert_eq!(matching.contract_drift(), None);
+        assert_eq!(matching.contract_version.as_deref(), Some(CONTRACT_VERSION));
+
+        let echo_less =
+            VerdictJson::parse(r#"{"schema_version": 1, "phase": "Succeeded", "exit_code": 0}"#)
+                .expect("echo-less document must parse");
+        assert_eq!(echo_less.contract_version, None);
+        assert_eq!(echo_less.contract_drift(), None);
+
+        for stray in ["\"2\"", "\"0\"", "\"v9\"", "\"\"", "\"1 \""] {
+            let doc = with_echo(&verdict_doc("Succeeded", 0, false, false, None), stray);
+            let vj = VerdictJson::parse(&doc)
+                .unwrap_or_else(|e| panic!("stray echo {stray} must parse: {e}"));
+            let expected = stray.trim_matches('"');
+            assert_eq!(vj.contract_drift(), Some(expected), "echo {stray}");
+        }
+    }
+
+    /// The plan's handshake rule (§"Versioning & compatibility"): a mismatch
+    /// the client can't interpret is InfraFailure with drift semantics,
+    /// never a misread verdict. Across the full field matrix, swapping the
+    /// matching echo for a foreign one flips every document — pass, gate,
+    /// OOM, deadline, whatever — to InfraFailure.
+    #[test]
+    fn property_mismatching_echo_is_infra_failure_across_the_matrix() {
+        for base in all_schema_one_documents() {
+            let expected = VerdictJson::parse(&base).expect("base parses").to_verdict();
+            // Sanity: with the matching echo the matrix classifies normally
+            // (this is what makes the flip below a drift effect, not noise).
+            assert_ne!(expected, Verdict::Cancelled, "matrix verdict is real");
+
+            let drifted = with_echo(&base, r#""9""#);
+            let parsed = VerdictJson::parse(&drifted)
+                .unwrap_or_else(|e| panic!("{drifted}: drift broke parse: {e}"));
+            assert_eq!(parsed.contract_drift(), Some("9"));
+            assert_eq!(
+                parsed.to_verdict(),
+                Verdict::InfraFailure,
+                "foreign echo must read as infra: {drifted}"
+            );
+            assert!(parsed.to_verdict().is_infra_failure());
+        }
+    }
+
+    /// A producer that echoes a non-string shape tried to confirm a contract
+    /// this client cannot read: the document still parses (one fumbled field
+    /// must not cost the rest), but the unreadable echo can never match, so
+    /// it is drift — InfraFailure, not a guessed verdict.
+    #[test]
+    fn garbled_echo_shape_is_drift_not_parse_error() {
+        for garbled in ["42", "true", "[\"1\"]", "{\"v\":1}"] {
+            let doc = with_echo(&verdict_doc("Succeeded", 0, false, false, None), garbled);
+            let parsed = VerdictJson::parse(&doc)
+                .unwrap_or_else(|e| panic!("garbled echo {garbled} must still parse: {e}"));
+            assert!(parsed.contract_drift().is_some(), "garbled {garbled}");
+            assert_eq!(
+                parsed.to_verdict(),
+                Verdict::InfraFailure,
+                "garbled echo {garbled}"
+            );
+        }
+    }
+
+    /// Absence of the echo is tolerance, not drift — the field arrived by
+    /// additive evolution, so a schema-1 producer predating the handshake is
+    /// fully interpretable and the ladder decides exactly as before.
+    #[test]
+    fn absent_echo_is_a_pre_handshake_producer_not_drift() {
+        let pass =
+            VerdictJson::parse(r#"{"schema_version": 1, "phase": "Succeeded", "exit_code": 0}"#)
+                .expect("echo-less pass must parse");
+        assert_eq!(pass.contract_drift(), None);
+        assert_eq!(pass.to_verdict(), Verdict::Pass);
+
+        let gate = VerdictJson::parse(
+            r#"{"schema_version": 1, "phase": "Succeeded", "exit_code": 0,
+                "failure_class": "gate-failure"}"#,
+        )
+        .expect("echo-less gate document must parse");
+        assert_eq!(gate.contract_drift(), None);
+        assert_eq!(gate.to_verdict(), Verdict::GateFailure);
+
+        let oom = VerdictJson::parse(
+            r#"{"schema_version": 1, "phase": "Failed", "exit_code": 137,
+                "oom": true, "deadline_exceeded": false}"#,
+        )
+        .expect("echo-less oom document must parse");
+        assert_eq!(oom.to_verdict(), Verdict::InfraFailure);
+    }
+
+    /// The handshake does not disturb the degradation contract: malformed
+    /// JSON and unsupported schema versions still degrade to exit-code-only
+    /// regardless of any echo they carry — there is no parseable schema-1
+    /// document to handshake with.
+    #[test]
+    fn handshake_does_not_disturb_the_degradation_contract() {
+        assert_eq!(
+            Verdict::interpret(1, Some(r#"{not json, "contract_version": "9"}"#)),
+            Verdict::TestFailure,
+            "unparseable document degrades on the exit code alone"
+        );
+        assert_eq!(
+            Verdict::interpret(
+                0,
+                Some(
+                    r#"{"schema_version": 3, "phase": "Succeeded",
+                "exit_code": 0, "contract_version": "9"}"#
+                )
+            ),
+            Verdict::Pass,
+            "unsupported schema degrades; the echo is never consulted"
+        );
+    }
+
     //
     // Dependency-free property tests over a deterministic generated space:
     // every base document in the full field matrix crossed with every unknown-
@@ -694,7 +1395,11 @@ mod tests {
     /// override a parseable document.
     #[test]
     fn property_unknown_fields_never_change_parse_or_verdict() {
-        const NAMES: &[&str] = &["future_field", "contract_version", "toolchain", "node_name"];
+        // contract_version is NOT here: it is a known field since the
+        // contract handshake, and injecting into it is drift semantics —
+        // covered by property_mismatching_echo_is_infra_failure_across_the_matrix
+        // above, not by the unknown-field tolerance.
+        const NAMES: &[&str] = &["future_field", "toolchain", "node_name"];
         let values = unknown_field_values();
 
         for base in all_schema_one_documents() {
@@ -752,6 +1457,12 @@ mod tests {
                     "absent failure_class must not serialize: {serialized}"
                 );
             }
+            if parsed.contract_version.is_none() {
+                assert!(
+                    !serialized.contains("contract_version"),
+                    "absent contract_version must not serialize: {serialized}"
+                );
+            }
 
             let reparsed = VerdictJson::parse(&serialized)
                 .unwrap_or_else(|e| panic!("{serialized}: round trip broke parse: {e}"));
@@ -762,10 +1473,10 @@ mod tests {
 
     /// Property: every schema_version this parser does not know is rejected
     /// loudly (which degrades callers to exit-code-only), never silently
-    /// interpreted as version 1.
+    /// interpreted as a known one.
     #[test]
     fn property_unsupported_schema_versions_are_rejected() {
-        for version in [0u32, 2, 3, 42, u32::MAX] {
+        for version in [0u32, 3, 42, u32::MAX] {
             let doc =
                 format!(r#"{{"schema_version": {version}, "phase": "Succeeded", "exit_code": 0}}"#);
             let err = VerdictJson::parse(&doc)

@@ -17,6 +17,7 @@
 // field is a major bump of [`SCHEMA_VERSION`] and a new schema file.
 
 pub mod explain;
+pub mod run;
 pub mod schema;
 pub mod status;
 pub mod why;

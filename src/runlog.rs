@@ -394,7 +394,10 @@ impl IntentRecord {
             ts: Self::now_ms(),
             tool,
             args,
-            repo,
+            // S-5 log hygiene: store the remote URL but never the credentials
+            // embedded in it — the same userinfo strip the crash bundle's
+            // redactor applies, so the rule has one implementation to audit.
+            repo: crate::crash::redact_url_userinfo(&repo),
             sha,
             cwd_rel,
             gate,
@@ -473,6 +476,24 @@ pub struct VerdictRecord {
     /// Exit code from the run.
     pub exit_code: i32,
 
+    /// Failure taxonomy class (verdict.json v2, plan §Component 5): what the
+    /// remote run died of — compile-error / test-failure / doctest /
+    /// harness-panic — when it ran to completion, failed, and was
+    /// instrumented with `--message-format json`. `None` for passes, infra,
+    /// cancels, local runs, and uninstrumented producers; `gate-failure` is
+    /// never derived, only attributed by the producer.
+    ///
+    /// Lenient on read, exactly like verdict.json: a class string a newer
+    /// producer coined reads as absent rather than failing the record parse.
+    /// Additive on write (skipped when absent), so records from either
+    /// schema parse everywhere the ledger does — `SCHEMA_VERSION` stays 1.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::verdict::deserialize_lenient_failure_class"
+    )]
+    pub failure_class: Option<crate::verdict::FailureClass>,
+
     /// Backend handle (workflow name, etc.) for `gantry why`.
     pub handle: String,
 
@@ -501,6 +522,7 @@ impl VerdictRecord {
             verdict,
             ran,
             exit_code,
+            failure_class: None,
             handle,
             durations_ms,
         }
@@ -744,6 +766,54 @@ mod tests {
         assert_eq!(parsed["tool"], "cargo");
         assert_eq!(parsed["args"].as_array().unwrap().len(), 3);
         assert_eq!(parsed["decision"], "remote");
+    }
+
+    #[test]
+    fn intent_repo_strips_embedded_credentials_s5() {
+        // S-5 log hygiene: the runlog stores the remote URL as given but
+        // never the credentials embedded in it — userinfo is stripped before
+        // the intent is written.
+        let intent = IntentRecord::new(
+            "cargo".to_string(),
+            vec!["test".to_string()],
+            format!("https://ci:{}@git.example/repo.git", ["gantry", "synthetic", "pw"].join("-")),
+            "abc123".to_string(),
+            PathBuf::from("."),
+            GateInputs {
+                worktree: true,
+                head: true,
+                remote: true,
+                clean: true,
+            },
+            Decision::Remote,
+            "clean".to_string(),
+            "argo".to_string(),
+        );
+        assert!(
+            !intent.repo.contains("gantry-synthetic-pw"),
+            "{}",
+            intent.repo
+        );
+        assert_eq!(intent.repo, "https://[REDACTED]@git.example/repo.git");
+
+        // A clean URL is stored as given — S-5 strips userinfo, nothing else.
+        let plain = IntentRecord::new(
+            "cargo".to_string(),
+            vec!["test".to_string()],
+            "https://github.com/example/repo".to_string(),
+            "abc123".to_string(),
+            PathBuf::from("."),
+            GateInputs {
+                worktree: true,
+                head: true,
+                remote: true,
+                clean: true,
+            },
+            Decision::Remote,
+            "clean".to_string(),
+            "argo".to_string(),
+        );
+        assert_eq!(plain.repo, "https://github.com/example/repo");
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod backend;
 pub mod cap; // plan Component 6: the per-run cgroup cap (probe once per process, degrade loudly)
 pub mod cli; // plan module layout: management-CLI diagnostics — why / explain / status, --json with schema_version
 pub mod config;
+pub mod crash; // plan Component 7: the crash flight recorder — redacted InfraFailure bundles + `gantry report`
 pub mod decision;
 pub mod doctor;
 pub mod gate;
@@ -13,4 +14,5 @@ pub mod shim;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod uninstall; // plan §8 installer line: "`gantry uninstall` reverses it"
 pub mod verdict;

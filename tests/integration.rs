@@ -154,11 +154,37 @@ fn run_cargo_test(fixture_name: &str) -> (i32, String, String) {
         .output()
         .expect("git ls-remote before failed");
 
+    // The reference executor runs the real toolchain inside the fetched
+    // worktree, so it must not inherit whatever `cargo` sits first in this
+    // process's PATH: on boxes whose PATH cargo is a HOME-relative wrapper
+    // (the fleet interceptor), the isolated HOME below breaks it and the
+    // suite would "fail" without ever running. GANTRY_EXEC_CARGO exists for
+    // exactly this (documented in contrib/gantry-exec.sh), and the rustup
+    // proxy additionally needs CARGO_HOME/RUSTUP_HOME pinned to resolve
+    // toolchains under the redirected HOME. Boxes without a home toolchain
+    // (CI builder images with a system cargo) keep the plain PATH lookup.
+    let orig_home = PathBuf::from(env::var_os("HOME").expect("HOME is set"));
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| orig_home.join(".cargo"));
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| orig_home.join(".rustup"));
+    let home_cargo = cargo_home.join("bin").join("cargo");
+
     // Run the cargo symlink (which invokes gantry with argv[0]="cargo")
     let output = Command::new(&cargo_link)
         .current_dir(&fixture_path)
         .env("GANTRY_EXEC_PATH", executor_path())
         .env("HOME", home.path())
+        .env("CARGO_HOME", &cargo_home)
+        .env("RUSTUP_HOME", &rustup_home)
+        .envs(home_cargo.is_file().then(|| {
+            (
+                "GANTRY_EXEC_CARGO",
+                home_cargo.to_string_lossy().into_owned(),
+            )
+        }))
         // XDG overrides would redirect the user config layer away from the
         // isolated HOME, so they are stripped rather than set.
         .env_remove("XDG_CONFIG_HOME")
