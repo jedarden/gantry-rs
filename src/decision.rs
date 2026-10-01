@@ -316,11 +316,16 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
 
     let run_start = Instant::now();
     let deadline = Instant::now() + backend_wait_deadline(config);
-    let verdict_result = backend.wait(&handle, deadline);
+    // wait_outcome pairs the verdict with the failure class the remote's
+    // parsed document attributed to it (the verdict.json v2 taxonomy); a
+    // verdict-only backend keeps None. The class rides into the terminal
+    // record below, where the field contract gate ([`gate_failure_class`],
+    // inside [`write_verdict`]) decides whether it lands on the record.
+    let outcome_result = backend.wait_outcome(&handle, deadline);
     let run_duration_ms = run_start.elapsed().as_millis() as u64;
 
-    let verdict = match verdict_result {
-        Ok(v) => v,
+    let (verdict, failure_class) = match outcome_result {
+        Ok(outcome) => outcome,
         Err(e) => {
             report_wait_failure(&e, &handle.handle);
             eprintln!("[gantry] verdict: InfraFailure");
@@ -344,7 +349,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                     &rl,
                     run_id.clone(),
                     Verdict::InfraFailure,
-                    None,
+                    None, // a wait error carries no document, so no class
                     RanLocation::Remote,
                     1,
                     handle.handle.clone(),
@@ -378,14 +383,16 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         );
     }
 
-    // Step 6: Write terminal verdict record (successful completion path)
+    // Step 6: Write terminal verdict record (successful completion path). The
+    // failure class wait_outcome paired with the verdict rides along; the
+    // field contract gate inside write_verdict decides whether it lands.
     if let Some(rl) = runlog {
         let exit_code = verdict.to_exit_code();
         let _ = write_verdict(
             &rl,
             run_id.clone(),
             verdict,
-            None,
+            failure_class,
             RanLocation::Remote,
             exit_code,
             handle.handle.clone(),
@@ -822,10 +829,35 @@ fn write_verdict(
     handle: String,
     durations_ms: Option<Durations>,
 ) -> Result<(), crate::runlog::RunLogError> {
-    let runlog_verdict = convert_backend_verdict_to_runlog(verdict);
-    let record = VerdictRecord::new(run_id, runlog_verdict, ran, exit_code, handle, durations_ms)
-        .with_failure_class(gate_failure_class(runlog_verdict, failure_class));
+    let record = verdict_record(
+        run_id,
+        verdict,
+        failure_class,
+        ran,
+        exit_code,
+        handle,
+        durations_ms,
+    );
     runlog.close_verdict(&record)
+}
+
+/// Assemble the terminal remote verdict record — everything
+/// [`write_verdict`] writes minus the ledger append. Split out so record-
+/// level tests drive the exact assembly the intercepted path's terminal
+/// write uses: `RunLog::open()` resolves the state dir from the process-wide
+/// HOME, which a parallel unit test must not mutate.
+fn verdict_record(
+    run_id: String,
+    verdict: Verdict,
+    failure_class: Option<crate::verdict::FailureClass>,
+    ran: RanLocation,
+    exit_code: i32,
+    handle: String,
+    durations_ms: Option<Durations>,
+) -> VerdictRecord {
+    let runlog_verdict = convert_backend_verdict_to_runlog(verdict);
+    VerdictRecord::new(run_id, runlog_verdict, ran, exit_code, handle, durations_ms)
+        .with_failure_class(gate_failure_class(runlog_verdict, failure_class))
 }
 
 /// The field contract gate ([`crate::runlog::VerdictRecord::failure_class`]):
@@ -1674,6 +1706,104 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
             let parsed: VerdictRecord = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed.failure_class, Some(FailureClass::HarnessPanic));
+        }
+    }
+
+    mod intercepted_wait_threading {
+        use super::*;
+        use crate::backend::RunHandle;
+        use crate::runlog::Verdict as RunLogVerdict;
+        use crate::verdict::FailureClass;
+
+        /// The canned-outcome backend the threading tests drive:
+        /// wait_outcome returns the outcome a class-parsing backend hands the
+        /// intercepted path, and wait() panics — after the wait_outcome
+        /// switch, the wait site must never consult the bare-verdict shape.
+        struct OutcomeBackend {
+            outcome: Result<(Verdict, Option<FailureClass>), BackendError>,
+        }
+
+        impl RemoteBackend for OutcomeBackend {
+            fn submit(&self, _spec: &RunSpec) -> Result<RunHandle, BackendError> {
+                Ok(RunHandle::new("workflow-canned"))
+            }
+
+            fn wait(&self, _h: &RunHandle, _deadline: Instant) -> Result<Verdict, BackendError> {
+                panic!("the intercepted wait site must go through wait_outcome");
+            }
+
+            fn wait_outcome(
+                &self,
+                _h: &RunHandle,
+                _deadline: Instant,
+            ) -> Result<(Verdict, Option<FailureClass>), BackendError> {
+                self.outcome.clone()
+            }
+        }
+
+        /// The intercepted path's wait fold (run_remote Step 5) paired with
+        /// the record assembly its terminal write uses: wait_outcome's
+        /// (verdict, class) pair goes into [`verdict_record`] unchanged — the
+        /// same helper [`write_verdict`] builds the ledger record from — so a
+        /// class-bearing outcome stamps the remote record and no parsed class
+        /// is dropped on the floor.
+        #[test]
+        fn class_bearing_outcome_lands_on_the_terminal_remote_record() {
+            let backend = OutcomeBackend {
+                outcome: Ok((Verdict::TestFailure, Some(FailureClass::TestFailure))),
+            };
+            let handle = RunHandle::new("workflow-classed");
+
+            let (verdict, failure_class) = backend
+                .wait_outcome(&handle, Instant::now())
+                .expect("canned class-bearing outcome");
+            let record = verdict_record(
+                "run-classed".to_string(),
+                verdict,
+                failure_class,
+                RanLocation::Remote,
+                verdict.to_exit_code(),
+                handle.handle.clone(),
+                None,
+            );
+
+            assert_eq!(record.verdict, RunLogVerdict::TestFailure);
+            assert_eq!(record.failure_class, Some(FailureClass::TestFailure));
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                json.contains("\"failure_class\":\"test-failure\""),
+                "terminal remote record must stamp the parsed class, got: {json}"
+            );
+        }
+
+        #[test]
+        fn wait_error_folds_to_an_infra_failure_record_with_null_class() {
+            let backend = OutcomeBackend {
+                outcome: Err(BackendError::new("pod evicted mid-wait")),
+            };
+            let handle = RunHandle::new("workflow-evicted");
+
+            // The Err arm of run_remote's wait fold: the wait carried no
+            // outcome at all, so the record is InfraFailure with no class —
+            // and the field contract would keep it null regardless.
+            assert!(backend.wait_outcome(&handle, Instant::now()).is_err());
+            let record = verdict_record(
+                "run-evicted".to_string(),
+                Verdict::InfraFailure,
+                None,
+                RanLocation::Remote,
+                1,
+                handle.handle.clone(),
+                None,
+            );
+
+            assert_eq!(record.verdict, RunLogVerdict::InfraFailure);
+            assert_eq!(record.failure_class, None);
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                !json.contains("failure_class"),
+                "wait-error record must serialize no failure_class field, got: {json}"
+            );
         }
     }
 }
