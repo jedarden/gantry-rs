@@ -664,10 +664,21 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
 
     let run_start = Instant::now();
     let deadline = Instant::now() + backend_wait_deadline(config);
-    let verdict = match backend.wait(&handle, deadline) {
-        Ok(v) => v,
+    // wait_outcome pairs the verdict with the failure class the remote's
+    // parsed document attributed to it (the verdict.json v2 taxonomy); a
+    // verdict-only backend keeps None. The class rides into the terminal
+    // record below, where the field contract gate ([`gate_failure_class`],
+    // inside [`write_verdict`]) decides whether it lands on the record.
+    let outcome_result = backend.wait_outcome(&handle, deadline);
+    let run_duration_ms = run_start.elapsed().as_millis() as u64;
+
+    let (verdict, failure_class) = match outcome_result {
+        Ok(outcome) => outcome,
         Err(e) => {
             report_wait_failure(&e, &handle.handle);
+            // The wait carried no document, so no class exists: the capped
+            // local ladder below closes the run with the class-free record
+            // every [`write_local_verdict`] call writes.
             record_infra_failure(
                 config,
                 &run_id,
@@ -717,14 +728,16 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
     }
 
     // Success path: record the remote verdict and return its ladder exit
-    // code — the same fidelity an intercepted run delivers (INV-3).
+    // code — the same fidelity an intercepted run delivers (INV-3). A class
+    // the wait paired with the verdict rides along; the field contract gate
+    // inside write_verdict decides whether it lands.
     let exit_code = verdict.to_exit_code();
     if let Some(rl) = runlog {
         let _ = write_verdict(
             &rl,
             run_id,
             verdict,
-            None,
+            failure_class,
             RanLocation::Remote,
             exit_code,
             handle.handle.clone(),
@@ -732,7 +745,7 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
                 gate: gate_duration_ms,
                 push: push_duration_ms,
                 queue: queue_duration_ms,
-                run: run_start.elapsed().as_millis() as u64,
+                run: run_duration_ms,
             }),
         );
     }
@@ -772,6 +785,7 @@ fn explicit_run_spec_fields<'a>(
 /// internally, while the wrapped program's resolution is the explicit
 /// offload's own contract (plan §1: resolution failures surface, never
 /// re-exec gantry).
+#[allow(clippy::too_many_arguments)]
 fn resolve_and_fall_back(
     config: &Config,
     program: &str,
@@ -879,6 +893,10 @@ fn gate_failure_class(
 }
 
 /// Write a verdict record for a local execution.
+///
+/// Local records never carry a failure class: the class is a property of the
+/// remote's parsed verdict document ([`write_verdict`]), and a local run
+/// produces none — the local outcome *is* the verdict.
 fn write_local_verdict(
     runlog: &RunLog,
     run_id: String,
@@ -886,15 +904,29 @@ fn write_local_verdict(
     exit_code: i32,
     durations_ms: Option<Durations>,
 ) -> Result<(), crate::runlog::RunLogError> {
-    let record = VerdictRecord::new(
+    let record = local_verdict_record(run_id, verdict, exit_code, durations_ms);
+    runlog.close_verdict(&record)
+}
+
+/// Assemble the terminal local verdict record — everything
+/// [`write_local_verdict`] writes minus the ledger append. Split out so
+/// record-level tests drive the exact assembly the local tails use (the
+/// same reason [`verdict_record`] exists for the remote write) and pin the
+/// null contract: no local record ever serializes a failure_class field.
+fn local_verdict_record(
+    run_id: String,
+    verdict: crate::runlog::Verdict,
+    exit_code: i32,
+    durations_ms: Option<Durations>,
+) -> VerdictRecord {
+    VerdictRecord::new(
         run_id,
         verdict,
         RanLocation::Local,
         exit_code,
         "local".to_string(),
         durations_ms,
-    );
-    runlog.close_verdict(&record)
+    )
 }
 
 /// Convert a backend Verdict to a runlog Verdict.
@@ -1064,6 +1096,7 @@ pub fn run_tier0(config: &Config, repo_url: &str, sha: &str, args: &[String]) ->
 /// which is how the explicit-offload paths run the wrapped command instead.
 ///
 /// Returns the child's exit code, or 1 when nothing could be run.
+#[allow(clippy::too_many_arguments)]
 fn execute_locally(
     config: &Config,
     repo_url: &str,
@@ -1803,6 +1836,177 @@ mod tests {
             assert!(
                 !json.contains("failure_class"),
                 "wait-error record must serialize no failure_class field, got: {json}"
+            );
+        }
+    }
+
+    mod fallback_wait_threading {
+        use super::*;
+        use crate::backend::RunHandle;
+        use crate::runlog::Verdict as RunLogVerdict;
+        use crate::verdict::FailureClass;
+
+        /// The canned-outcome backend the fallback-resolution threading
+        /// tests drive: wait_outcome returns the outcome a class-parsing
+        /// backend hands the explicit path, and wait() panics — after the
+        /// wait_outcome switch, this path's wait site must never consult
+        /// the bare-verdict shape.
+        struct OutcomeBackend {
+            outcome: Result<(Verdict, Option<FailureClass>), BackendError>,
+        }
+
+        impl RemoteBackend for OutcomeBackend {
+            fn submit(&self, _spec: &RunSpec) -> Result<RunHandle, BackendError> {
+                Ok(RunHandle::new("workflow-canned"))
+            }
+
+            fn wait(&self, _h: &RunHandle, _deadline: Instant) -> Result<Verdict, BackendError> {
+                panic!("the fallback-resolution wait site must go through wait_outcome");
+            }
+
+            fn wait_outcome(
+                &self,
+                _h: &RunHandle,
+                _deadline: Instant,
+            ) -> Result<(Verdict, Option<FailureClass>), BackendError> {
+                self.outcome.clone()
+            }
+        }
+
+        /// The explicit path's wait fold paired with the record assembly its
+        /// terminal write uses: wait_outcome's (verdict, class) pair goes
+        /// into [`verdict_record`] unchanged — the same helper
+        /// [`write_verdict`] builds the ledger record from — so a
+        /// class-bearing outcome stamps the remote record here exactly as it
+        /// does on the intercepted path, and no parsed class is dropped on
+        /// the floor.
+        #[test]
+        fn class_bearing_outcome_lands_on_the_terminal_remote_record() {
+            let backend = OutcomeBackend {
+                outcome: Ok((Verdict::TestFailure, Some(FailureClass::CompileError))),
+            };
+            let handle = RunHandle::new("workflow-explicit-classed");
+
+            let (verdict, failure_class) = backend
+                .wait_outcome(&handle, Instant::now())
+                .expect("canned class-bearing outcome");
+            let record = verdict_record(
+                "run-explicit-classed".to_string(),
+                verdict,
+                failure_class,
+                RanLocation::Remote,
+                verdict.to_exit_code(),
+                handle.handle.clone(),
+                None,
+            );
+
+            assert_eq!(record.verdict, RunLogVerdict::TestFailure);
+            assert_eq!(record.failure_class, Some(FailureClass::CompileError));
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                json.contains("\"failure_class\":\"compile-error\""),
+                "terminal remote record must stamp the parsed class, got: {json}"
+            );
+        }
+
+        /// The Err arm of the explicit path's wait fold: the wait carried no
+        /// document, so no class exists — the run closes through the capped
+        /// local ladder, whose record is InfraFailure and class-free.
+        #[test]
+        fn wait_error_folds_to_a_class_free_local_fallback_record() {
+            let backend = OutcomeBackend {
+                outcome: Err(BackendError::new("pod evicted mid-wait")),
+            };
+            let handle = RunHandle::new("workflow-explicit-evicted");
+
+            assert!(backend.wait_outcome(&handle, Instant::now()).is_err());
+            // The record the fallback ladder closes the folded run with —
+            // the same assembly [`write_local_verdict`] writes.
+            let record = local_verdict_record(
+                "run-explicit-evicted".to_string(),
+                RunLogVerdict::InfraFailure,
+                1,
+                None,
+            );
+
+            assert_eq!(record.verdict, RunLogVerdict::InfraFailure);
+            assert_eq!(record.ran, RanLocation::Local);
+            assert_eq!(record.failure_class, None);
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                !json.contains("failure_class"),
+                "local fallback record must serialize no failure_class field, got: {json}"
+            );
+        }
+
+        /// The remote half of the both-paths wait-error pin: even when a
+        /// backend pairs a class with a terminal InfraFailure verdict, the
+        /// field contract keeps the class off the record — the shared
+        /// assembly both wait sites' terminal writes go through.
+        #[test]
+        fn infra_failure_records_stay_class_free_even_when_a_class_arrived() {
+            let record = verdict_record(
+                "run-infra-classed".to_string(),
+                Verdict::InfraFailure,
+                Some(FailureClass::HarnessPanic),
+                RanLocation::Remote,
+                1,
+                "workflow-infra".to_string(),
+                None,
+            );
+
+            assert_eq!(record.verdict, RunLogVerdict::InfraFailure);
+            assert_eq!(record.failure_class, None);
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                !json.contains("failure_class"),
+                "infra-failure record must serialize no failure_class field even when a class arrived, got: {json}"
+            );
+        }
+
+        /// A local record never carries a class — not even a failed one: the
+        /// local outcome is the verdict, and the class is a property of the
+        /// remote's parsed document.
+        #[test]
+        fn local_records_stay_class_free_even_when_failed() {
+            let record = local_verdict_record(
+                "run-local-failed".to_string(),
+                RunLogVerdict::TestFailure,
+                101,
+                None,
+            );
+
+            assert_eq!(record.verdict, RunLogVerdict::TestFailure);
+            assert_eq!(record.failure_class, None);
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                !json.contains("failure_class"),
+                "local record must serialize no failure_class field, got: {json}"
+            );
+        }
+
+        /// The field contract's Pass arm exercised through the terminal
+        /// write's real assembly (not by calling the gate directly): a
+        /// backend that pairs a class with a Pass verdict must not see it
+        /// stamped — [`gate_failure_class`] nulls it.
+        #[test]
+        fn pass_record_stays_null_even_when_a_class_arrived() {
+            let record = verdict_record(
+                "run-pass-classed".to_string(),
+                Verdict::Pass,
+                Some(FailureClass::TestFailure),
+                RanLocation::Remote,
+                0,
+                "workflow-pass".to_string(),
+                None,
+            );
+
+            assert_eq!(record.verdict, RunLogVerdict::Pass);
+            assert_eq!(record.failure_class, None);
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                !json.contains("failure_class"),
+                "pass record must serialize no failure_class field even when a class arrived, got: {json}"
             );
         }
     }
