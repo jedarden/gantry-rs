@@ -92,9 +92,12 @@ impl FailureClass {
     ///
     /// This is the normative form of the algorithm the reference producer
     /// (`contrib/argo/gantry-verify-workflowtemplate.yml`) executes in jq/awk
-    /// when it stamps `failure_class` into verdict.json; the fixture tests
-    /// below pin both to the same semantics. Inputs are exactly what the
-    /// producer has:
+    /// when it stamps `failure_class` into verdict.json; the shared fixture
+    /// corpus (`tests/fixtures/failure-class-corpus.json`) pins both to the
+    /// same semantics — the producer-parity test below executes the
+    /// template's own snippet on every fixture, so drift fails `cargo test`
+    /// instead of surfacing as an agent branching on a class the run
+    /// contradicts. Inputs are exactly what the producer has:
     ///
     /// - `exit_code` — the *raw* cargo exit code (0–255 shell domain), not
     ///   the client-ladder code verdict.json carries.
@@ -693,264 +696,321 @@ mod tests {
 
     // --- failure taxonomy: FailureClass::classify (verdict.json v2) ---------
 
-    // The fixtures below mirror exactly what the reference producer archives
-    // (contrib/argo/gantry-verify-workflowtemplate.yml): `messages` is the
-    // cargo JSON protocol stream (one object per line, as emitted under
-    // `--message-format json`), `run_log` is the human stream (harness lines,
-    // rendered diagnostics, stderr). Both sides of the pin — this classifier
-    // and the producer's jq/awk — must classify identically or agents branch
-    // on a class the run contradicts.
+    // The fixtures live in one shared corpus
+    // (tests/fixtures/failure-class-corpus.json) that both consumers of the
+    // taxonomy read: the classify tests here, and the producer-parity test
+    // below, which executes the reference producer's own classification
+    // snippet (contrib/argo/gantry-verify-workflowtemplate.yml) on every
+    // entry. Both sides of the pin — this classifier and the producer's
+    // jq/grep/awk — must classify identically or agents branch on a class
+    // the run contradicts.
 
-    /// A compiler-message line the way cargo actually emits it: `level`
-    /// lives inside the `message` object, and the `rendered` diagnostics —
-    /// which carry real newlines — are JSON-escaped inside the string, one
-    /// line per protocol record.
-    fn compiler_message_line(level: &str, rendered: &str) -> String {
-        let rendered = rendered.replace('\n', "\\n");
-        format!(
-            r#"{{"reason":"compiler-message","package_id":"gantry 0.1.0 (path+file:///home/u/gantry)","target":{{"kind":["lib"],"name":"gantry","src_path":"/home/u/gantry/src/lib.rs"}},"message":{{"level":"{level}","message":"see rendered","rendered":"{rendered}","code":null,"spans":[],"children":[]}}}}"#
-        )
+    /// One fixture of the shared producer-reference corpus: exactly the
+    /// inputs the producer archives (exit code, instrumentation, the two
+    /// streams) plus the class both implementations must stamp.
+    #[derive(Debug, Deserialize)]
+    struct ProducerCorpusEntry {
+        name: String,
+        /// What the fixture proves, rendered on failure.
+        why: String,
+        /// The raw cargo exit code (0-255 shell domain).
+        exit_code: i32,
+        /// False when the caller chose their own `--message-format`.
+        instrumented: bool,
+        /// The archived cargo JSON protocol stream (one object per line,
+        /// mixed with the harness's human lines that share stdout).
+        messages: String,
+        /// The human-visible run output (harness lines, rendered
+        /// diagnostics, stderr).
+        run_log: String,
+        /// The kebab-case class both implementations must stamp, null where
+        /// the classifiable window leaves the class unset.
+        expected_class: Option<String>,
+        /// Set only where the producer attributes the class explicitly
+        /// (gates) instead of deriving it from the streams.
+        producer_attribute: Option<String>,
     }
 
-    /// The compile-error fixture: rustc never finished, so the protocol
-    /// stream carries an error-level compiler-message (plus a warning and a
-    /// build-script line, the way a real failing build does), the run log
-    /// carries the rendered diagnostics, and there is no test result at all —
-    /// the suite never ran.
-    #[test]
-    fn classify_compilation_error_from_the_protocol_stream() {
-        let messages = format!(
-            "{}\n{}\n{}\n",
-            compiler_message_line("warning", "warning: unused import: `fmt`\n"),
-            compiler_message_line(
-                "error",
-                "error[E0432]: unresolved import `nope`\n --> src/lib.rs:2:5\n"
-            ),
-            r#"{"reason":"build-script-executed","package_id":"gantry 0.1.0"}"#
-        );
-        let run_log = "error[E0432]: unresolved import `nope`\n \
-                       error: could not compile `gantry` (lib) due to 1 previous error\n";
-
-        assert_eq!(
-            FailureClass::classify(101, true, &messages, run_log),
-            Some(FailureClass::CompileError),
-            "an error-level compiler-message is a compile error whatever else the stream shows"
-        );
+    #[derive(Debug, Deserialize)]
+    struct ProducerCorpus {
+        entries: Vec<ProducerCorpusEntry>,
     }
 
-    /// The harness-panic fixture: a test binary crashed the harness (stack
-    /// overflow), which the protocol stream never names — the class is read
-    /// off the human run log, and it outranks the FAILED lines a partially-
-    /// completed target printed before dying. The exit code is cargo's (101:
-    /// "some test binary failed"), not the crashed binary's signal code —
-    /// the producer classifies cargo's exit, and the signal range (>=128)
-    /// stays outside the classifiable window exactly as the producer's
-    /// `exit < 128` gate draws it.
-    #[test]
-    fn classify_stack_overflow_harness_panic_from_the_run_log() {
-        let messages = format!(
-            "{}\n",
-            compiler_message_line("warning", "warning: unused\n")
-        );
-        let run_log = "running 4 tests\n\
-                       test coords ... ok\n\
-                       thread 'big_stack' has overflowed its stack\n\
-                       fatal runtime error: stack overflow\n\
-                       test result: FAILED. 1 passed; 0 failed; 0 ignored\n\
-                       error: test failed, to rerun pass `--lib`\n";
-
-        assert_eq!(
-            FailureClass::classify(101, true, &messages, run_log),
-            Some(FailureClass::HarnessPanic),
-            "a stack-overflowed test binary is a harness panic, not a test failure"
-        );
+    /// The shared corpus, exactly as both consumers read it.
+    fn producer_corpus() -> ProducerCorpus {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/failure-class-corpus.json"
+        )))
+        .expect("the shared producer-reference corpus must parse")
     }
 
-    /// The doctest fixture: the lib target passed, and the only FAILED
-    /// `test result:` lines are the ones after the `Doc-tests` section
-    /// header. A failing doctest *assertion* never produces an error-level
-    /// compiler-message — the protocol stream is benign here, as in a real
-    /// instrumented run.
+    /// The corpus is the fixture pin on [`FailureClass::classify`]: for
+    /// every entry, classify must return exactly the entry's expected class
+    /// for exactly the inputs the producer archives.
     #[test]
-    fn classify_doctest_when_only_the_doc_section_failed() {
-        let messages = format!(
-            "{}\n",
-            compiler_message_line("warning", "warning: unused\n")
-        );
-        let run_log = "running 12 tests\n\
-                       test result: ok. 12 passed; 0 failed; 0 ignored\n\
-                       \n\
-                          Doc-tests gantry\n\
-                       running 3 tests\n\
-                       test src/lib.rs - read_config (line 20) ... FAILED\n\
-                       test result: FAILED. 2 passed; 1 failed; 0 ignored\n\
-                       error: doctest failed\n";
-
-        assert_eq!(
-            FailureClass::classify(1, true, &messages, run_log),
-            Some(FailureClass::Doctest),
-            "only the Doc-tests section failed: a doctest failure"
-        );
+    fn classify_matches_the_producer_reference_corpus() {
+        for entry in producer_corpus().entries {
+            let name = entry.name.as_str();
+            let why = entry.why.as_str();
+            let expected = entry.expected_class.as_deref().map(|raw| {
+                FailureClass::from_kebab(raw)
+                    .unwrap_or_else(|| panic!("corpus entry {name} names an unknown class {raw:?}"))
+            });
+            assert_eq!(
+                FailureClass::classify(
+                    entry.exit_code,
+                    entry.instrumented,
+                    &entry.messages,
+                    &entry.run_log
+                ),
+                expected,
+                "entry {name}: {why}"
+            );
+        }
     }
 
-    /// The test-failure fixture — the fallthrough class: a failed unit test,
-    /// no compile error, no panic, no Doc-tests section.
+    /// The window's upper edge across the whole signal range: the corpus
+    /// carries the representative edges, this sweeps the ladder — every
+    /// signal-killed exit is infra, classified by the verdict ladder, never
+    /// a failure class.
     #[test]
-    fn classify_test_failure_is_the_fallthrough_class() {
-        let messages = format!(
-            "{}\n",
-            compiler_message_line("warning", "warning: unused\n")
-        );
-        let run_log = "running 2 tests\n\
-                       test parser::tests::rejects_bad ... FAILED\n\
-                       failures:\n\
-                       \n\
-                       failures: parser::tests::rejects_bad\n\
-                       test result: FAILED. 1 passed; 1 failed; 0 ignored\n\
-                       error: test failed\n";
-
-        assert_eq!(
-            FailureClass::classify(1, true, &messages, run_log),
-            Some(FailureClass::TestFailure),
-            "a failed unit test with nothing else wrong is a plain test failure"
-        );
-    }
-
-    /// The classifiable window (plan §Component 5): a suite that ran to
-    /// completion and failed under instrumentation. A passing suite has no
-    /// failure to name; a signal-killed suite (exit ≥ 128) is infra,
-    /// classified by the verdict ladder; an uninstrumented run (caller chose
-    /// their own `--message-format`) never captured the protocol stream, so
-    /// no class is derivable — the exit-code ladder decides, honestly.
-    #[test]
-    fn classify_outside_the_window_is_none() {
-        let messages = format!(
-            "{}\n",
-            compiler_message_line("error", "error[E0432]: unresolved import `nope`\n")
-        );
-        let run_log = "error: could not compile `gantry` (lib)\n";
-
-        // A passing suite: nothing to classify, even with errors archived.
-        assert_eq!(FailureClass::classify(0, true, &messages, run_log), None);
-
-        // Signal-killed suites: infra, the ladder's business.
+    fn classify_signal_range_is_classless_across_the_ladder() {
+        let corpus = producer_corpus();
+        let entry = corpus
+            .entries
+            .iter()
+            .find(|entry| entry.name == "signal-killed-suite-is-infra")
+            .expect("the corpus carries the signal-range fixture");
         for code in [128, 130, 137, 143, 255] {
             assert_eq!(
-                FailureClass::classify(code, true, &messages, run_log),
+                FailureClass::classify(code, entry.instrumented, &entry.messages, &entry.run_log),
                 None,
                 "exit {code} is infra, not a failure class"
             );
         }
-
-        // Even a stack-overflowed log stays unclassified out here: the
-        // producer derives classes only under its `exit < 128` gate, so a
-        // class read at >=128 would name a run the producer records as
-        // class-less — the ladder's InfraFailure is the whole story.
-        assert_eq!(
-            FailureClass::classify(
-                134,
-                true,
-                &messages,
-                "thread 'big_stack' has overflowed its stack\n"
-            ),
-            None,
-            "the signal range has no failure class even on overflow evidence"
-        );
-
-        // Uninstrumented runs: no protocol stream was captured.
-        assert_eq!(
-            FailureClass::classify(1, false, &messages, run_log),
-            None,
-            "a caller-chosen --message-format means no taxonomy"
-        );
     }
 
-    /// Detection order is the producer's exactly: compile-error outranks
-    /// everything a later stage printed, because rustc never finished and
-    /// whatever failed after it is noise.
-    #[test]
-    fn classify_compile_error_outranks_later_stream_evidence() {
-        let messages = format!(
-            "{}\n",
-            compiler_message_line("error", "error[E0432]: unresolved import `nope`\n")
-        );
-        let run_log = "thread 'big_stack' has overflowed its stack\n\
-                          Doc-tests gantry\n\
-                       test result: FAILED. 0 passed; 1 failed\n";
-
-        assert_eq!(
-            FailureClass::classify(101, true, &messages, run_log),
-            Some(FailureClass::CompileError),
-            "compile-error outranks harness-panic and doctest evidence"
-        );
-    }
-
-    /// A run whose unit tests failed AND whose doctests failed is a plain
-    /// test failure: the doctest class names runs where the doc section was
-    /// the *only* thing that failed, so "also fix your doctests" never
-    /// hides the real signal.
-    #[test]
-    fn classify_mixed_unit_and_doc_failures_are_a_plain_test_failure() {
-        let messages = "";
-        let run_log = "running 2 tests\n\
-                       test a ... FAILED\n\
-                       test result: FAILED. 1 passed; 1 failed\n\
-                       \n\
-                          Doc-tests gantry\n\
-                       running 1 test\n\
-                       test doc ... FAILED\n\
-                       test result: FAILED. 0 passed; 1 failed\n";
-
-        assert_eq!(
-            FailureClass::classify(1, true, messages, run_log),
-            Some(FailureClass::TestFailure),
-            "doc failures beside unit failures are a plain test failure"
-        );
-    }
-
-    /// Leniency the classifier is documented for: a line in the archived
-    /// protocol stream that is not a JSON object (the harness's human output
-    /// shares stdout in instrumented mode) is skipped, not an error — one
-    /// garbled line cannot blind the classifier to the error that follows.
-    #[test]
-    fn classify_garbled_protocol_lines_cannot_blind_the_classifier() {
-        let messages = format!(
-            "running 12 tests\n{}\n{{not json}}\n{}\n",
-            compiler_message_line("warning", "warning: unused\n"),
-            compiler_message_line("error", "error[E0432]: unresolved import `nope`\n")
-        );
-
-        assert_eq!(
-            FailureClass::classify(101, true, &messages, ""),
-            Some(FailureClass::CompileError),
-            "garbled lines are skipped; the error-level diagnostic still classifies"
-        );
-    }
-
-    /// `GateFailure` is never derived from the stream: gates run only after a
-    /// passing suite and are attributed explicitly by the producer — a class
-    /// read off a failing suite's output could only conflate the two.
+    /// `GateFailure` is never derived from the streams — not on any corpus
+    /// fixture. Gates run only after a passing suite and are attributed
+    /// explicitly by the producer, so exactly one fixture carries the
+    /// attribution marker, and on it the classifier must derive nothing.
     #[test]
     fn classify_never_derives_gate_failure() {
-        let fixtures = [
-            // (exit, instrumented, messages, run_log) — every fixture in this suite.
-            (101, true, "", "error: could not compile\n"),
-            (1, true, "", "test result: FAILED. 0 passed; 1 failed\n"),
-            (
-                1,
-                true,
-                "",
-                "   Doc-tests gantry\ntest result: FAILED. 0 passed; 1 failed\n",
-            ),
-            (134, true, "", "thread 'x' has overflowed its stack\n"),
-            (0, true, "", "test result: ok. 12 passed\n"),
-        ];
-        for (exit, instrumented, messages, run_log) in fixtures {
+        let corpus = producer_corpus();
+        for entry in &corpus.entries {
+            let name = entry.name.as_str();
             assert_ne!(
-                FailureClass::classify(exit, instrumented, messages, run_log),
+                FailureClass::classify(
+                    entry.exit_code,
+                    entry.instrumented,
+                    &entry.messages,
+                    &entry.run_log
+                ),
                 Some(FailureClass::GateFailure),
-                "gate-failure is attributed, never derived (exit {exit})"
+                "entry {name}: gate-failure is attributed, never derived"
             );
+        }
+        let attributed: Vec<&ProducerCorpusEntry> = corpus
+            .entries
+            .iter()
+            .filter(|entry| entry.producer_attribute.is_some())
+            .collect();
+        let gate = attributed
+            .first()
+            .expect("the corpus carries the producer-attributed gate fixture");
+        assert_eq!(
+            attributed.len(),
+            1,
+            "gate-failure is the only attributed class"
+        );
+        assert_eq!(
+            gate.producer_attribute.as_deref(),
+            Some("gate-failure"),
+            "gate-failure is the only attributed class"
+        );
+        assert_eq!(
+            gate.exit_code, 0,
+            "gates run only after a passing suite: the canonical gate shape"
+        );
+        assert_eq!(
+            gate.expected_class, None,
+            "attribution is not derivation: the window leaves the class unset"
+        );
+    }
+
+    // --- producer parity: the template's snippet vs classify -----------------
+
+    /// Extract the producer's classification snippet verbatim from the
+    /// reference template: the `failure_class` assignment chain between the
+    /// failure-taxonomy and quality-gates section markers — the exact text
+    /// the producer executes when it stamps `failure_class` into
+    /// verdict.json.
+    ///
+    /// Extraction is structural on purpose: what runs is what the template
+    /// says, so a template reorganization that moves or breaks the block
+    /// fails here, loudly, rather than quietly unpinning the producer.
+    fn classification_snippet(template: &str) -> Result<String, String> {
+        const TAXONOMY: &str = "# --- failure taxonomy";
+        const GATES: &str = "# --- quality gates";
+        let lines: Vec<&str> = template.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.contains(TAXONOMY))
+            .ok_or_else(|| format!("template lost its {TAXONOMY:?} section marker"))?;
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.contains(GATES))
+            .map(|offset| start + 1 + offset)
+            .ok_or_else(|| format!("template lost its {GATES:?} section marker"))?;
+        let region = &lines[start..end];
+        let begin = region
+            .iter()
+            .position(|line| line.trim() == r#"failure_class="""#)
+            .ok_or_else(|| "classification block lost its failure_class initializer".to_string())?;
+        let mut snippet: Vec<&str> = region[begin..].to_vec();
+        while snippet.last().is_some_and(|line| line.trim().is_empty()) {
+            snippet.pop();
+        }
+        let last = snippet
+            .last()
+            .ok_or_else(|| "classification block is empty".to_string())?;
+        if last.trim() != "fi" {
+            return Err(format!(
+                "classification block must end at the window gate's closing `fi`, found {last:?}"
+            ));
+        }
+        Ok(snippet.join("\n"))
+    }
+
+    /// Stamp `failure_class` the way the producer does: run the template's
+    /// classification snippet under the shell options the template runs
+    /// under, with the fixture's streams archived to files exactly as the
+    /// producer archives them. Returns the snippet's class ("" where the
+    /// window or instrumentation gates leave it unset).
+    ///
+    /// The snippet's tools are the producer's own (jq, grep, awk); an
+    /// environment that cannot run them cannot establish parity, so this
+    /// fails loudly rather than skipping the pin.
+    fn run_producer_snippet(
+        entry: &ProducerCorpusEntry,
+        snippet: &str,
+        work: &tempfile::TempDir,
+    ) -> String {
+        let messages = work.path().join("cargo-messages.jsonl");
+        std::fs::write(&messages, &entry.messages).expect("archive the protocol stream");
+        let run_log = work.path().join("output.log");
+        std::fs::write(&run_log, &entry.run_log).expect("archive the run log");
+        // The template's fmt_present gate is the negation of classify's
+        // `instrumented` input: a caller-chosen --message-format means the
+        // raw protocol was never captured.
+        let fmt_present = if entry.instrumented { "false" } else { "true" };
+        let exit_code = entry.exit_code;
+        let messages = messages.display().to_string();
+        let run_log = run_log.display().to_string();
+        let script = format!(
+            "set -euo pipefail\nexit_code={exit_code}\nfmt_present={fmt_present}\n\
+             messages={messages}\nrun_log={run_log}\n{snippet}\nprintf '%s' \"$failure_class\"\n"
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("spawn bash to run the producer's classification snippet");
+        let name = entry.name.as_str();
+        assert!(
+            output.status.success(),
+            "entry {name}: the producer snippet must run cleanly, stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("the stamped class is UTF-8")
+    }
+
+    /// The pin: the reference producer's snippet and
+    /// [`FailureClass::classify`] must stamp the same class on every fixture
+    /// of the shared corpus. Drift anywhere — the window gate, the jq
+    /// compile scan, the grep/awk chain, a class name — fails on the
+    /// fixture that diverged, before an agent ever branches on a class the
+    /// run contradicts.
+    #[test]
+    fn producer_snippet_and_classify_agree_on_the_shared_corpus() {
+        let template = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contrib/argo/gantry-verify-workflowtemplate.yml"
+        ));
+        let snippet = classification_snippet(template)
+            .expect("the template carries the classification block");
+        let corpus = producer_corpus();
+        let work = tempfile::TempDir::new().expect("scratch dir for the archived streams");
+        for entry in &corpus.entries {
+            let name = entry.name.as_str();
+            let why = entry.why.as_str();
+            let stamped = run_producer_snippet(entry, &snippet, &work);
+            let derived = FailureClass::classify(
+                entry.exit_code,
+                entry.instrumented,
+                &entry.messages,
+                &entry.run_log,
+            );
+            let derived_kebab = derived.as_ref().map(|class| {
+                serde_json::to_value(class)
+                    .expect("a failure class serializes")
+                    .as_str()
+                    .expect("the serialized class is its kebab name")
+                    .to_owned()
+            });
+
+            // 1. Parity: the producer stamps exactly what classify derives.
+            assert_eq!(
+                stamped,
+                derived_kebab.clone().unwrap_or_default(),
+                "entry {name}: template stamped {stamped:?}, classify derived \
+                 {derived_kebab:?}: {why}"
+            );
+
+            // 2. The corpus is load-bearing for both consumers: the class
+            //    both implementations stamped is also the entry's expectation.
+            let stamped_class = if stamped.is_empty() {
+                None
+            } else {
+                Some(stamped.as_str())
+            };
+            assert_eq!(
+                stamped_class,
+                entry.expected_class.as_deref(),
+                "entry {name}: the corpus's expected_class must name what both \
+                 implementations stamp"
+            );
+
+            // 3. The taxonomy never derives gate-failure on either side;
+            //    where the corpus marks an attributed class, the template
+            //    must carry the explicit attribution, at the suite's own
+            //    exit 0.
+            assert_ne!(
+                stamped, "gate-failure",
+                "entry {name}: the classification window must never derive gate-failure"
+            );
+            if entry.producer_attribute.as_deref() == Some("gate-failure") {
+                let attribution = template
+                    .lines()
+                    .find(|line| line.contains("emit_verdict") && line.contains("gate-failure"))
+                    .expect("the template must attribute gate-failure explicitly");
+                let args: Vec<&str> = attribution.split_whitespace().collect();
+                assert_eq!(
+                    args.len(),
+                    5,
+                    "emit_verdict takes phase exit_code class oom"
+                );
+                assert_eq!(args[1], "Failed", "a failed gate is a Failed verdict");
+                assert_eq!(
+                    args[2], "0",
+                    "the suite passed: gate attribution keeps its exit 0 ({attribution:?})"
+                );
+                assert_eq!(
+                    args[3], "gate-failure",
+                    "the attributed class is stamped verbatim ({attribution:?})"
+                );
+            }
         }
     }
 
