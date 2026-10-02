@@ -60,6 +60,18 @@ impl RunLog {
         Ok(RunLog { log_path })
     }
 
+    /// Open the runlog at an explicit path — the test seam for the ledger
+    /// hops.
+    ///
+    /// [`RunLog::open`] resolves `~/.local/state/gantry/` from the
+    /// process-wide HOME, which a parallel test must not mutate, so tests
+    /// driving the record hop name the file directly. Not compiled into the
+    /// shipped binary — production callers always want [`RunLog::open`].
+    #[cfg(test)]
+    pub(crate) fn open_at(log_path: PathBuf) -> Self {
+        RunLog { log_path }
+    }
+
     /// Write an OPEN intent record BEFORE dispatch.
     ///
     /// This MUST be called before any real work happens (gate checks passed,

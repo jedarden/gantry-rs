@@ -1676,4 +1676,314 @@ mod tests {
             assert_eq!(parsed.failure_class, Some(FailureClass::HarnessPanic));
         }
     }
+
+    /// The runs.jsonl record hop (verdict.json v2, plan §Component 5): the
+    /// class the parse and decision hops land must be the class the client's
+    /// recording step appends to the ledger, and the class the ledger reader
+    /// hands back in the session record `gantry status` lists and `gantry
+    /// why` replays. Each corpus fixture drives the same front hops as the
+    /// parse/decision suite — `VerdictJson::parse`, then the argo backend's
+    /// `wait_outcome` against a mock kubectl serving the fixture verbatim —
+    /// and then the real client recording step, `write_verdict` (record
+    /// assembly, class gate, ledger append), into a per-test runs.jsonl
+    /// opened through the explicit-path seam (`RunLog::open` resolves HOME
+    /// process-wide, which a parallel test must not mutate), and reads the
+    /// recorded session back with `read_entries`, the read the status hop
+    /// answers from.
+    mod verdict_ledger_hop {
+        use super::*;
+        use crate::backend::argo::{ArgoBackend, ArgoConfig};
+        use crate::backend::{FailureClass, RunHandle, VerdictJson};
+        use serde::Deserialize;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::PathBuf;
+        use std::thread;
+
+        /// One entry of the shared verdict.json document corpus — the same
+        /// shape the parse pin and the parse/decision hop suites read.
+        #[derive(Debug, Deserialize)]
+        struct CorpusEntry {
+            name: String,
+            why: String,
+            /// The complete verdict.json document, compact and single-line.
+            document: String,
+            /// The kebab-case class the recorded session must carry, null
+            /// where the contract leaves the class unset.
+            expected_class: Option<String>,
+        }
+
+        /// The shared corpus file's top level; the producer's provenance
+        /// note is dropped (serde omits fields the struct doesn't name).
+        #[derive(Debug, Deserialize)]
+        struct Corpus {
+            entries: Vec<CorpusEntry>,
+        }
+
+        /// The shared corpus, exactly as the other hop suites read it.
+        fn corpus() -> Vec<CorpusEntry> {
+            serde_json::from_str::<Corpus>(include_str!("../tests/fixtures/verdict-v2-corpus.json"))
+                .expect("the shared verdict.json document corpus must parse")
+                .entries
+        }
+
+        /// Write an executable mock kubectl into `dir` serving the terminal
+        /// workflow whose `verdict` output parameter carries `document`
+        /// verbatim (tests/argo_backend_integration.rs's idiom: one script
+        /// per call site, per-test temp dirs, no env vars).
+        fn mock_kubectl_serving(dir: &Path, phase: &str, document: &str) -> String {
+            let workflow = format!(
+                r#"{{"status":{{"phase":"{phase}","outputs":{{"parameters":[{{"name":"verdict","value":{}}}]}}}}}}"#,
+                serde_json::to_string(document).expect("document is a valid JSON string"),
+            );
+            let script = format!(
+                "#!/usr/bin/env bash\n\
+                 case \" $* \" in\n\
+                   *' get workflow '*) cat <<'JSON'\n{workflow}\nJSON\n ;;\n\
+                   *) echo \"unexpected argv: $*\" >&2; exit 99 ;;\n\
+                 esac\n",
+            );
+            let path = dir.join("mock-kubectl");
+            fs::write(&path, script).expect("write mock kubectl");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("make mock kubectl executable");
+            path.to_str().expect("temp path is valid utf-8").to_string()
+        }
+
+        /// Retry a mock-backed call when exec fails with ETXTBSY ("Text file
+        /// busy") — under the parallel test harness, exec of a
+        /// freshly-written mock can transiently race a still-open write
+        /// handle; the condition clears once every straggler handle closes.
+        /// Production exec paths deliberately do NOT get this — they must
+        /// surface real spawn errors loudly.
+        fn with_exec_retry<T>(
+            mut f: impl FnMut() -> Result<T, BackendError>,
+        ) -> Result<T, BackendError> {
+            let mut attempt = 0;
+            loop {
+                match f() {
+                    Err(e) if attempt < 4 && e.reason.contains("Text file busy") => {
+                        attempt += 1;
+                        thread::sleep(Duration::from_millis(50 * attempt));
+                    }
+                    other => return other,
+                }
+            }
+        }
+
+        /// Drive one fixture remote session from its document to the
+        /// decision outcome the client records: the backend parse, then the
+        /// argo backend's `wait_outcome` against the mock kubectl.
+        fn decide(phase: &str, document: &str) -> (Verdict, Option<FailureClass>) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let backend = ArgoBackend::new(ArgoConfig {
+                kubectl_path: mock_kubectl_serving(tmp.path(), phase, document),
+                ..ArgoConfig::default()
+            });
+            let handle = RunHandle::new("gantry-abc123");
+
+            with_exec_retry(|| {
+                backend.wait_outcome(&handle, Instant::now() + Duration::from_secs(60))
+            })
+            .expect("wait_outcome must return the terminal outcome")
+        }
+
+        /// The faithful exit code the pipeline exits with — not this hop's
+        /// assertion target, just recorded deterministically.
+        fn exit_code_for(verdict: Verdict) -> i32 {
+            match verdict {
+                Verdict::Pass => 0,
+                _ => 1,
+            }
+        }
+
+        /// Open the write-ahead intent the pipeline opens before dispatch,
+        /// and return the run_id the verdict record must close.
+        fn open_remote_intent(runlog: &RunLog) -> String {
+            let intent = IntentRecord::new(
+                "cargo".to_string(),
+                vec!["test".to_string()],
+                "https://git.ardenone.com/jedarden/gantry-rs.git".to_string(),
+                "abc123".to_string(),
+                PathBuf::from("."),
+                GateInputs {
+                    worktree: true,
+                    head: true,
+                    remote: true,
+                    clean: true,
+                },
+                RunLogDecision::Remote,
+                String::new(),
+                "argo".to_string(),
+            );
+            runlog
+                .open_intent(&intent)
+                .expect("the intent must be recorded")
+        }
+
+        /// The recorded session for `run_id` — the entry `read_entries`
+        /// pairs (the read the status hop answers from) plus the verdict
+        /// line exactly as it landed on disk.
+        fn recorded_session(runlog: &RunLog, run_id: &str) -> (crate::runlog::RunEntry, String) {
+            let ledger = runlog.read_entries().expect("the ledger must read back");
+            assert_eq!(
+                ledger.skipped_lines, 0,
+                "the hop must write lines the ledger reader parses"
+            );
+            assert_eq!(
+                ledger.unmatched_verdicts, 0,
+                "the verdict must pair with the intent opened before dispatch"
+            );
+            let entry = ledger
+                .entries
+                .into_iter()
+                .find(|e| e.intent.run_id == run_id)
+                .expect("the recorded session must read back");
+            let line = fs::read_to_string(runlog.path())
+                .expect("read the ledger file")
+                .lines()
+                .find(|l| l.contains(run_id) && l.contains("\"rec\":\"verdict\""))
+                .expect("the verdict line must be on disk")
+                .to_string();
+            (entry, line)
+        }
+
+        /// Acceptance (1): every classified fixture — the four failure
+        /// classes (compile-error, test-failure, doctest, harness-panic)
+        /// plus the attributed gate-failure — carries its class into the
+        /// recorded runs.jsonl session: the class the decision produced is
+        /// the class the read-back entry carries, and the line on disk
+        /// spells it in the corpus's kebab form.
+        #[test]
+        fn classified_fixtures_carry_their_class_into_the_recorded_session() {
+            let mut classified = 0;
+            for entry in corpus() {
+                let Some(kebab) = entry.expected_class.as_deref() else {
+                    continue;
+                };
+                let expected = FailureClass::from_kebab(kebab).unwrap_or_else(|| {
+                    panic!(
+                        "corpus entry {} names an unknown class {kebab:?}",
+                        entry.name
+                    )
+                });
+
+                // The front hops, exactly as the parse/decision suite drives them.
+                let parsed = VerdictJson::parse(&entry.document)
+                    .unwrap_or_else(|e| panic!("fixture {} must parse: {}", entry.name, e.reason));
+                let (verdict, class) = decide(&parsed.phase, &entry.document);
+                assert_eq!(
+                    class,
+                    Some(expected.clone()),
+                    "fixture {}: the decision hop must hand the class to the recorder: {}",
+                    entry.name,
+                    entry.why
+                );
+
+                // The record hop — the client's real recording step.
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let runlog = RunLog::open_at(tmp.path().join("runs.jsonl"));
+                let run_id = open_remote_intent(&runlog);
+                write_verdict(
+                    &runlog,
+                    run_id.clone(),
+                    verdict,
+                    class,
+                    RanLocation::Remote,
+                    exit_code_for(verdict),
+                    format!("workflow-{}", entry.name),
+                    None,
+                )
+                .expect("the recording step must append the session record");
+
+                let (recorded, line) = recorded_session(&runlog, &run_id);
+                let verdict = recorded
+                    .verdict
+                    .expect("the closed session must carry its verdict");
+                assert_eq!(
+                    verdict.failure_class,
+                    Some(expected),
+                    "fixture {}: the record hop lost the class: {}",
+                    entry.name,
+                    entry.why
+                );
+                assert_eq!(
+                    verdict.ran,
+                    RanLocation::Remote,
+                    "fixture {}: a remote session must record as remote",
+                    entry.name
+                );
+                assert!(
+                    line.contains(&format!("\"failure_class\":\"{kebab}\"")),
+                    "fixture {}: the ledger line must spell the kebab class, got: {line}",
+                    entry.name
+                );
+                classified += 1;
+            }
+            assert_eq!(
+                classified, 5,
+                "the four failure classes plus the attributed gate-failure must all be fixtures"
+            );
+        }
+
+        /// Acceptance (2): every null-class fixture — pass, the three infra
+        /// signals (oom, deadline, workflow-error), the uninstrumented
+        /// failure, and the schema-v1 document with no taxonomy field —
+        /// records a session with no class at all: the read-back entry's
+        /// field stays None and the line on disk carries no failure_class
+        /// key (the field is additive-absent, so a null never leaks into the
+        /// ledger).
+        #[test]
+        fn null_class_fixtures_record_sessions_without_a_class() {
+            let mut null_class = 0;
+            for entry in corpus() {
+                if entry.expected_class.is_some() {
+                    continue;
+                }
+
+                let parsed = VerdictJson::parse(&entry.document)
+                    .unwrap_or_else(|e| panic!("fixture {} must parse: {}", entry.name, e.reason));
+                let (verdict, class) = decide(&parsed.phase, &entry.document);
+                assert_eq!(
+                    class, None,
+                    "fixture {}: the decision hop must hand the recorder no class: {}",
+                    entry.name, entry.why
+                );
+
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let runlog = RunLog::open_at(tmp.path().join("runs.jsonl"));
+                let run_id = open_remote_intent(&runlog);
+                write_verdict(
+                    &runlog,
+                    run_id.clone(),
+                    verdict,
+                    class,
+                    RanLocation::Remote,
+                    exit_code_for(verdict),
+                    format!("workflow-{}", entry.name),
+                    None,
+                )
+                .expect("the recording step must append the session record");
+
+                let (recorded, line) = recorded_session(&runlog, &run_id);
+                let verdict = recorded
+                    .verdict
+                    .expect("the closed session must carry its verdict");
+                assert_eq!(
+                    verdict.failure_class, None,
+                    "fixture {}: the record hop invented a class: {}",
+                    entry.name, entry.why
+                );
+                assert!(
+                    !line.contains("failure_class"),
+                    "fixture {}: the ledger line must carry no class field, got: {line}",
+                    entry.name
+                );
+                null_class += 1;
+            }
+            assert_eq!(
+                null_class, 6,
+                "pass, the three infra signals, uninstrumented, and schema v1 must all be fixtures"
+            );
+        }
+    }
 }
