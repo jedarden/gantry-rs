@@ -1985,5 +1985,106 @@ mod tests {
                 "pass, the three infra signals, uninstrumented, and schema v1 must all be fixtures"
             );
         }
+
+        /// Acceptance (3): the status hop — `gantry status --json` against
+        /// the recorded sessions. Every fixture drives the same front hops
+        /// into one ledger, and the document `status` builds from that
+        /// ledger's read-back carries each fixture's class — the kebab
+        /// spelling on the wire for the classified failures, JSON null for
+        /// every record the contract leaves unset — completing the
+        /// end-to-end proof from verdict.json v2 to status output.
+        #[test]
+        fn recorded_sessions_surface_their_class_through_status() {
+            // One ledger records every fixture's session in corpus order —
+            // arrival order, the order a real pipeline appends in.
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let runlog = RunLog::open_at(tmp.path().join("runs.jsonl"));
+            let mut expected: Vec<(String, Option<FailureClass>)> = Vec::new();
+            for entry in corpus() {
+                let expected_class = entry.expected_class.as_deref().map(|kebab| {
+                    FailureClass::from_kebab(kebab).unwrap_or_else(|| {
+                        panic!(
+                            "corpus entry {} names an unknown class {kebab:?}",
+                            entry.name
+                        )
+                    })
+                });
+
+                // The front hops, exactly as the two suites above drive them.
+                let parsed = VerdictJson::parse(&entry.document)
+                    .unwrap_or_else(|e| panic!("fixture {} must parse: {}", entry.name, e.reason));
+                let (verdict, class) = decide(&parsed.phase, &entry.document);
+                assert_eq!(
+                    class, expected_class,
+                    "fixture {}: the front hops must deliver the corpus class: {}",
+                    entry.name, entry.why
+                );
+
+                let run_id = open_remote_intent(&runlog);
+                write_verdict(
+                    &runlog,
+                    run_id.clone(),
+                    verdict,
+                    class,
+                    RanLocation::Remote,
+                    exit_code_for(verdict),
+                    format!("workflow-{}", entry.name),
+                    None,
+                )
+                .expect("the recording step must append the session record");
+                expected.push((run_id, expected_class));
+            }
+
+            // The status hop: the read `gantry status --json` answers from,
+            // and the pure builder behind the command.
+            let ledger = runlog.read_entries().expect("the ledger must read back");
+            assert_eq!(
+                ledger.skipped_lines, 0,
+                "status must read every recorded line"
+            );
+            assert_eq!(
+                ledger.unmatched_verdicts, 0,
+                "every verdict must pair with the intent opened before dispatch"
+            );
+            let doc = crate::cli::status::build(
+                ledger,
+                runlog.path().display().to_string(),
+                expected.len(),
+            );
+
+            // Every session closed with a verdict, so every session is
+            // `recent`, newest first — corpus order reversed.
+            assert_eq!(doc.total_entries, expected.len());
+            assert!(doc.in_flight.is_empty());
+            assert_eq!(doc.recent.len(), expected.len());
+            for ((run_id, class), run) in expected.iter().rev().zip(&doc.recent) {
+                assert_eq!(&run.run_id, run_id, "recent must list newest first");
+                assert_eq!(
+                    run.failure_class, *class,
+                    "run {run_id}: the status hop must carry the recorded class"
+                );
+            }
+
+            // The --json wire form spells the corpus's kebab class for the
+            // classified failures and JSON null for every other record.
+            let json = serde_json::to_value(&doc).expect("the document must serialize");
+            let recent = json["recent"].as_array().expect("recent is an array");
+            for ((_, class), run) in expected.iter().rev().zip(recent) {
+                match class {
+                    Some(class) => assert_eq!(
+                        run["failure_class"],
+                        serde_json::Value::String(
+                            crate::cli::failure_class_name(class).to_string()
+                        ),
+                        "the wire form must spell the kebab class"
+                    ),
+                    None => assert_eq!(
+                        run["failure_class"],
+                        serde_json::Value::Null,
+                        "a record with no class must surface null, not a re-derived class"
+                    ),
+                }
+            }
+        }
     }
 }
