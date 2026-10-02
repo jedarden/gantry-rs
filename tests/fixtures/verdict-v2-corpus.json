@@ -1,0 +1,93 @@
+{
+  "notes": "Shared document-layer corpus for the verdict.json v2 failure taxonomy: one whole verdict.json document per outcome an agent can be handed, read by the parse-layer pin in src/verdict.rs and reusable verbatim by the downstream hop tests. Each `document` is the compact single-line JSON a producer writes, in the reference producer's field order (schema_version, phase, exit_code, oom, deadline_exceeded, contract_version echo, then failure_class when the taxonomy derives one) — see emit_verdict in contrib/argo/gantry-verify-workflowtemplate.yml for the shape and src/verdict.rs VerdictJson for the contract. The class fixtures are schema-2 documents per the v2 contract: a producer that instruments the suite derives the class for every suite that ran to completion and failed; the reference template currently emits schema_version 1 (gate attribution only), so these pin the documents the v2 producer must write, not ones archived today. `expected_class` is the kebab-case class the parse layer must land on, null where the contract leaves the class unset; `expected_verdict` is the kebab-case verdict the document must ladder to. exit_code rides the client's ladder (0 pass, 1 a real failure whatever its class, 2 infra) — never cargo's raw code, which the producer keeps in the run log and the container's own exit status; that is why every classified failure ladders to test-failure rather than infra-failure (a raw 101 would trigger the capped local re-run the verdict ladder exists to prevent).",
+  "entries": [
+    {
+      "name": "compile-error",
+      "why": "rustc never finished: the producer derives compile-error from the protocol stream and the document ladders through the exit code to a test failure, never the infra re-run.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Failed\",\"exit_code\":1,\"oom\":false,\"deadline_exceeded\":false,\"contract_version\":\"1\",\"failure_class\":\"compile-error\"}",
+      "expected_class": "compile-error",
+      "expected_verdict": "test-failure"
+    },
+    {
+      "name": "test-failure",
+      "why": "The fallthrough class: an instrumented suite ran to completion and failed, nothing more specific in the stream.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Failed\",\"exit_code\":1,\"oom\":false,\"deadline_exceeded\":false,\"contract_version\":\"1\",\"failure_class\":\"test-failure\"}",
+      "expected_class": "test-failure",
+      "expected_verdict": "test-failure"
+    },
+    {
+      "name": "doctest",
+      "why": "Only the Doc-tests section failed; the class names it so 'also fix your doctests' is visible beside the verdict.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Failed\",\"exit_code\":1,\"oom\":false,\"deadline_exceeded\":false,\"contract_version\":\"1\",\"failure_class\":\"doctest\"}",
+      "expected_class": "doctest",
+      "expected_verdict": "test-failure"
+    },
+    {
+      "name": "harness-panic",
+      "why": "The test harness itself crashed (stack overflow); the producer read the class off the run log and the client exit stays on the failure rung.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Failed\",\"exit_code\":1,\"oom\":false,\"deadline_exceeded\":false,\"contract_version\":\"1\",\"failure_class\":\"harness-panic\"}",
+      "expected_class": "harness-panic",
+      "expected_verdict": "test-failure"
+    },
+    {
+      "name": "gate-failure",
+      "why": "The one class that survives a passing exit code: the suite's 0 stays in the document (the container's own exit 3, which turns the workflow Failed, is the workflow's business, not the document's), and attribution is explicit — classify never derives gate-failure.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Failed\",\"exit_code\":0,\"oom\":false,\"deadline_exceeded\":false,\"contract_version\":\"1\",\"failure_class\":\"gate-failure\"}",
+      "expected_class": "gate-failure",
+      "expected_verdict": "gate-failure"
+    },
+    {
+      "name": "pass",
+      "why": "A passing suite has no failure to name: no class, the plain pass rung.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Succeeded\",\"exit_code\":0,\"oom\":false,\"deadline_exceeded\":false,\"contract_version\":\"1\"}",
+      "expected_class": null,
+      "expected_verdict": "pass"
+    },
+    {
+      "name": "infra-oom",
+      "why": "A signal-killed suite (the container ladders 137 to the client's 2 with the oom flag set): no class is read outside the classifiable window, and the infra rung triggers the capped local fallback — never a misread test failure.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Failed\",\"exit_code\":2,\"oom\":true,\"deadline_exceeded\":false,\"contract_version\":\"1\"}",
+      "expected_class": null,
+      "expected_verdict": "infra-failure"
+    },
+    {
+      "name": "infra-deadline",
+      "why": "The deadline fires outside the container: the producer's in-process document never sets the flag, the client-side default the caller pre-writes for the capped shape does.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Failed\",\"exit_code\":2,\"oom\":false,\"deadline_exceeded\":true,\"contract_version\":\"1\"}",
+      "expected_class": null,
+      "expected_verdict": "infra-failure"
+    },
+    {
+      "name": "infra-workflow-error",
+      "why": "The workflow itself errored (template not found, controller break): no suite ever ran, so the exit code claims nothing and the Error phase alone decides infra.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Error\",\"exit_code\":2,\"oom\":false,\"deadline_exceeded\":false,\"contract_version\":\"1\"}",
+      "expected_class": null,
+      "expected_verdict": "infra-failure"
+    },
+    {
+      "name": "uninstrumented",
+      "why": "A failing run whose caller chose their own --message-format: the producer never captured the protocol stream, stamps no class, and the exit-code ladder decides honestly.",
+      "schema_version": 2,
+      "document": "{\"schema_version\":2,\"phase\":\"Failed\",\"exit_code\":1,\"oom\":false,\"deadline_exceeded\":false,\"contract_version\":\"1\"}",
+      "expected_class": null,
+      "expected_verdict": "test-failure"
+    },
+    {
+      "name": "schema-v1-no-taxonomy",
+      "why": "The pre-taxonomy producer's document: schema_version 1 with no taxonomy field at all, fully interpretable by this parser — the version bump is a semantics contract, not a shape change.",
+      "schema_version": 1,
+      "document": "{\"schema_version\":1,\"phase\":\"Failed\",\"exit_code\":1,\"oom\":false,\"deadline_exceeded\":false,\"contract_version\":\"1\"}",
+      "expected_class": null,
+      "expected_verdict": "test-failure"
+    }
+  ]
+}

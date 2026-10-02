@@ -691,6 +691,118 @@ mod tests {
         assert_eq!(vj.to_verdict(), Verdict::TestFailure);
     }
 
+    // --- the verdict.json v2 document corpus (tests/fixtures) ---------------
+
+    // The document-layer counterpart of the classify fixtures below: one
+    // whole verdict.json document per outcome an agent can be handed, kept as
+    // a data file (tests/fixtures/verdict-v2-corpus.json) so the downstream
+    // hop tests can read the same fixtures verbatim, in the reference
+    // producer's field order (emit_verdict in
+    // contrib/argo/gantry-verify-workflowtemplate.yml). This is the
+    // parse-layer contract (gantry-287c3fc2): every document must parse, and
+    // each must land on exactly the class — or no class — the producer's
+    // contract promises;
+    // [`verdict_v2_document_corpus_parses_and_maps_every_document`] is the pin.
+
+    /// One entry of the shared verdict.json document corpus: the complete
+    /// document exactly as a producer writes it, plus the class — or the
+    /// absence of one — and the verdict the parse layer must land on.
+    #[derive(Debug, Deserialize)]
+    struct VerdictDocCorpusEntry {
+        name: String,
+        why: String,
+        schema_version: u32,
+        /// The complete verdict.json document, compact and single-line.
+        document: String,
+        /// The kebab-case class the parsed document must carry, null where
+        /// the contract leaves the class unset.
+        expected_class: Option<String>,
+        /// The kebab-case verdict the document must ladder to.
+        expected_verdict: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct VerdictDocCorpus {
+        entries: Vec<VerdictDocCorpusEntry>,
+    }
+
+    /// The shared document corpus, exactly as this pin and the downstream hop
+    /// tests read it.
+    fn verdict_doc_corpus() -> VerdictDocCorpus {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/verdict-v2-corpus.json"
+        )))
+        .expect("the shared verdict.json document corpus must parse")
+    }
+
+    /// The corpus's kebab verdict names, mapped at the pin — the corpus stays
+    /// data, so reading it needs no serde on [`Verdict`].
+    fn expected_verdict(raw: &str, name: &str) -> Verdict {
+        match raw {
+            "pass" => Verdict::Pass,
+            "test-failure" => Verdict::TestFailure,
+            "gate-failure" => Verdict::GateFailure,
+            "infra-failure" => Verdict::InfraFailure,
+            other => panic!("corpus entry {name} names an unknown verdict {other:?}"),
+        }
+    }
+
+    /// The corpus pin (gantry-287c3fc2): every fixture document parses
+    /// through [`VerdictJson::parse`] without error and lands on exactly its
+    /// expected taxonomy class — or `None`, for the null-class fixtures — at
+    /// the parse layer, then on exactly its expected verdict through the
+    /// document ladder: the two hops a client's branch actually reads.
+    #[test]
+    fn verdict_v2_document_corpus_parses_and_maps_every_document() {
+        let corpus = verdict_doc_corpus();
+        let mut classes_seen: Vec<FailureClass> = Vec::new();
+        for entry in &corpus.entries {
+            let parsed = VerdictJson::parse(&entry.document)
+                .unwrap_or_else(|e| panic!("fixture {} must parse: {}", entry.name, e.reason));
+            assert_eq!(
+                parsed.schema_version, entry.schema_version,
+                "fixture {}: schema_version drift between the document and its column",
+                entry.name
+            );
+            let expected = entry.expected_class.as_deref().map(|raw| {
+                FailureClass::from_kebab(raw).unwrap_or_else(|| {
+                    panic!("corpus entry {} names an unknown class {raw:?}", entry.name)
+                })
+            });
+            assert_eq!(
+                parsed.failure_class, expected,
+                "fixture {}: {}",
+                entry.name, entry.why
+            );
+            assert_eq!(
+                parsed.to_verdict(),
+                expected_verdict(&entry.expected_verdict, &entry.name),
+                "fixture {}: {}",
+                entry.name,
+                entry.why
+            );
+            if let Some(class) = parsed.failure_class {
+                classes_seen.push(class);
+            }
+        }
+        // The corpus is the whole taxonomy: every FailureClass variant has a
+        // fixture, so a newly coined class cannot ship without one.
+        for raw in [
+            "compile-error",
+            "test-failure",
+            "doctest",
+            "harness-panic",
+            "gate-failure",
+        ] {
+            let class = FailureClass::from_kebab(raw).unwrap_or_else(|| panic!("{raw} must map"));
+            assert!(
+                classes_seen.contains(&class),
+                "the corpus must cover every failure class; missing {raw:?}"
+            );
+        }
+    }
+
     // --- failure taxonomy: FailureClass::classify (verdict.json v2) ---------
 
     // The fixtures below mirror exactly what the reference producer archives
