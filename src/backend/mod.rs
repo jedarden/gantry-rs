@@ -269,6 +269,32 @@ pub trait RemoteBackend {
     /// the exit code to a Verdict using the minimal ladder.
     fn wait(&self, h: &RunHandle, deadline: std::time::Instant) -> BackendResult<Verdict>;
 
+    /// Wait for the remote run to complete and return its outcome: the
+    /// verdict plus the failure class the remote attributed to it (the
+    /// verdict.json v2 failure taxonomy).
+    ///
+    /// This is what the client half of the taxonomy records into runs.jsonl
+    /// ([`crate::runlog::VerdictRecord::failure_class`]): a remote run that
+    /// died carries *what it died of* alongside *that it died*. The class is
+    /// `None` for every shape of "not known from a parsed document" — no
+    /// usable verdict.json (absent, malformed, newer schema), a backend that
+    /// never reads documents at all — so the runlog's field contract (null
+    /// for uninstrumented producers) falls out of the plumbing instead of
+    /// being enforced per call site. Whether a threaded class belongs on the
+    /// record for the verdict it arrived with is the runlog contract's call,
+    /// applied where the record is built.
+    ///
+    /// Default: [`Self::wait`]'s verdict with no class. Backends that parse
+    /// verdict.json override this; every other implementation — and every
+    /// consumer written against the plain ladder — keeps compiling unchanged.
+    fn wait_outcome(
+        &self,
+        h: &RunHandle,
+        deadline: std::time::Instant,
+    ) -> BackendResult<(Verdict, Option<FailureClass>)> {
+        self.wait(h, deadline).map(|verdict| (verdict, None))
+    }
+
     /// Describe a run for human consumption (e.g., a URL to view logs).
     ///
     /// Phase 0.5: may panic — this is not implemented in the skeleton.
@@ -675,5 +701,45 @@ mod tests {
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let err = backend.wait(&h, past).expect_err("elapsed deadline errors");
         assert_eq!(err.reason, "deadline passed");
+    }
+
+    #[test]
+    fn default_wait_outcome_pairs_wait_verdict_with_no_class() {
+        // A verdict-only backend (no wait_outcome override) inherits the
+        // class-free default: wait()'s verdict paired with None.
+        let backend: &dyn RemoteBackend = &StubBackend;
+        let deadline = StubBackend::deadline_ahead();
+
+        let h = backend
+            .submit(&StubBackend::run_spec("pass"))
+            .expect("submit");
+        assert_eq!(
+            backend.wait_outcome(&h, deadline).expect("wait_outcome"),
+            (Verdict::Pass, None),
+            "default pairs wait()'s verdict with no failure class"
+        );
+
+        let h = backend
+            .submit(&StubBackend::run_spec("fail"))
+            .expect("submit");
+        assert_eq!(
+            backend.wait_outcome(&h, deadline).expect("wait_outcome"),
+            (Verdict::TestFailure, None)
+        );
+    }
+
+    #[test]
+    fn default_wait_outcome_surfaces_wait_errors_unchanged() {
+        // An erroring wait has no verdict, so no class either: the default
+        // must pass the BackendError through untouched, not fabricate an
+        // outcome around it.
+        let backend = SkeletonBackend;
+        let err = backend
+            .wait_outcome(&RunHandle::new("unused"), StubBackend::deadline_ahead())
+            .expect_err("erroring wait surfaces as Err");
+        assert_eq!(
+            err.reason, "skeleton backend waits on nothing",
+            "the wait error passes through unchanged"
+        );
     }
 }
