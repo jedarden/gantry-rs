@@ -782,7 +782,7 @@ mod tests {
             .iter()
             .find(|entry| entry.name == "signal-killed-suite-is-infra")
             .expect("the corpus carries the signal-range fixture");
-        for code in [128, 130, 137, 143, 255] {
+        for code in 128..=255 {
             assert_eq!(
                 FailureClass::classify(code, entry.instrumented, &entry.messages, &entry.run_log),
                 None,
