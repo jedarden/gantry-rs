@@ -12,12 +12,20 @@
 // - Orphaned intent detection from runlog
 // - Overall health summary
 
+use crate::backend::command::CommandBackend;
+use crate::backend::{RemoteBackend, RunSpec};
 use crate::config::Config;
-use crate::runlog::RunLog;
+use crate::refs::RefPusher;
+use crate::runlog::{Decision as LedgerDecision, RanLocation, RunEntry, RunLog};
 use crate::shim::{resolve_real_binary, shim_dir};
+use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
+
+use crate::backend::Verdict as BackendVerdict;
+use crate::drill;
 
 /// Result of a doctor check.
 #[derive(Debug, Clone, PartialEq)]
@@ -477,31 +485,520 @@ pub fn run_all_checks() -> HealthStatus {
 
 /// Run end-to-end canary test (doctor --e2e).
 ///
-/// Pushes a tiny fixture ref through the real pipeline and asserts the expected pass verdict.
-/// This validates the full pipeline is actually working on the operator's schedule.
+/// Pushes the current repo's HEAD as a normal gantry ref and submits it to
+/// the configured backend with the argv overridden to a trivial command, then
+/// asserts the Pass verdict round-trips: push → clone → contract → verdict
+/// without running a real suite (plan Component 8). One command answers "is
+/// the pipeline actually working" on the operator's schedule, and
+/// `gantry init --ssh` runs it as its final step; the round-trip split is in
+/// the report (plan R3: "`doctor --e2e` measures round-trip").
+///
+/// The trivial argv composes with the shipped executor's contract:
+/// `contrib/gantry-exec.sh` fixes the subcommand (`cargo test "$@"`), so the
+/// canary's tail args are `["--help"]` — the backend runs `cargo test
+/// --help`, which exits 0 without compiling anything. (`cargo --version`, the
+/// plan's example, is not expressible through that contract — `cargo test
+/// --version` is a cargo usage error — and `cargo test` bare would run the
+/// operator's real suite, exactly what a canary must not do.)
+///
+/// Deliberately NOT the decision pipeline's degrade path: the canary must
+/// fail when the pipeline is broken, and [`crate::decision::run_explicit`]'s
+/// admission-semaphore ladder would mask exactly that — a dead backend
+/// degrades to a capped local run whose trivial command exits 0. So the
+/// canary drives the real stages directly ([`RefPusher::push`] → the real
+/// backend's submit/wait) and reports the first broken stage instead.
 pub fn run_e2e_test() -> Result<String, String> {
-    // TODO: Implement e2e canary test
-    // This requires:
-    // 1. Create a trivial test command (cargo --version)
-    // 2. Push it through RefPusher
-    // 3. Submit to backend
-    // 4. Wait for verdict
-    // 5. Assert pass verdict
+    let config = Config::load().config;
+    if config.remote.backend == crate::config::Backend::None {
+        return Err(
+            "no remote backend configured (Tier-0) — the canary round-trips a real \
+             backend, and there is nothing to round-trip; configure one (e.g. \
+             `gantry init --ssh user@host`)"
+                .to_string(),
+        );
+    }
 
-    Err("E2E test not yet implemented".to_string())
+    // The canary runs the operator's current repo: HEAD is the content the
+    // backend will fetch and check out.
+    if !crate::gate::is_inside_work_tree().unwrap_or(false) {
+        return Err(
+            "not inside a git work tree — run `gantry doctor --e2e` from the \
+             repository whose pipeline you want to canary"
+                .to_string(),
+        );
+    }
+    let sha = crate::gate::head_sha()?;
+    let repo_url = e2e_repo_url(&config);
+    let run_id = format!(
+        "e2e-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+
+    eprintln!(
+        "[gantry] e2e: canary {run_id}: pushing {sha} to remote `{}`",
+        config.remote.ci_remote
+    );
+    let push_start = Instant::now();
+    let pushed = RefPusher::push(&config, &sha, &run_id);
+    let push_ms = push_start.elapsed().as_millis();
+    if !pushed.success {
+        // S-5: a git push failure can echo the remote URL, credentials and
+        // all — the same redaction the crash bundle applies to raw responses.
+        let reason = crate::crash::redact_url_userinfo(&pushed.reason);
+        return Err(format!(
+            "push failed after {push_ms}ms: {reason} (the backend never saw the run)"
+        ));
+    }
+    eprintln!("[gantry] e2e: pushed {}", pushed.ref_name);
+
+    // The same backend construction the decision pipeline resolves (user
+    // command templates, or the shipped defaults) — the canary is only
+    // honest if it drives the backend a real run would drive.
+    let backend = match &config.remote.command {
+        Some(c) => CommandBackend::with_config(crate::backend::command::CommandConfig {
+            submit: c.submit.clone(),
+            logs: c.logs.clone(),
+            wait: c.wait.clone(),
+            status: None, // the config schema carries no status step
+        }),
+        None => CommandBackend::new(),
+    };
+
+    let spec = RunSpec::new(
+        "cargo",
+        "test",
+        vec!["--help".to_string()],
+        &repo_url,
+        &sha,
+        "",
+    );
+    let handle = backend.submit(&spec).map_err(|e| {
+        format!(
+            "submit failed: {} (the push succeeded, so the backend or its \
+                 command templates are broken)",
+            e.reason
+        )
+    })?;
+    eprintln!(
+        "[gantry] e2e: submitted {}, waiting for the verdict",
+        handle.handle
+    );
+
+    let wait_start = Instant::now();
+    let deadline = Instant::now() + crate::decision::backend_wait_deadline(&config);
+    let waited = backend.wait(&handle, deadline);
+    let wait_ms = wait_start.elapsed().as_millis();
+
+    match waited {
+        Ok(BackendVerdict::Pass) => Ok(format!(
+            "pipeline round trip OK: push {push_ms}ms + backend {wait_ms}ms → \
+             verdict Pass (ref {}, run {run_id})",
+            pushed.ref_name
+        )),
+        Ok(other) => Err(format!(
+            "backend returned verdict {other} after {wait_ms}ms — expected Pass \
+             for the trivial canary argv (run {run_id}, handle {})",
+            handle.handle
+        )),
+        Err(e) => Err(format!(
+            "wait failed after {wait_ms}ms: {} (run {run_id}, handle {})",
+            e.reason, handle.handle
+        )),
+    }
+}
+
+/// The repo URL the canary submits, resolved the way the dispatcher resolves
+/// it: the ci_remote's URL, with local paths made `file://`. The dispatcher's
+/// copy (`get_repo_url` in main.rs) is binary-private, so the rule is spelled
+/// here once more — the two must agree or the canary submits a URL a real
+/// run would never use.
+fn e2e_repo_url(config: &Config) -> String {
+    Command::new("git")
+        .args(["remote", "get-url", &config.remote.ci_remote])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| normalize_repo_url(String::from_utf8_lossy(&out.stdout).trim()))
+        .unwrap_or_else(|| {
+            format!(
+                "file://{}",
+                env::current_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default()
+            )
+        })
+}
+
+/// The dispatcher's repo-URL rule: a local path (absolute, or relative) is
+/// submitted as a `file://` URL; everything else passes through unchanged.
+fn normalize_repo_url(url: &str) -> String {
+    if url.starts_with('/') || url.starts_with('.') {
+        format!("file://{url}")
+    } else {
+        url.to_string()
+    }
 }
 
 /// Run fault-injection fire drill (doctor --drill).
 ///
-/// Injects a synthetic InfraFailure and asserts the entire loud-degrade chain fires.
+/// Injects a synthetic InfraFailure through the drill-scoped hook and asserts
+/// the entire loud-degrade chain fires (plan Component 8): the timeout
+/// banner naming the drill run, the drill-named infra reason, the write-ahead
+/// intent and terminal verdict records, the admission-semaphore capped local
+/// run, and an exit code faithful to that local run.
+///
+/// Mechanism: this process snapshots the run ledger, spawns itself as
+/// [`drill::DRILL_RUN_SUBCOMMAND`] — which is what arms the hook, so nothing
+/// outside a drill process can ever arm it — and asserts the chain from the
+/// child's stderr and the ledger delta. The child's exit code IS the
+/// pipeline's exit code, which is what makes the faithfulness link
+/// assertable. The child's captured stderr is echoed through untouched: the
+/// chain itself is the evidence, not a summary of it.
 pub fn run_drill() -> Result<String, String> {
-    // TODO: Implement fire drill
-    // This requires:
-    // 1. Inject synthetic failure via drill-scoped hook
-    // 2. Assert banner prints
-    // 3. Assert intent/verdict records written
-    // 4. Assert semaphore-gated capped local run
-    // 5. Assert correct exit code
+    // Pre-child ledger snapshot: the drill run's records are the delta, so
+    // the assertion cannot be fooled by anything already in the ledger.
+    let before: HashSet<String> = match RunLog::open().and_then(|rl| rl.read_entries()) {
+        Ok(ledger) => ledger
+            .entries
+            .iter()
+            .map(|e| e.intent.run_id.clone())
+            .collect(),
+        Err(e) => {
+            return Err(format!(
+                "cannot read the run ledger ({e}) — the drill asserts its \
+                 intent/verdict records, so the ledger must be readable"
+            ))
+        }
+    };
 
-    Err("Fire drill not yet implemented".to_string())
+    let started = Instant::now();
+    let exe = env::current_exe().map_err(|e| format!("cannot locate the gantry binary: {e}"))?;
+    let output = Command::new(exe)
+        .arg(drill::DRILL_RUN_SUBCOMMAND)
+        .output()
+        .map_err(|e| format!("cannot spawn the drill run: {e}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit = output.status.code().unwrap_or(-1);
+
+    // The child's chain is the evidence — pass it through so the operator
+    // sees the real degrade, not a summary of it.
+    eprint!("{stderr}");
+
+    let drill_entries: Vec<RunEntry> = match RunLog::open().and_then(|rl| rl.read_entries()) {
+        Ok(ledger) => ledger
+            .entries
+            .into_iter()
+            .filter(|e| !before.contains(&e.intent.run_id))
+            .collect(),
+        Err(e) => {
+            return Err(format!(
+                "cannot re-read the run ledger after the drill ({e})"
+            ))
+        }
+    };
+
+    let links = drill_links(&stderr, exit, &drill_entries);
+    for (name, fired) in &links {
+        println!("  {} {name}", if *fired { "✓" } else { "✗" });
+    }
+
+    let missed: Vec<&str> = links.iter().filter(|(_, f)| !*f).map(|(n, _)| *n).collect();
+    if missed.is_empty() {
+        Ok(format!(
+            "full degrade chain fired in {}ms: timeout banner, drill-named \
+             infra reason, write-ahead intent + terminal verdict records, \
+             semaphore-gated capped local run, faithful exit {exit}",
+            started.elapsed().as_millis()
+        ))
+    } else {
+        Err(format!(
+            "the degrade chain did not fully fire — {} link(s) missing: {}. \
+             The synthetic failure must reach the backend wait boundary: run \
+             `gantry doctor --drill` from a clean git work tree whose `{}` \
+             remote exists; `gantry report` shows what the pipeline recorded.",
+            missed.len(),
+            missed.join("; "),
+            Config::load().config.remote.ci_remote,
+        ))
+    }
+}
+
+/// The fire drill's link-by-link assertion, pure so the whole chain contract
+/// is unit-testable without spawning the drill process: did the synthetic
+/// failure produce the banner, the records, the capped run, and a faithful
+/// exit code?
+///
+/// `stderr` is the drill child's captured stderr; `child_exit` its process
+/// exit code (−1 when it died by signal); `drill_entries` the ledger entries
+/// the drill run added (the delta against the pre-run snapshot — nothing
+/// already in the ledger can satisfy a link).
+fn drill_links(
+    stderr: &str,
+    child_exit: i32,
+    drill_entries: &[RunEntry],
+) -> Vec<(&'static str, bool)> {
+    let submitted_needle = format!("[gantry] submitted: {}", drill::DRILL_HANDLE);
+    let banner_needle = format!(
+        "[gantry] timeout: run {} exceeded its deadline",
+        drill::DRILL_HANDLE
+    );
+
+    // The backend was the drill's synthetic one (the fixed handle proves the
+    // injection actually fired rather than a real submission slipping by).
+    let submitted = stderr.contains(submitted_needle.as_str());
+    // The loud banner: a deadline expiry reads differently from every other
+    // wait failure (plan §"failure modes"), and the drill must prove that
+    // line specifically.
+    let banner = stderr.contains(banner_needle.as_str());
+    // The degrade must name itself as a drill — never mistakable in a
+    // transcript or post-mortem for a real outage.
+    let infra_named = stderr.contains(drill::DRILL_INFRA_REASON);
+    // The ladder: the capped local run the caller's result actually came
+    // from ([`crate::local::run_fallback_program`]'s entry lines).
+    let ladder = stderr.contains("[gantry] falling back to capped local run");
+
+    // The records: the write-ahead intent decided remote, and a terminal
+    // verdict closed the run as `ran: local_after_infra` (INV-1 pairing).
+    let intent_remote = drill_entries
+        .iter()
+        .any(|e| matches!(e.intent.decision, LedgerDecision::Remote));
+    let capped_verdict = drill_entries
+        .iter()
+        .find_map(|e| e.verdict.as_ref())
+        .filter(|v| matches!(v.ran, RanLocation::LocalAfterInfra));
+    let verdict_recorded = capped_verdict.is_some();
+    // The faithful exit (INV-3): the process exit code is the capped local
+    // run's own, and for the drill's trivial argv (`cargo --version`) that
+    // run passes — anything else means the chain lied about the result.
+    let exit_faithful = capped_verdict
+        .map(|v| v.exit_code == child_exit && v.verdict == crate::runlog::Verdict::Pass)
+        .unwrap_or(false);
+
+    vec![
+        ("the drill backend took the submission", submitted),
+        ("the synthetic failure raised the timeout banner", banner),
+        (
+            "the degrade named the drill as its infra reason",
+            infra_named,
+        ),
+        (
+            "the semaphore-gated ladder fell back to a capped local run",
+            ladder,
+        ),
+        (
+            "the write-ahead intent recorded decision: remote",
+            intent_remote,
+        ),
+        (
+            "a terminal verdict recorded ran: local_after_infra",
+            verdict_recorded,
+        ),
+        (
+            "the exit code is the capped local run's own (Pass)",
+            exit_faithful,
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod repo_url_rule {
+        use super::*;
+
+        #[test]
+        fn local_paths_become_file_urls() {
+            assert_eq!(normalize_repo_url("/srv/git/repo"), "file:///srv/git/repo");
+            assert_eq!(
+                normalize_repo_url("../relative/repo"),
+                "file://../relative/repo"
+            );
+        }
+
+        #[test]
+        fn remote_urls_pass_through_unchanged() {
+            assert_eq!(
+                normalize_repo_url("https://git.example.com/x/y.git"),
+                "https://git.example.com/x/y.git"
+            );
+            assert_eq!(
+                normalize_repo_url("git@host:team/repo.git"),
+                "git@host:team/repo.git"
+            );
+        }
+    }
+
+    mod fire_drill_links {
+        use super::*;
+        use crate::runlog::{Decision, GateInputs, IntentRecord, Verdict, VerdictRecord};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        /// The stderr the real chain prints, byte for byte from the
+        /// pipeline's own format strings.
+        fn chain_stderr() -> String {
+            format!(
+                "[gantry] decision: remote execution eligible\n\
+                 [gantry] submitted: {}\n\
+                 [gantry] timeout: run {} exceeded its deadline before a verdict was returned\n\
+                 [gantry] infra: wait failed: {}\n\
+                 [gantry] falling back to capped local run\n\
+                 [gantry] verdict: Pass\n",
+                drill::DRILL_HANDLE,
+                drill::DRILL_HANDLE,
+                drill::DRILL_INFRA_REASON,
+            )
+        }
+
+        /// One ledger entry shaped exactly like the drill run's: a remote
+        /// decision intent closed by a `local_after_infra` verdict.
+        fn drill_entry(exit_code: i32, verdict: Verdict, ran: RanLocation) -> RunEntry {
+            let intent = IntentRecord::new(
+                "cargo".to_string(),
+                vec!["--version".to_string()],
+                "file:///repo".to_string(),
+                "abc123".to_string(),
+                PathBuf::from("."),
+                GateInputs {
+                    worktree: true,
+                    head: true,
+                    remote: true,
+                    clean: true,
+                },
+                Decision::Remote,
+                "gate: clean tree, remote present".to_string(),
+                "command".to_string(),
+            );
+            let record = VerdictRecord::new(
+                intent.run_id.clone(),
+                verdict,
+                ran,
+                exit_code,
+                "local".to_string(),
+                None,
+            );
+            RunEntry {
+                intent,
+                verdict: Some(record),
+            }
+        }
+
+        fn fired_map(
+            stderr: &str,
+            child_exit: i32,
+            entries: &[RunEntry],
+        ) -> HashMap<&'static str, bool> {
+            drill_links(stderr, child_exit, entries)
+                .into_iter()
+                .collect()
+        }
+
+        #[test]
+        fn every_link_of_the_real_chain_fires() {
+            let links = drill_links(
+                &chain_stderr(),
+                0,
+                &[drill_entry(0, Verdict::Pass, RanLocation::LocalAfterInfra)],
+            );
+            assert_eq!(links.len(), 7, "the chain has seven asserted links");
+            for (name, fired) in &links {
+                assert!(fired, "link `{name}` must fire on the real chain");
+            }
+        }
+
+        #[test]
+        fn nothing_fires_without_the_chain() {
+            // Empty stderr and an empty ledger delta: no link may claim
+            // success — the drill must not pass vacuously.
+            for (name, fired) in drill_links("", 0, &[]) {
+                assert!(!fired, "link `{name}` fired on empty evidence");
+            }
+        }
+
+        #[test]
+        fn a_real_submission_does_not_satisfy_the_drill_links() {
+            // A run that really submitted (no drill handle, no banner) and
+            // degraded locally: the injection and banner links stay dark.
+            let stderr = "[gantry] submitted: run-173-42\n\
+                          [gantry] infra: wait failed: x\n\
+                          [gantry] falling back to capped local run\n";
+            let fired = fired_map(
+                stderr,
+                0,
+                &[drill_entry(0, Verdict::Pass, RanLocation::LocalAfterInfra)],
+            );
+            assert!(!fired["the drill backend took the submission"]);
+            assert!(!fired["the synthetic failure raised the timeout banner"]);
+            assert!(!fired["the degrade named the drill as its infra reason"]);
+            // …but the records and the capped run genuinely happened.
+            assert!(fired["the semaphore-gated ladder fell back to a capped local run"]);
+            assert!(fired["the write-ahead intent recorded decision: remote"]);
+            assert!(fired["a terminal verdict recorded ran: local_after_infra"]);
+        }
+
+        #[test]
+        fn a_lying_exit_code_fails_the_faithfulness_link() {
+            // Child exited 7 while the capped run recorded 0: INV-3 broken,
+            // and the drill must say so even though everything else fired.
+            let fired = fired_map(
+                &chain_stderr(),
+                7,
+                &[drill_entry(0, Verdict::Pass, RanLocation::LocalAfterInfra)],
+            );
+            assert!(!fired["the exit code is the capped local run's own (Pass)"]);
+        }
+
+        #[test]
+        fn a_failing_capped_run_is_not_a_faithful_drill_exit() {
+            // The drill's argv is `cargo --version`: a capped run that
+            // itself failed means the chain degraded into a failure the
+            // caller never asked for — the faithfulness link (record is
+            // Pass AND codes match) stays dark either way.
+            let fired = fired_map(
+                &chain_stderr(),
+                1,
+                &[drill_entry(
+                    1,
+                    Verdict::TestFailure,
+                    RanLocation::LocalAfterInfra,
+                )],
+            );
+            assert!(!fired["the exit code is the capped local run's own (Pass)"]);
+        }
+
+        #[test]
+        fn a_remote_ran_verdict_does_not_close_the_drill_run() {
+            // A verdict claiming the work ran remotely would mean the
+            // synthetic failure never degraded — the records link must
+            // reject it rather than let the drill pass on a lie.
+            let fired = fired_map(
+                &chain_stderr(),
+                0,
+                &[drill_entry(0, Verdict::Pass, RanLocation::Remote)],
+            );
+            assert!(!fired["a terminal verdict recorded ran: local_after_infra"]);
+        }
+
+        #[test]
+        fn the_link_set_is_exactly_the_reported_chain() {
+            // Guard against a link being added or dropped without this
+            // suite and the parent report disagreeing about the chain.
+            let names: Vec<&'static str> = drill_links("", 0, &[])
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            assert_eq!(names.len(), 7);
+            assert!(names.contains(&"the drill backend took the submission"));
+            assert!(names.contains(&"the synthetic failure raised the timeout banner"));
+            assert!(names.contains(&"the degrade named the drill as its infra reason"));
+            assert!(names.contains(&"the semaphore-gated ladder fell back to a capped local run"));
+            assert!(names.contains(&"the write-ahead intent recorded decision: remote"));
+            assert!(names.contains(&"a terminal verdict recorded ran: local_after_infra"));
+            assert!(names.contains(&"the exit code is the capped local run's own (Pass)"));
+        }
+    }
 }

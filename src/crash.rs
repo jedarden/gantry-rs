@@ -1161,11 +1161,17 @@ mod tests {
     #[test]
     fn url_userinfo_is_redacted_with_and_without_a_username() {
         assert_eq!(
-            redact(&format!("https://user:{}@example.com/repo.git", userinfo_password())),
+            redact(&format!(
+                "https://user:{}@example.com/repo.git",
+                userinfo_password()
+            )),
             "https://[REDACTED]@example.com/repo.git"
         );
         assert_eq!(
-            redact(&format!("https://:{}@example.com/repo.git", userinfo_password())),
+            redact(&format!(
+                "https://:{}@example.com/repo.git",
+                userinfo_password()
+            )),
             "https://[REDACTED]@example.com/repo.git"
         );
         // The whole userinfo goes, username included — it is sometimes the

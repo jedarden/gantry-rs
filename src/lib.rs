@@ -5,6 +5,7 @@ pub mod config;
 pub mod crash; // plan Component 7: the crash flight recorder — redacted InfraFailure bundles + `gantry report`
 pub mod decision;
 pub mod doctor;
+pub mod drill; // plan Component 8: drill-scoped fault injection for `doctor --drill`
 pub mod gate;
 pub mod local; // plan Component 6: LocalExecutor — scope, slice, fallback semaphore
 pub mod quickcheck; // plan CLI surface: `gantry quickcheck` — shim, cap, git (Tier-0 proof)

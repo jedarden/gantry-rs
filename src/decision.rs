@@ -606,15 +606,23 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
 
     // Step: submit to the command backend (the same template resolution
     // run_remote uses — user-configured templates, or the shipped defaults).
-    let backend = match &config.remote.command {
-        Some(c) => CommandBackend::with_config(crate::backend::command::CommandConfig {
-            submit: c.submit.clone(),
-            logs: c.logs.clone(),
-            wait: c.wait.clone(),
-            status: None,
-        }),
-        None => CommandBackend::new(),
+    // Built as a trait object through the drill injection seam
+    // ([`crate::drill::inject`]): unarmed — every real run, ever — the hook
+    // hands the backend straight back at the cost of one atomic load; armed
+    // (a `doctor --drill` run) the drill's hermetic synthetic backend takes
+    // the wait, and the InfraFailure it raises drives the real ladder below.
+    let backend: Box<dyn RemoteBackend> = match &config.remote.command {
+        Some(c) => Box::new(CommandBackend::with_config(
+            crate::backend::command::CommandConfig {
+                submit: c.submit.clone(),
+                logs: c.logs.clone(),
+                wait: c.wait.clone(),
+                status: None, // the config schema carries no status step
+            },
+        )),
+        None => Box::new(CommandBackend::new()),
     };
+    let backend = crate::drill::inject(backend);
 
     let (tool, subcommand, run_args) = explicit_run_spec_fields(program, tail);
     let spec = RunSpec::new(tool, &subcommand, run_args, repo_url, sha, "");
@@ -886,7 +894,7 @@ fn record_infra_failure(
 /// the command templates keep [`Config::command_deadline`]. Tier-0 never
 /// enters a remote wait, so its arm exists only to keep the match
 /// exhaustive.
-fn backend_wait_deadline(config: &Config) -> Duration {
+pub(crate) fn backend_wait_deadline(config: &Config) -> Duration {
     match config.remote.backend {
         Backend::Argo => config.argo_deadline(),
         Backend::None | Backend::Command => config.command_deadline(),

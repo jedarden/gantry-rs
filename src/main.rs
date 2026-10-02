@@ -285,6 +285,43 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
         // are uninstall::cli's: 0 clean, 1 leftovers remain, 2 usage error.
         "uninstall" => ExitCode::from(gantry::uninstall::cli(&argv[2..]) as u8),
 
+        // Hidden drill runner: `gantry doctor --drill` spawns `<self>
+        // __drill-run` and asserts the degrade chain from the child's stderr
+        // and its ledger delta. Deliberately absent from `gantry help` — the
+        // doctor flag is the only supported way in; the subcommand exists so
+        // the drill's exit code is a real process exit the parent can assert
+        // against the verdict record.
+        //
+        // Arming HERE is what makes the hook drill-scoped (plan Component 8):
+        // this process is a drill by definition, so its pipeline run gets
+        // the synthetic backend, and the RAII scope disarms on the way out.
+        // No other subcommand — and no environment variable, config key, or
+        // flag — reaches `drill::arm`, which is why a real run can never be
+        // degraded by a stray flag.
+        //
+        // The run forces the remote arm (a Tier-0 box has no remote pipeline
+        // to drill — the injection must meet a backend) and clears the kill
+        // switches for itself (GANTRY_ON=1, no GANTRY_LOCAL): an operator's
+        // `gantry off` must not silently turn the fire drill into a plain
+        // local run with nothing to degrade from.
+        "__drill-run" => {
+            let _drill_scope = gantry::drill::arm();
+            env::set_var("GANTRY_ON", "1");
+            env::remove_var("GANTRY_LOCAL");
+
+            let load_result = config::Config::load();
+            for warning in load_result.warnings {
+                eprintln!("[gantry] config warning: {}", warning);
+            }
+            let mut cfg = load_result.config;
+            cfg.remote.backend = config::Backend::Command;
+
+            let repo_url = get_repo_url();
+            let sha = get_current_sha();
+            let wrapped = ["cargo".to_string(), "--version".to_string()];
+            exit_code_from(decision::run_explicit(&cfg, &repo_url, &sha, &wrapped))
+        }
+
         // Unknown command: print a hint and exit 2 (conventional for CLI misuse).
         _ => {
             eprintln!("gantry: unknown command '{subcommand}'");
