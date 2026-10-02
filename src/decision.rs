@@ -762,6 +762,7 @@ fn explicit_run_spec_fields<'a>(
 /// internally, while the wrapped program's resolution is the explicit
 /// offload's own contract (plan §1: resolution failures surface, never
 /// re-exec gantry).
+#[allow(clippy::too_many_arguments)]
 fn resolve_and_fall_back(
     config: &Config,
     program: &str,
@@ -1001,6 +1002,7 @@ pub fn run_tier0(config: &Config, repo_url: &str, sha: &str, args: &[String]) ->
 /// which is how the explicit-offload paths run the wrapped command instead.
 ///
 /// Returns the child's exit code, or 1 when nothing could be run.
+#[allow(clippy::too_many_arguments)]
 fn execute_locally(
     config: &Config,
     repo_url: &str,

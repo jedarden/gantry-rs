@@ -776,7 +776,10 @@ mod tests {
         let intent = IntentRecord::new(
             "cargo".to_string(),
             vec!["test".to_string()],
-            format!("https://ci:{}@git.example/repo.git", ["gantry", "synthetic", "pw"].join("-")),
+            format!(
+                "https://ci:{}@git.example/repo.git",
+                ["gantry", "synthetic", "pw"].join("-")
+            ),
             "abc123".to_string(),
             PathBuf::from("."),
             GateInputs {

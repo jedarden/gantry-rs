@@ -8,3 +8,6 @@
 # already created broken submodule links here (bf-1hgq). Ignore them instead.
 /tests/integration/fixtures/*/cargo
 /tests/integration/fixtures/*/.git-state/
+
+# Release packaging output (scripts/package-release.sh --out default)
+/dist/

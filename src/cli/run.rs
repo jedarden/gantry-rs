@@ -129,7 +129,7 @@ pub fn parse(argv: &[String]) -> Result<ParsedRun, u8> {
 pub fn cli(argv: &[String], repo_url: &str, sha: &str) -> u8 {
     let parsed = match parse(argv) {
         Ok(parsed) => parsed,
-        Err(code) => return code as u8,
+        Err(code) => return code,
     };
 
     let load = Config::load();
