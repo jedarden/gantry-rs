@@ -9,6 +9,13 @@
 //   every submission carries `contract-version` (CONTRACT_VERSION) — the
 //   client half of the verdict.json handshake the reference template echoes
 //   back, and a foreign echo classifies the run infra in wait() below
+// - submit preflight (plan Component 5, part 3): before anything remote
+//   happens, the parity preflight ([`crate::preflight`]) compares the repo's
+//   rust-toolchain.toml and the requested features against the builder
+//   image's capability labels — a provable mismatch refuses the submission
+//   (no manifest is built, nothing reaches kubectl; the caller's existing
+//   infra ladder lands the run locally behind the loud `[gantry] parity:`
+//   line), an unknown/unlabeled image warns and proceeds, a match is silent
 // - stream_logs: kubectl logs -f on the workflow's pod
 // - wait: polls kubectl get workflow status.phase until terminal or deadline
 // - status: one-shot status.phase → RunStatus snapshot (never blocks, never
@@ -25,8 +32,11 @@
 // run progresses, not a captured end-of-run result.
 
 use crate::backend::{BackendError, RemoteBackend, RunSpec, RunStatus, Verdict, VerdictJson};
+use crate::capability::{capability_of, ImageInspector, RegistryInspector};
+use crate::preflight::{Decision, LocalPin};
 use crate::verdict::CONTRACT_VERSION;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -250,6 +260,34 @@ pub struct ArgoHandle {
     pub namespace: String,
 }
 
+/// The local inputs the submit-path parity preflight compares (plan
+/// Component 5): the repo's pin file and the features the remote run relies
+/// on. `None` on [`ArgoConfig::parity`] disables the preflight entirely —
+/// the submission is never compared. Populating it from user config is the
+/// decision-layer wiring, a later child of the same split; today only a
+/// caller that constructs [`ArgoConfig`] directly can arm it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParityPreflight {
+    /// The repo's rust-toolchain.toml. A missing file is an unpinned repo
+    /// (no channel claim to compare); an unusable file warns rather than
+    /// refuses — [`crate::preflight`] owns those semantics.
+    pub toolchain_path: PathBuf,
+    /// Features the remote run relies on (`sccache`, …). Each must be
+    /// advertised by the image's capability label or the submission is
+    /// refused. Empty by default: gantry requests nothing it was not told to.
+    pub features: Vec<String>,
+}
+
+impl ParityPreflight {
+    /// Arm the preflight against `toolchain_path` with `features`.
+    pub fn new(toolchain_path: PathBuf, features: Vec<String>) -> Self {
+        ParityPreflight {
+            toolchain_path,
+            features,
+        }
+    }
+}
+
 /// Argo configuration from config file.
 ///
 /// Phase 1a: kubectl path, WorkflowTemplate reference, and submit plumbing
@@ -274,6 +312,9 @@ pub struct ArgoConfig {
     pub builder_image: Option<String>,
     /// Base URL for Argo UI (optional, for describe() to return human-readable URLs).
     pub base_url: Option<String>,
+    /// Parity preflight inputs (plan Component 5). `None` — the default —
+    /// disables the preflight: submissions are never compared.
+    pub parity: Option<ParityPreflight>,
 }
 
 impl Default for ArgoConfig {
@@ -286,6 +327,7 @@ impl Default for ArgoConfig {
             generate_name: "gantry-".to_string(),
             builder_image: None,
             base_url: None,
+            parity: None,
         }
     }
 }
@@ -516,6 +558,11 @@ pub struct ArgoBackend {
     /// The kubectl execution seam: the production binary runner, or a test
     /// fake when the backend is built through `with_runner`.
     kubectl: Box<dyn KubectlRunner>,
+    /// The image-label seam the preflight reads through: the production
+    /// registry inspector, or a test fake when the backend is built through
+    /// `with_runner_and_inspector`. Consulted only when the preflight is
+    /// armed (`config.parity` set).
+    inspector: Box<dyn ImageInspector>,
     /// Poll interval while waiting for a terminal phase. Production value:
     /// [`STATUS_POLL`]; tests shorten it so polling scenarios stay fast.
     status_poll: Duration,
@@ -531,6 +578,7 @@ impl ArgoBackend {
         ArgoBackend {
             config,
             kubectl,
+            inspector: Box::new(RegistryInspector),
             status_poll: STATUS_POLL,
             discovery_poll: POD_DISCOVERY_POLL,
         }
@@ -549,11 +597,72 @@ impl ArgoBackend {
     /// overrides the `status_poll`/`discovery_poll` fields directly.
     #[cfg(test)]
     fn with_runner(config: ArgoConfig, kubectl: Box<dyn KubectlRunner>) -> Self {
+        ArgoBackend::with_runner_and_inspector(config, kubectl, Box::new(RegistryInspector))
+    }
+
+    /// [`Self::with_runner`] plus an injected image inspector: the seam the
+    /// preflight's capability lookup reads through, so preflight scenarios
+    /// run with a canned answer instead of a registry query.
+    #[cfg(test)]
+    fn with_runner_and_inspector(
+        config: ArgoConfig,
+        kubectl: Box<dyn KubectlRunner>,
+        inspector: Box<dyn ImageInspector>,
+    ) -> Self {
         ArgoBackend {
             config,
             kubectl,
+            inspector,
             status_poll: Duration::from_millis(1),
             discovery_poll: Duration::from_millis(1),
+        }
+    }
+
+    /// The submit-path parity preflight (plan Component 5).
+    ///
+    /// Compares the repo's rust-toolchain.toml and the configured feature
+    /// requests against the builder image's capability labels — *before*
+    /// anything remote happens, so a refusal means no Workflow manifest is
+    /// ever built and nothing reaches kubectl:
+    ///
+    /// - provable mismatch → the loud `[gantry] parity:` line is printed and
+    ///   `Err` returned; the caller's existing infra ladder falls back to a
+    ///   local run ([`crate::decision`]'s submit-error arm);
+    /// - unknown/unlabeled image → the warn-only `[gantry] parity:` line,
+    ///   then the submission proceeds;
+    /// - match → silent, submission proceeds.
+    ///
+    /// Disarmed (`config.parity == None`) this is a no-op — the preflight is
+    /// never consulted, and neither is the inspector.
+    fn preflight(&self) -> Result<(), BackendError> {
+        let Some(parity) = self.config.parity.as_ref() else {
+            return Ok(());
+        };
+        let pin = LocalPin::read(&parity.toolchain_path);
+        let (image, capability) = match self.config.builder_image.as_deref() {
+            Some(image) => (image, capability_of(self.inspector.as_ref(), image)),
+            None => (
+                // The image identity lives in the cluster's WorkflowTemplate
+                // default — unknowable client-side, which IS an unknown
+                // capability: warn-only, never a refusal.
+                "the template default image",
+                crate::capability::ImageCapability::Unknown {
+                    reason: "no builder-image override is configured; the WorkflowTemplate \
+                             default applies and its capabilities cannot be inspected"
+                        .to_string(),
+                },
+            ),
+        };
+        match crate::preflight::decide(&pin, &capability, &parity.features, image) {
+            Decision::Submit => Ok(()),
+            Decision::SubmitWithWarning { line } => {
+                eprintln!("{line}");
+                Ok(())
+            }
+            Decision::RefuseToLocal { line, detail } => {
+                eprintln!("{line}");
+                Err(BackendError::new(&detail))
+            }
         }
     }
 
@@ -758,10 +867,18 @@ impl ArgoBackend {
 impl RemoteBackend for ArgoBackend {
     /// Submit a workflow to Argo.
     ///
-    /// Builds the Workflow manifest with serde and pipes it into
-    /// `kubectl create -f -` through the [`KubectlRunner`] seam. The workflow
-    /// name (stdout) becomes the handle.
+    /// Runs the parity preflight first ([`Self::preflight`], plan Component
+    /// 5): a provable toolchain/feature mismatch against the builder image
+    /// refuses the run with a loud `[gantry] parity:` line and *no* Workflow
+    /// manifest is ever built or submitted. Past the preflight, builds the
+    /// Workflow manifest with serde and pipes it into `kubectl create -f -`
+    /// through the [`KubectlRunner`] seam. The workflow name (stdout) becomes
+    /// the handle.
     fn submit(&self, spec: &RunSpec) -> Result<crate::backend::RunHandle, BackendError> {
+        // Parity preflight before anything remote happens: the refusal path
+        // must not even build the manifest it will never send.
+        self.preflight()?;
+
         // Format args as JSON array
         let args_json = serde_json::to_string(&spec.args)
             .map_err(|e| BackendError::new(&format!("failed to serialize args: {}", e)))?;
@@ -1055,6 +1172,7 @@ impl RemoteBackend for ArgoBackend {
 mod tests {
     use super::*;
     use crate::backend::RunHandle;
+    use crate::capability::{ImageLabels, LookupFailure};
     use crate::verdict::CONTRACT_VERSION;
 
     #[test]
@@ -1199,6 +1317,7 @@ mod tests {
             generate_name: "gantry-".to_string(),
             builder_image: None,
             base_url: None,
+            parity: None,
         };
         let backend = ArgoBackend::new(config);
         let handle = RunHandle::new("test-workflow-abc123");
@@ -1217,6 +1336,7 @@ mod tests {
             generate_name: "gantry-".to_string(),
             builder_image: None,
             base_url: Some("https://argo.example.com".to_string()),
+            parity: None,
         };
         let backend = ArgoBackend::new(config);
         let handle = RunHandle::new("test-workflow-abc123");
@@ -1238,6 +1358,7 @@ mod tests {
             generate_name: "gantry-".to_string(),
             builder_image: None,
             base_url: Some("https://argo.example.com/".to_string()),
+            parity: None,
         };
         let backend = ArgoBackend::new(config);
         let handle = RunHandle::new("test-workflow-abc123");
@@ -1442,6 +1563,174 @@ mod tests {
         )
         .expect("stdin payload is the Workflow manifest JSON");
         assert_eq!(manifest["metadata"]["generateName"], "gantry-");
+    }
+
+    // --- submit-path parity preflight (plan Component 5, part 3) ------------
+    //
+    // The decision itself is unit-tested in src/preflight.rs — the messages'
+    // single definition site, where the `[gantry]`-prefix loudness contract is
+    // asserted. These tests pin the *wiring*: what submit() does — and what it
+    // must never touch — for each decision, through the same kubectl fake the
+    // other submit tests use.
+
+    /// An [`ImageInspector`] with a canned answer, so preflight scenarios run
+    /// without a registry query. `Ok` labels flow through the real
+    /// `capability_of` classifier; `Err` is the lookup-failure arm.
+    struct FixedInspector(Result<ImageLabels, LookupFailure>);
+
+    impl ImageInspector for FixedInspector {
+        fn labels(&self, _image: &str) -> Result<ImageLabels, LookupFailure> {
+            self.0.clone()
+        }
+    }
+
+    /// Labels carrying a parseable toolchain claim: `channel`, no pin, the
+    /// given features — round-tripped through the real label format so the
+    /// fake answers the same payload shape a registry lookup would.
+    fn known_labels(channel: &str, features: &[&str]) -> Result<ImageLabels, LookupFailure> {
+        let label = crate::labels::CapabilityLabel {
+            channel: channel.to_string(),
+            pin: None,
+            features: features.iter().map(|f| f.to_string()).collect(),
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            crate::labels::TOOLCHAIN_LABEL_KEY.to_string(),
+            label.to_label_value(),
+        );
+        Ok(ImageLabels::from_map(map))
+    }
+
+    /// A config with the preflight armed against a temp pin file naming
+    /// `channel`, the builder image set, no requested features.
+    fn armed_config(dir: &std::path::Path, channel: &str) -> ArgoConfig {
+        let pin_path = dir.join("rust-toolchain.toml");
+        std::fs::write(&pin_path, format!("[toolchain]\nchannel = \"{channel}\"\n"))
+            .expect("write pin file");
+        ArgoConfig {
+            builder_image: Some("registry.test/gantry-builder:1".to_string()),
+            parity: Some(ParityPreflight::new(pin_path, Vec::new())),
+            ..ArgoConfig::default()
+        }
+    }
+
+    /// The submit-path guarantee (plan Component 5): a provable toolchain
+    /// mismatch refuses the run *before anything remote happens* — submit()
+    /// errors and kubectl is never invoked, so no Workflow manifest is built
+    /// or submitted. The caller's infra ladder lands the run locally.
+    #[test]
+    fn submit_on_parity_mismatch_refuses_without_touching_kubectl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (fake, calls) = FakeKubectl::serving(vec![ok_outcome(
+            "workflow.argoproj.io/gantry-abc123 created\n",
+        )]);
+        let backend = ArgoBackend::with_runner_and_inspector(
+            armed_config(tmp.path(), "stable"),
+            fake,
+            Box::new(FixedInspector(known_labels("nightly", &[]))),
+        );
+
+        let err = backend
+            .submit(&submit_spec())
+            .expect_err("a stable repo vs a nightly image must refuse the submission");
+        assert!(
+            err.reason.contains("refusing remote run"),
+            "error carries the refusal: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("falling back to local execution"),
+            "error explains the fallback: {}",
+            err.reason
+        );
+        assert!(
+            calls_of(&calls).is_empty(),
+            "a refused submission must not reach kubectl — no Workflow is created"
+        );
+    }
+
+    /// Past a *matching* preflight the submission is business as usual:
+    /// exactly the one `create -f -` call, the handle carrying the generated
+    /// workflow name. A match is silent — no warning, no refusal, no extra
+    /// kubectl traffic.
+    #[test]
+    fn submit_past_a_matching_preflight_creates_the_workflow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (fake, calls) = FakeKubectl::serving(vec![ok_outcome(
+            "workflow.argoproj.io/gantry-abc123 created\n",
+        )]);
+        let backend = ArgoBackend::with_runner_and_inspector(
+            armed_config(tmp.path(), "stable"),
+            fake,
+            Box::new(FixedInspector(known_labels("stable", &[]))),
+        );
+
+        let handle = backend
+            .submit(&submit_spec())
+            .expect("a parity match submits");
+        assert_eq!(handle, RunHandle::new("gantry-abc123"));
+
+        let log = calls_of(&calls);
+        assert_eq!(log.len(), 1, "the match path makes exactly the create call");
+        assert_eq!(log[0].args, vec!["create", "-f", "-"]);
+    }
+
+    /// The warn-only arm at the submit path: an unlabeled image (labels, but
+    /// none in the `org.gantry.*` namespace) is *not* a refusal — the loud
+    /// `[gantry] parity:` warning prints and the submission proceeds exactly
+    /// as if the preflight were silent.
+    #[test]
+    fn submit_on_an_unlabeled_image_warns_but_proceeds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (fake, calls) = FakeKubectl::serving(vec![ok_outcome(
+            "workflow.argoproj.io/gantry-abc123 created\n",
+        )]);
+        let backend = ArgoBackend::with_runner_and_inspector(
+            armed_config(tmp.path(), "stable"),
+            fake,
+            Box::new(FixedInspector(Ok(ImageLabels::from_map(
+                std::collections::BTreeMap::from([(
+                    "maintainer".to_string(),
+                    "someone".to_string(),
+                )]),
+            )))),
+        );
+
+        let handle = backend
+            .submit(&submit_spec())
+            .expect("an unlabeled image is warn-only — the submission proceeds");
+        assert_eq!(handle, RunHandle::new("gantry-abc123"));
+
+        let log = calls_of(&calls);
+        assert_eq!(log.len(), 1, "the warn path makes exactly the create call");
+        assert_eq!(log[0].args, vec!["create", "-f", "-"]);
+    }
+
+    /// Disarmed (`parity: None`, the default) the preflight is a no-op: the
+    /// inspector is never consulted — a panic there proves it — and the
+    /// submission proceeds untouched.
+    #[test]
+    fn submit_without_parity_armed_never_consults_the_inspector() {
+        struct ExplosiveInspector;
+        impl ImageInspector for ExplosiveInspector {
+            fn labels(&self, _image: &str) -> Result<ImageLabels, LookupFailure> {
+                panic!("a disarmed preflight must not query the image at all");
+            }
+        }
+        let (fake, calls) = FakeKubectl::serving(vec![ok_outcome(
+            "workflow.argoproj.io/gantry-abc123 created\n",
+        )]);
+        let backend = ArgoBackend::with_runner_and_inspector(
+            ArgoConfig::default(),
+            fake,
+            Box::new(ExplosiveInspector),
+        );
+
+        let handle = backend
+            .submit(&submit_spec())
+            .expect("a disarmed preflight never blocks the submission");
+        assert_eq!(handle, RunHandle::new("gantry-abc123"));
+        assert_eq!(calls_of(&calls).len(), 1);
     }
 
     /// kubectl create exiting non-zero surfaces kubectl's stderr in the

@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod gate;
 pub mod labels; // plan Component 5: image capability label schema (org.gantry.toolchain) for parity preflight
 pub mod local; // plan Component 6: LocalExecutor — scope, slice, fallback semaphore
+pub mod preflight; // plan Component 5 part 3: the parity preflight decision — match/mismatch/unknown
 pub mod quickcheck; // plan CLI surface: `gantry quickcheck` — shim, cap, git (Tier-0 proof)
 pub mod refs;
 pub mod runlog;
