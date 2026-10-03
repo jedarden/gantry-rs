@@ -243,9 +243,10 @@ impl QueueClass {
 
 /// The single systemd user slice every gantry-spawned local run lands in
 /// (plan Component 6). The slice unit carries the box-level *sum* cap —
-/// fixed at 12 CPU / 32G until the `local.slice_*` tuning keys land with
-/// the slice-config surface — so the total load of all gantry runs stays
-/// inside it no matter how many per-run scopes nest beneath.
+/// the configured `local.slice_cpu_quota_pct` / `local.slice_memory_max`
+/// (`crate::config::DEFAULT_SLICE_*` when absent: 12 CPU / 32G) — so the
+/// total load of all gantry runs stays inside it no matter how many
+/// per-run scopes nest beneath.
 pub const SLICE_NAME: &str = "gantry.slice";
 
 /// How the next local child is spawned.
@@ -487,14 +488,12 @@ struct Decision {
 /// (plan Component 6). Build with [`Self::from_config`]; spawn children with
 /// [`Self::spawn`], which returns the child's [`ExitStatus`] unchanged — the
 /// systemd-run wrapper (when active) waits for the child and propagates its
-/// exit code, so every call site keeps its existing INV-3 mapping.
-/// Boxwide `gantry.slice` sum-cap defaults (plan Component 6): 12 CPU / 32G.
-/// These mirror the `crate::config::DEFAULT_SLICE_*` surface, which lands
-/// with the slice-config slice; until then the sum cap is fixed here and the
-/// placement cannot be switched off via config.
-const DEFAULT_SLICE_CPU_QUOTA_PCT: u32 = 1200;
-const DEFAULT_SLICE_MEMORY_MAX: &str = "32G";
-
+/// exit code, so every call site keeps its existing INV-3 mapping. The
+/// boxwide `gantry.slice` sum cap comes from the layered
+/// `local.slice_enabled` / `local.slice_cpu_quota_pct` /
+/// `local.slice_memory_max` keys (`crate::config::DEFAULT_SLICE_*` when
+/// absent); the S-2 merge guard keeps repo config from touching them, so
+/// they remain the operator's box-level choice.
 pub struct SlicePlacement {
     enabled: bool,
     cpu_quota_pct: u32,
@@ -506,18 +505,23 @@ pub struct SlicePlacement {
 
 impl SlicePlacement {
     /// Read the placement configuration from the layered config.
+    ///
+    /// The sum-cap keys arrive already resolved: `LocalConfig`'s defaults are
+    /// the `crate::config::DEFAULT_SLICE_*` values, user-layer overrides win,
+    /// and the S-2 merge guard ignores repo-layer attempts — so absent keys
+    /// keep today's 12 CPU / 32G defaults, and a cloned repo can neither opt
+    /// the box out of the slice nor raise the cap.
     pub fn from_config(config: &Config) -> Self {
         Self {
-            // `local.slice_enabled` (the operator opt-out) and the
-            // `local.slice_*` tuning keys land with the slice-config
-            // surface; until then the placement is always on at the default
-            // sum cap, and `decide` degrades loudly when systemd-run is
-            // unavailable.
-            enabled: true,
+            // `local.slice_enabled = false` is the operator opting out:
+            // `decide` then spawns plain — no unit written, no manager
+            // touched. An *unavailable* slice (no systemd-run, no user
+            // manager) still degrades loudly, once per process.
+            enabled: config.local.slice_enabled,
             cpu_quota_pct: u32::from(config.local.cpu_quota_pct),
             memory_max: config.local.memory_max.clone(),
-            slice_cpu_quota_pct: DEFAULT_SLICE_CPU_QUOTA_PCT,
-            slice_memory_max: DEFAULT_SLICE_MEMORY_MAX.to_string(),
+            slice_cpu_quota_pct: config.local.slice_cpu_quota_pct,
+            slice_memory_max: config.local.slice_memory_max.clone(),
             decision: std::sync::OnceLock::new(),
         }
     }
@@ -1612,8 +1616,8 @@ mod tests {
             enabled: true,
             cpu_quota_pct: 200,
             memory_max: "6G".to_string(),
-            slice_cpu_quota_pct: super::DEFAULT_SLICE_CPU_QUOTA_PCT,
-            slice_memory_max: super::DEFAULT_SLICE_MEMORY_MAX.to_string(),
+            slice_cpu_quota_pct: crate::config::DEFAULT_SLICE_CPU_QUOTA_PCT,
+            slice_memory_max: crate::config::DEFAULT_SLICE_MEMORY_MAX.to_string(),
             decision: std::sync::OnceLock::new(),
         };
         sp.decision
@@ -1645,6 +1649,69 @@ mod tests {
         );
         assert!(slice_unit_content(800, "24G").contains("CPUQuota=800%"));
         assert!(slice_unit_content(800, "24G").contains("MemoryMax=24G"));
+    }
+
+    #[test]
+    fn from_config_threads_the_layered_slice_keys() {
+        // Custom operator values land in the placement verbatim.
+        let mut config = Config::tier_0_defaults();
+        config.local.slice_enabled = true;
+        config.local.slice_cpu_quota_pct = 800;
+        config.local.slice_memory_max = "24G".to_string();
+        let sp = SlicePlacement::from_config(&config);
+        assert!(sp.enabled);
+        assert_eq!(sp.slice_cpu_quota_pct, 800);
+        assert_eq!(sp.slice_memory_max, "24G");
+        // The unit `decide` provisions is composed from exactly those
+        // values — the same `slice_unit_content` call the provision path
+        // makes — so the deployed gantry.slice carries the operator's cap.
+        let unit = slice_unit_content(sp.slice_cpu_quota_pct, &sp.slice_memory_max);
+        assert!(
+            unit.contains("CPUQuota=800%"),
+            "sum cap must thread: {unit}"
+        );
+        assert!(
+            unit.contains("MemoryMax=24G"),
+            "sum cap must thread: {unit}"
+        );
+    }
+
+    #[test]
+    fn from_config_absent_slice_keys_keep_the_defaults() {
+        // Tier-0 defaults carry no overrides, so the placement is today's
+        // behavior: enabled, at the published default sum cap.
+        let sp = SlicePlacement::from_config(&Config::tier_0_defaults());
+        assert!(sp.enabled);
+        assert_eq!(
+            sp.slice_cpu_quota_pct,
+            crate::config::DEFAULT_SLICE_CPU_QUOTA_PCT
+        );
+        assert_eq!(sp.slice_memory_max, crate::config::DEFAULT_SLICE_MEMORY_MAX);
+        // And the provisioned unit is byte-identical to the pinned default.
+        assert_eq!(
+            slice_unit_content(sp.slice_cpu_quota_pct, &sp.slice_memory_max),
+            slice_unit_content(1200, "32G")
+        );
+    }
+
+    /// `slice_enabled = false` opts the box out: the placement decides Plain
+    /// with no launcher — the `decide` guard short-circuits before
+    /// `provision_slice`, so no unit is written and no manager is touched,
+    /// and the choice degrades silently (deliberate operator choice, pinned
+    /// in `placement_decision_branches`). Safe to run for real: the disabled
+    /// path's only side effect is a PATH scan.
+    #[test]
+    fn slice_disabled_by_config_spawns_plain_without_touching_systemd() {
+        let mut config = Config::tier_0_defaults();
+        config.local.slice_enabled = false;
+        let sp = SlicePlacement::from_config(&config);
+        assert!(!sp.enabled, "from_config must honor the operator opt-out");
+        let decision = sp.decide();
+        assert_eq!(decision.placement, Placement::Plain);
+        assert!(
+            decision.systemd_run.is_none(),
+            "a plain placement must never carry a launcher"
+        );
     }
 
     #[test]
