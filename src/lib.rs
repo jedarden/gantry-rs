@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod cap; // plan Component 6: the per-run cgroup cap (probe once per process, degrade loudly)
+pub mod capability; // plan Component 5 part 2: builder-image capability acquisition — OCI label lookup behind an injectable inspector
 pub mod cli; // plan module layout: management-CLI diagnostics — why / explain / status, --json with schema_version
 pub mod config;
 pub mod crash; // plan Component 7: the crash flight recorder — redacted InfraFailure bundles + `gantry report`
