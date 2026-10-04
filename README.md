@@ -12,6 +12,23 @@ Extraction of a battle-tested in-house pair of bash scripts (`~/.local/bin/cargo
 
 **The resource-capped local fallback does not exist yet.** When the GitGate finds remote execution ineligible (no configured `origin`, dirty tree, non-git directory), an intercepted `cargo test` exits non-zero **without running any tests** — it does not degrade to a local run. In a clean git repo with no `origin`, for example, it prints `ineligible: remote 'origin' is not configured`, records `verdict: Ineligible`, and exits 1. The local-execution tail of Phase 1a, then Phase 1b onward, are still open; see [`docs/plan/plan.md`](docs/plan/plan.md) for the phase breakdown.
 
+## Usage
+
+The shim intercepts `cargo` on PATH and offloads eligible invocations automatically. For anything else — or whenever you want the offload decision in your own hands — `gantry run` invokes the same pipeline explicitly, no shimming required:
+
+```
+gantry run [--backend none|argo|command] -- <cmd> [args…]
+```
+
+```
+gantry run -- make -j4
+gantry run --backend argo -- cargo test --workspace
+```
+
+Everything after `--` is the wrapped command, verbatim — its own flags are never read by gantry, which is why the separator is required. The wrapped command routes through the same GitGate → push → backend pipeline (and the same capped-local fallback when the remote path is unavailable) as an intercepted `cargo test`, and lands in the run ledger the same way.
+
+The exit code is the wrapped command's, not gantry's: a local run passes it through byte-exact, a remote run lands on the verdict ladder (0 pass, 1 failure, 2 infra). Usage errors — a missing `--`, an unknown `--backend` value — exit 2 before any gate, backend, or ledger is touched. `--backend` overrides the configured backend for this run only; `gantry explain` prints the active backend in the same spelling, so its output can be pasted straight back as `gantry run --backend <that>`.
+
 ## Structure
 
 - `docs/notes/` — features, constraints, design decisions, naming rationale
