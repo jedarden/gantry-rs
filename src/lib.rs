@@ -15,5 +15,6 @@ pub mod shim;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod toolchain; // plan Component 5 parity preflight (pure half): org.gantry.toolchain label payload vs the local pin
 pub mod uninstall; // plan §8 installer line: "`gantry uninstall` reverses it"
 pub mod verdict;
