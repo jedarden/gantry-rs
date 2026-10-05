@@ -60,6 +60,15 @@ impl RunLog {
         Ok(RunLog { log_path })
     }
 
+    /// Open a RunLog at an explicit path — the hermetic-test constructor (the
+    /// same seam as the gate's `_in` functions: `$HOME` is process-global
+    /// state, and tests never touch it). The parent directory must exist;
+    /// the log file itself is created on first append.
+    #[cfg(test)]
+    pub(crate) fn at_path(log_path: PathBuf) -> Self {
+        RunLog { log_path }
+    }
+
     /// Write an OPEN intent record BEFORE dispatch.
     ///
     /// This MUST be called before any real work happens (gate checks passed,
@@ -369,6 +378,34 @@ pub struct IntentRecord {
 
     /// Backend chosen for this run (argo/command/none).
     pub backend: String,
+
+    /// Content hash of the tested tree (`git rev-parse HEAD^{tree}`) — the
+    /// ledger-intelligence identity of *what* was tested (plan Component 10).
+    /// Memoization keys on the tree rather than the sha (rebases/amends with
+    /// identical content hit), and flake flagging compares verdicts at
+    /// identical trees. Additive like `failure_class`: `None` on records
+    /// written before this field existed, and a record without it never
+    /// matches a memo key, gets superseded, or flags a flake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_hash: Option<String>,
+
+    /// Originator process id, for the supersede zero-attachment rule (plan
+    /// Component 10): a still-running sibling is only superseded when its
+    /// originator is provably gone. `None` (legacy records) means liveness is
+    /// unprovable — such a sibling is never yanked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+
+    /// Toolchain identity (`rustc --version` output) — a memo key part (plan
+    /// Component 10): the same tree under a different toolchain is a
+    /// different test run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<String>,
+
+    /// Backend image digest when the producer pins one (`GANTRY_IMAGE_DIGEST`)
+    /// — a memo key part (plan Component 10). `None` matches only `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
 }
 
 impl IntentRecord {
@@ -404,6 +441,10 @@ impl IntentRecord {
             decision,
             reason,
             backend,
+            tree_hash: None,
+            pid: None,
+            toolchain: None,
+            image_digest: None,
         }
     }
 
@@ -500,6 +541,14 @@ pub struct VerdictRecord {
     /// Duration breakdown (milliseconds) for performance visibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durations_ms: Option<Durations>,
+
+    /// Flake flag (plan Component 10): the suite's outcome flipped a prior
+    /// terminal outcome at the same `(tree_hash, tool, args)` — the same
+    /// tree+args producing opposite results is the flake signature. Set by
+    /// [`crate::ledger::mark_flaky_if_flip`] before the record lands;
+    /// append-only ledger means only the flipping run carries the flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flaky_suspect: Option<bool>,
 }
 
 impl VerdictRecord {
@@ -525,6 +574,7 @@ impl VerdictRecord {
             failure_class: None,
             handle,
             durations_ms,
+            flaky_suspect: None,
         }
     }
 
@@ -732,6 +782,57 @@ mod rand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_key_fields_round_trip_additively() {
+        let mut intent = IntentRecord::new(
+            "cargo".to_string(),
+            vec!["test".to_string()],
+            "https://example.com/repo.git".to_string(),
+            "abc123".to_string(),
+            PathBuf::from("."),
+            GateInputs {
+                worktree: true,
+                head: true,
+                remote: true,
+                clean: true,
+            },
+            Decision::Remote,
+            "clean".to_string(),
+            "command".to_string(),
+        );
+        intent.tree_hash = Some("tree1234".to_string());
+        intent.pid = Some(4242);
+        intent.toolchain = Some("rustc 1.98.1".to_string());
+        intent.image_digest = Some("sha256:abc".to_string());
+
+        let json = serde_json::to_string(&intent).unwrap();
+        assert!(json.contains("\"tree_hash\":\"tree1234\""));
+        assert!(json.contains("\"pid\":4242"));
+
+        let parsed: IntentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tree_hash.as_deref(), Some("tree1234"));
+        assert_eq!(parsed.pid, Some(4242));
+        assert_eq!(parsed.toolchain.as_deref(), Some("rustc 1.98.1"));
+        assert_eq!(parsed.image_digest.as_deref(), Some("sha256:abc"));
+    }
+
+    #[test]
+    fn records_without_ledger_key_fields_parse_as_none() {
+        // A legacy intent record (pre-Component-10 shape): no tree_hash, pid,
+        // toolchain, or image_digest. The additive rule — they parse as None.
+        let legacy_intent = r#"{"rec":"intent","schema_version":1,"run_id":"r1","ts":1,"tool":"cargo","args":["test"],"repo":"https://example.com/r.git","sha":"abc","cwd_rel":".","gate":{"worktree":true,"head":true,"remote":true,"clean":true},"decision":"remote","reason":"clean","backend":"command"}"#;
+        let parsed: IntentRecord = serde_json::from_str(legacy_intent).unwrap();
+        assert_eq!(parsed.tree_hash, None);
+        assert_eq!(parsed.pid, None);
+        assert_eq!(parsed.toolchain, None);
+        assert_eq!(parsed.image_digest, None);
+
+        // Same for a legacy verdict record without the flake flag.
+        let legacy_verdict = r#"{"rec":"verdict","schema_version":1,"run_id":"r1","ts":2,"verdict":"pass","ran":"remote","exit_code":0,"handle":"wf"}"#;
+        let parsed: VerdictRecord = serde_json::from_str(legacy_verdict).unwrap();
+        assert_eq!(parsed.flaky_suspect, None);
+    }
 
     #[test]
     fn intent_record_serializes_correctly() {

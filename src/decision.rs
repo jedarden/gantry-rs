@@ -85,6 +85,50 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         }
     };
 
+    // Ledger intelligence (plan Component 10): capture the memo-key parts on
+    // every remote run. The same parts enrich the intent record below, where
+    // supersede and flake flagging consume them, so the capture is
+    // unconditional even though serving a cached verdict is opt-in.
+    let ledger_tree = crate::gate::head_tree_hash().ok();
+    let ledger_toolchain = crate::ledger::rustc_toolchain();
+    let ledger_image = crate::ledger::current_image_digest();
+    let memo_key = crate::ledger::MemoKey::from_parts(
+        ledger_tree.clone(),
+        ledger_toolchain.clone(),
+        ledger_image.clone(),
+        "cargo",
+        args,
+    );
+
+    // Opt-in memoization (plan Component 10, never default): an identical
+    // (tree-hash, args, toolchain, image digest) with a terminal PASS verdict
+    // returns the recorded verdict instantly. `GANTRY_MEMOIZE=1` opts in;
+    // `GANTRY_FRESH=1` is the `--fresh` escape and forces a real execution.
+    // Failures are never memoized, and a hit appends no ledger records — the
+    // PASS record that earned the verdict stays the only evidence.
+    if crate::ledger::memoize_requested() {
+        if crate::ledger::fresh_requested() {
+            eprintln!("[gantry] memoize: GANTRY_FRESH forces a fresh run");
+        } else if let (Some(rl), Some(key)) = (&runlog, &memo_key) {
+            if let Some(hit) = crate::ledger::lookup_cached_pass(rl, key) {
+                let verdict = hit
+                    .verdict
+                    .as_ref()
+                    .map(|v| v.verdict.to_string())
+                    .unwrap_or_else(|| "Pass".to_string());
+                eprintln!(
+                    "[gantry] cached: {} for tree {} (run {}) — GANTRY_FRESH=1 forces execution",
+                    verdict,
+                    crate::ledger::short_sha(&key.tree_hash),
+                    hit.intent.run_id,
+                );
+                return 0;
+            }
+        } else {
+            eprintln!("[gantry] memoize: key or ledger unavailable — running fresh");
+        }
+    }
+
     // Print the decision line to stderr
     eprintln!("[gantry] decision: remote execution eligible");
 
@@ -137,6 +181,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     }
 
     // Step 2: Write OPEN intent record BEFORE dispatch (write-ahead, INV-1)
+    let mut ledger_intent: Option<IntentRecord> = None;
     let run_id = if let Some(rl) = &runlog {
         let cwd_rel = std::env::current_dir()
             .ok()
@@ -147,7 +192,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             })
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        let intent = IntentRecord::new(
+        let mut intent = IntentRecord::new(
             "cargo".to_string(),
             args.to_vec(),
             repo_url.to_string(),
@@ -159,7 +204,17 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             "command".to_string(), // hardcoded backend
         );
 
-        match rl.open_intent(&intent) {
+        // Ledger intelligence (plan Component 10): the key parts ride the
+        // intent additively — old readers ignore them, and a record missing
+        // them never matches a memo key, gets superseded, or flags a flake.
+        intent.tree_hash = ledger_tree.clone();
+        intent.pid = Some(std::process::id());
+        intent.toolchain = ledger_toolchain.clone();
+        intent.image_digest = ledger_image.clone();
+
+        let written = rl.open_intent(&intent);
+        ledger_intent = Some(intent);
+        match written {
             Ok(id) => id,
             Err(e) => {
                 eprintln!(
@@ -186,6 +241,16 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                 .as_millis()
         )
     };
+
+    // Supersede-on-new-commit (plan Component 10): a different sha submitted
+    // for the same (repo, args) marks older still-running siblings with an
+    // explicit `superseded` terminal record — but only when the sibling has
+    // zero live attachments (originator process gone). A watched run, a
+    // same-sha sibling, or one whose originator liveness cannot be proven is
+    // never yanked; it simply runs alongside.
+    if let (Some(rl), Some(fresh)) = (&runlog, ledger_intent.as_ref()) {
+        crate::ledger::supersede_stale_siblings(rl, fresh);
+    }
 
     let _total_start = Instant::now();
 
@@ -342,6 +407,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             if let Some(rl) = runlog {
                 let _ = write_verdict(
                     &rl,
+                    ledger_intent.as_ref(),
                     run_id.clone(),
                     Verdict::InfraFailure,
                     RanLocation::Remote,
@@ -382,6 +448,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         let exit_code = verdict.to_exit_code();
         let _ = write_verdict(
             &rl,
+            ledger_intent.as_ref(),
             run_id.clone(),
             verdict,
             RanLocation::Remote,
@@ -526,8 +593,17 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
         )
     };
 
+    // Ledger intelligence (plan Component 10): capture the key parts once and
+    // record them on the intent, so the flake flagging at the verdict write
+    // can compare this run against history. Memoize/supersede stay on the
+    // intercepted path.
+    let ledger_tree = crate::gate::head_tree_hash().ok();
+    let ledger_toolchain = crate::ledger::rustc_toolchain();
+    let ledger_image = crate::ledger::current_image_digest();
+
+    let mut ledger_intent: Option<IntentRecord> = None;
     let run_id = if let Some(rl) = &runlog {
-        let intent = IntentRecord::new(
+        let mut intent = IntentRecord::new(
             program.to_string(),
             tail.to_vec(),
             repo_url.to_string(),
@@ -538,7 +614,13 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
             reason,
             backend_name,
         );
-        match rl.open_intent(&intent) {
+        intent.tree_hash = ledger_tree.clone();
+        intent.pid = Some(std::process::id());
+        intent.toolchain = ledger_toolchain.clone();
+        intent.image_digest = ledger_image.clone();
+        let written = rl.open_intent(&intent);
+        ledger_intent = Some(intent);
+        match written {
             Ok(id) => id,
             Err(e) => {
                 eprintln!(
@@ -713,6 +795,7 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
     if let Some(rl) = runlog {
         let _ = write_verdict(
             &rl,
+            ledger_intent.as_ref(),
             run_id,
             verdict,
             RanLocation::Remote,
@@ -802,8 +885,15 @@ fn resolve_and_fall_back(
 }
 
 /// Write a verdict record for a remote execution.
+///
+/// `intent` carries the ledger-key parts for flake flagging (plan Component
+/// 10): a terminal Pass/TestFailure that flips a prior outcome at the same
+/// tree+args is marked `flaky-suspect` before the record lands. `None` (no
+/// intent was written) simply skips the check.
+#[allow(clippy::too_many_arguments)]
 fn write_verdict(
     runlog: &RunLog,
+    intent: Option<&IntentRecord>,
     run_id: String,
     verdict: Verdict,
     ran: RanLocation,
@@ -812,7 +902,11 @@ fn write_verdict(
     durations_ms: Option<Durations>,
 ) -> Result<(), crate::runlog::RunLogError> {
     let runlog_verdict = convert_backend_verdict_to_runlog(verdict);
-    let record = VerdictRecord::new(run_id, runlog_verdict, ran, exit_code, handle, durations_ms);
+    let mut record =
+        VerdictRecord::new(run_id, runlog_verdict, ran, exit_code, handle, durations_ms);
+    if let Some(intent) = intent {
+        crate::ledger::mark_flaky_if_flip(runlog, intent, &mut record);
+    }
     runlog.close_verdict(&record)
 }
 

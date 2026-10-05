@@ -131,6 +131,32 @@ fn git_common_dir_in(dir: &Path) -> Result<String, String> {
     })
 }
 
+/// Hash of the HEAD commit's tree (`git rev-parse HEAD^{tree}`).
+///
+/// This is the ledger-intelligence identity of *what is being tested* (plan
+/// Component 10): memoization keys on the tree rather than the commit sha, so
+/// a rebase or amend that lands identical content still hits, and flake
+/// flagging compares verdicts at identical trees. Fails outside a repository
+/// or on an unborn HEAD — callers treat that as "no key" and skip the ledger
+/// feature rather than the run.
+pub fn head_tree_hash() -> Result<String, String> {
+    head_tree_hash_in(Path::new("."))
+}
+
+/// [`head_tree_hash`], run against an explicit repository directory.
+fn head_tree_hash_in(dir: &Path) -> Result<String, String> {
+    let output = git_output(dir, &["rev-parse", "HEAD^{tree}"])?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD^{{tree}} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Check whether HEAD is detached (EC-02).
 ///
 /// Runs `git rev-parse --abbrev-ref HEAD` and returns true iff the output
@@ -449,6 +475,27 @@ mod tests {
     // point takes the repository directory explicitly (`check_git_gate_in` &
     // friends), so parallel tests can each target their own fixture repo
     // without serialization. See parallel_gate_checks_are_hermetic below.
+
+    #[test]
+    fn head_tree_hash_matches_rev_parse_in_a_real_repo() {
+        // setup_happy_repo's second element is the bare *remote* — and its
+        // TempDir guard is already dropped on return, so the repo to query is
+        // the first element.
+        let (dir, _remote) = setup_happy_repo();
+        let repo = dir.path();
+
+        let ours = head_tree_hash_in(repo).expect("tree hash");
+        let expected = git_cmd(repo, &["rev-parse", "HEAD^{tree}"]).expect("rev-parse");
+        assert_eq!(ours, expected);
+        assert_eq!(ours.len(), 40, "a tree hash is a full sha-1");
+    }
+
+    #[test]
+    fn head_tree_hash_fails_on_an_unborn_head() {
+        let dir = TempDir::new("unborn-repo");
+        git_cmd(dir.path(), &["init", "-q"]).expect("git init");
+        assert!(head_tree_hash_in(dir.path()).is_err());
+    }
 
     // --- filesystem fixtures ------------------------------------------------
     //
