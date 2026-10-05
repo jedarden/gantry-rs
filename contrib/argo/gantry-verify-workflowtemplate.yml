@@ -38,6 +38,22 @@
 #                     (that is where an org image belongs), or send
 #                     builder-image per run from client config.
 #
+# Builder-image toolchain label: a builder image SHOULD carry an
+# org.gantry.toolchain OCI label declaring the Rust toolchain it builds
+# with, so the client can check parity before submitting (plan Component 5).
+# One string label, canonical JSON v1:
+#   {"schema_version":1,"channel":"<rustup channel>"}
+# labeled at image build time, e.g.:
+#   LABEL org.gantry.toolchain='{"schema_version":1,"channel":"stable"}'
+# This template never reads the label — parity is client-side (doctor's
+# builder-image check; the submit-path preflight compares it against the
+# repo's rust-toolchain.toml pin). A readable label contradicting the pin
+# is a doctor FAIL and a loud local fallback; an absent, malformed, or
+# unknown-schema-version label is warn-only — parity cannot be asserted,
+# submission proceeds, an unlabeled image is never refused. Wire format:
+# docs/notes/toolchain-label-payload.md; labeling how-to and the full
+# policy table: docs/notes/builder-image-labeling.md; parser: src/toolchain.rs.
+#
 # Remote contract: the remote executes exactly the argv the caller typed
 # (faithful-argv, plan Q-2). v1 intercepts `cargo test` only, so the step
 # runs `cargo test` + args-json. Two documented deviations, both
