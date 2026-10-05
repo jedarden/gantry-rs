@@ -10,7 +10,11 @@
 // - **In flight, the key is visible**: the claim's entry exists under
 //   `<state>/join/` while the run runs — one live attachment — and carries
 //   the submitted handle once the originator records it, so waiters have
-//   something to stream and wait.
+//   something to stream and wait. The clause holds across the whole running
+//   window, not at one sampled instant: the test polls from spawn until it
+//   releases the parked wait, and every sample re-reads the entry and
+//   counts the live attachments (entry documents whose owner pid is alive)
+//   — at least one, the originator — for the entire span.
 // - **Terminal, the key is gone**: the entry guard lives to the end of the
 //   run function, so the entry clears after the verdict.
 //
@@ -23,8 +27,9 @@
 // isolated HOME whose join table holds exactly one claim, so globbing
 // `<state>/join/*.run` observes it without duplicating the hash derivation
 // the production path already owns. (The entry file is the visibility
-// witness this child asserts; `attachment_count` reads the same state under
-// the claim lock.)
+// witness; the attachment count reads the same on-disk state the
+// production claim reader counts under the claim lock — an entry whose
+// owner pid is still alive.)
 //
 // Each test gets its own temp dirs and bakes paths into its mock scripts —
 // no shared state, no env vars — so the suite stays hermetic under parallel
@@ -45,9 +50,18 @@ const HANDLE: &str = "wf-origin-1";
 
 /// How long a test waits for the in-flight run to reach a checkpoint (entry
 /// visible, handle recorded). Generous: the child does real git work (gate,
-/// ref push) before the entry even exists, and CI boxes are slow; the 25 ms
-/// poll interval keeps the happy path fast.
+/// ref push) before the entry even exists, and CI boxes are slow; the
+/// [`POLL_INTERVAL`] keeps the happy path fast.
 const APPEAR_BUDGET: Duration = Duration::from_secs(30);
+
+/// Pause between samples of the in-flight key (the appear loop and the hold
+/// loop share it).
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long the hold phase keeps sampling the parked run before releasing
+/// it: long enough that many samples observe the key in flight, so the
+/// visibility proof spans a window rather than one instant.
+const HOLD_WINDOW: Duration = Duration::from_millis(400);
 
 /// A fixture: everything one intercepted run needs, isolated per test.
 ///
@@ -239,6 +253,32 @@ fn read_entry(path: &Path) -> serde_json::Value {
         .expect("entry document is JSON")
 }
 
+/// Live attachments on the fixture's claimed keys: entry documents whose
+/// owner pid is still alive — the count the production claim reader
+/// computes under the claim lock, observed here from the same on-disk
+/// state. The plan's in-flight clause is "attachment_count at least 1".
+fn live_attachments(home: &Path) -> usize {
+    entries(home)
+        .iter()
+        .filter(|path| {
+            let doc = read_entry(path);
+            doc["pid"]
+                .as_u64()
+                .is_some_and(|pid| pid_alive(u32::try_from(pid).unwrap_or(0)))
+        })
+        .count()
+}
+
+/// Whether `pid` names a live process: Linux reads `/proc/<pid>`; elsewhere
+/// the conservative answer is "alive" (the same probe shape the ledger's
+/// supersede check uses).
+fn pid_alive(pid: u32) -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
 /// Assert a run output is the Pass round trip: exit 0 and the verdict
 /// trailer on stderr (the trailer is the pipeline's own claim, so the test
 /// fails with evidence rather than a bare exit-code mismatch).
@@ -285,7 +325,7 @@ fn originator_entry_is_visible_in_flight_and_gone_after_terminal() {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(POLL_INTERVAL);
     };
 
     assert_eq!(
@@ -306,12 +346,43 @@ fn originator_entry_is_visible_in_flight_and_gone_after_terminal() {
         "the entry carries the originator's runlog run id"
     );
 
-    // Still live immediately before the verdict: the attach window spans
-    // the whole run, not just the dispatch.
-    assert_eq!(
-        entries(f.home.path()).len(),
-        1,
-        "the attachment stays visible while the run is in flight"
+    // Still live across the whole parked window: the run now sits in
+    // backend.wait (the mock wait parks until the release below), so the
+    // hold phase samples the key continuously until that release — the
+    // in-flight clause holds for the ENTIRE running window, not at one
+    // sampled instant. Every sample re-asserts the full visibility
+    // contract: the entry exists, it still carries the recorded handle, it
+    // still names the originator, and the attachment count stays at least
+    // one.
+    let hold_start = Instant::now();
+    let mut samples = 0;
+    while hold_start.elapsed() < HOLD_WINDOW {
+        let live = entries(f.home.path());
+        assert_eq!(
+            live.len(),
+            1,
+            "the claimed key stays visible for the whole in-flight window"
+        );
+        let doc = read_entry(&live[0]);
+        assert_eq!(
+            doc["handle"], HANDLE,
+            "the recorded handle stays in the entry in flight"
+        );
+        assert_eq!(
+            doc["pid"].as_u64(),
+            Some(u64::from(child.id())),
+            "the attachment names the originator for the whole window"
+        );
+        assert!(
+            live_attachments(f.home.path()) >= 1,
+            "attachment_count stays at least 1 (the originator) in flight"
+        );
+        samples += 1;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    assert!(
+        samples >= 2,
+        "the hold phase must span a real window; got {samples} samples"
     );
 
     // Terminal: release the parked wait and let the run reach its verdict.
