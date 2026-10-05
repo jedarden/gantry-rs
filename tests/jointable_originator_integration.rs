@@ -16,7 +16,10 @@
 //   counts the live attachments (entry documents whose owner pid is alive)
 //   — at least one, the originator — for the entire span.
 // - **Terminal, the key is gone**: the entry guard lives to the end of the
-//   run function, so the entry clears after the verdict.
+//   run function, so after the verdict both clearing clauses hold — no
+//   `.run` entry survives anywhere in the table, and the live-attachment
+//   count (the same on-disk measure the in-flight clause watches) is back
+//   to zero. No stale claim on the finished run's key.
 //
 // The parent's other acceptance clauses are their own split children, and
 // their properties are deliberately not asserted here: the dispatch-failure
@@ -390,10 +393,19 @@ fn originator_entry_is_visible_in_flight_and_gone_after_terminal() {
     let output = child.wait_with_output().expect("wait for gantry run");
     assert_pass(&output, "the originator run");
 
-    // The guard dropped with the run function: the key is closed.
+    // The guard dropped with the run function: the key is closed. Both
+    // clearing clauses are asserted on the same post-terminal state — the
+    // entry file is gone from the table, and the live-attachment count the
+    // production claim reader computes from that state is back to zero.
     assert!(
         entries(f.home.path()).is_empty(),
         "the entry clears once the run reaches a terminal verdict"
+    );
+    assert_eq!(
+        live_attachments(f.home.path()),
+        0,
+        "attachment_count returns to zero once the run reaches a terminal \
+         verdict (the Drop guard fired)"
     );
 
     // The verdict was waited out on the recorded handle — the same handle a
