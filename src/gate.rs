@@ -112,7 +112,9 @@ pub fn git_common_dir() -> Result<String, String> {
 ///
 /// The raw git output may be repo-relative (`.git` when run at the repo root);
 /// resolve it against `dir` before treating it as a filesystem path.
-fn git_common_dir_in(dir: &Path) -> Result<String, String> {
+/// Crate-visible: the JoinTable's EC-01 identity resolution reuses this
+/// rather than re-shelling the same probe.
+pub(crate) fn git_common_dir_in(dir: &Path) -> Result<String, String> {
     let output = git_output(dir, &["rev-parse", "--git-common-dir"])?;
 
     if !output.status.success() {
