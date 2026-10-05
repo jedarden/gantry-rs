@@ -262,6 +262,35 @@ fn check_enabled_with(gantry_local: Option<String>, gantry_on: Option<String>) -
     (true, "default: enabled".to_string())
 }
 
+/// Check whether concurrent-run dedup (plan Component 9, the JoinTable) is
+/// enabled, alongside the source that decided it — the same (decision,
+/// source) shape [`check_enabled`] returns so the run paths can record the
+/// kill switch the same way they record the master one.
+///
+/// Kill switch priority (highest to lowest):
+/// 1. GANTRY_JOIN=0 environment variable (dedup off for this invocation)
+/// 2. GANTRY_JOIN=1 environment variable (dedup on, overriding any future
+///    state-file knob)
+/// 3. Default: enabled
+///
+/// Dedup is an optimization, never a correctness requirement, so there is no
+/// state-file arm: an unset environment defaults to on, and a caller that
+/// must not dedup sets the variable explicitly.
+pub fn check_join_enabled() -> (bool, String) {
+    check_join_enabled_with(std::env::var("GANTRY_JOIN").ok())
+}
+
+/// [`check_join_enabled`] against an explicit kill-switch value instead of
+/// the process environment — the same de-globalization
+/// [`check_enabled_with`] applies.
+fn check_join_enabled_with(gantry_join: Option<String>) -> (bool, String) {
+    match gantry_join.as_deref() {
+        Some("0") => (false, "GANTRY_JOIN=0".to_string()),
+        Some("1") => (true, "GANTRY_JOIN=1".to_string()),
+        _ => (true, "default: enabled".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +342,33 @@ mod tests {
         let (enabled, source) = check_enabled_with(Some("1".to_string()), Some("1".to_string()));
         assert!(!enabled);
         assert_eq!(source, "GANTRY_LOCAL=1");
+    }
+
+    #[test]
+    fn test_check_join_enabled_kill_switch() {
+        // GANTRY_JOIN=0 is the dedup kill switch: the run path claims
+        // nothing and submits alongside, exactly as before Component 9.
+        let (enabled, source) = check_join_enabled_with(Some("0".to_string()));
+        assert!(!enabled);
+        assert_eq!(source, "GANTRY_JOIN=0");
+    }
+
+    #[test]
+    fn test_check_join_enabled_defaults_on() {
+        // Unset defaults to enabled — dedup is an optimization, not a
+        // requirement, and must not need configuration to engage.
+        let (enabled, source) = check_join_enabled_with(None);
+        assert!(enabled);
+        assert_eq!(source, "default: enabled");
+
+        // An explicit GANTRY_JOIN=1 says the same thing.
+        let (enabled, source) = check_join_enabled_with(Some("1".to_string()));
+        assert!(enabled);
+        assert_eq!(source, "GANTRY_JOIN=1");
+
+        // Any other value is not the kill spelling; the switch fails open.
+        let (enabled, _source) = check_join_enabled_with(Some("yes".to_string()));
+        assert!(enabled);
     }
 
     #[test]

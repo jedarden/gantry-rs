@@ -254,51 +254,52 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
 
     let _total_start = Instant::now();
 
-    // Step 3: Push epoch ref via RefPusher
-    let push_start = Instant::now();
-    let push_result = RefPusher::push(config, sha, &run_id);
-    let push_duration_ms = push_start.elapsed().as_millis() as u64;
-
-    if !push_result.success {
-        eprintln!("[gantry] push failed: {}", push_result.reason);
-        eprintln!("[gantry] verdict: PushFailed");
-
-        // Flight recorder (plan Component 7, bf-3mc): the push is where most
-        // infra flakes live (auth, remote reachability), so the bundle gathers
-        // the git state while it is still fresh.
-        // The pusher's reason is the raw response this stage surfaced, so it
-        // rides both the event line and the backend artifact channel.
-        record_infra_failure(
-            config,
+    // Plan Component 9: JoinTable concurrent-run dedup. An identical run —
+    // same remote, sha, tool, and args — already in flight is joined (waited
+    // on) instead of resubmitted, so a fleet of callers verifying one commit
+    // lands one workflow, not one per caller. The claim sits after the intent
+    // record (INV-1: every invocation, joiner included, writes its OPEN
+    // first) and before the push (a joiner pushes nothing: the originator's
+    // epoch ref already carries the sha). The originator's entry guard lives
+    // to the end of the function, so the key clears on every exit path — a
+    // failed dispatch can never wedge it shut. The key's command shape is the
+    // RunSpec's (plan Q-2), so an intercepted `cargo test` and
+    // `gantry run -- cargo test` dedup as one.
+    let (join_subcommand, join_args) = match args.split_first() {
+        Some((first, rest)) => (first.as_str(), rest),
+        None => ("", args),
+    };
+    let join_key =
+        crate::jointable::JoinKey::new(repo_url, sha, "cargo", join_subcommand, join_args);
+    // The dedup kill switch (GANTRY_JOIN=0), checked like the master one: a
+    // caller that must not dedup gets exactly the pre-Component-9 behavior —
+    // no claim, no state touched, submit alongside everything else.
+    let (join_enabled, join_source) = state::check_join_enabled();
+    let (join_entry, joined) = if !join_enabled {
+        eprintln!("[gantry] dedup kill switch active: {}", join_source);
+        eprintln!("[gantry] join: submitting without dedup");
+        (None, None)
+    } else {
+        match crate::jointable::claim(
+            crate::jointable::default_state_dir().as_deref(),
+            &join_key,
             &run_id,
-            "push",
-            &push_result.reason,
-            None,
-            Some(&push_result.reason),
-            None,
-        );
-
-        // Write verdict record if runlog is available (infra failure path)
-        if let Some(rl) = runlog {
-            let _ = write_local_verdict(
-                &rl,
-                run_id,
-                crate::runlog::Verdict::InfraFailure,
-                1,
-                Some(Durations {
-                    gate: gate_duration_ms,
-                    push: push_duration_ms,
-                    queue: 0,
-                    run: 0,
-                }),
-            );
+            crate::cli::backend_name(config.remote.backend.clone()),
+        ) {
+            crate::jointable::JoinDecision::Originator(entry) => (Some(entry), None),
+            crate::jointable::JoinDecision::Attach(attach) => {
+                eprintln!(
+                    "[gantry] joining in-flight run {} (identical run already dispatched as {})",
+                    attach.handle.handle, attach.originator_run_id
+                );
+                (None, Some(attach))
+            }
+            crate::jointable::JoinDecision::Unjoined => (None, None),
         }
+    };
 
-        // Return non-zero to indicate infra failure
-        return 1;
-    }
-
-    // Step 4: Submit to command backend
+    // Steps 3 and 4 (originator and unjoined): push the epoch ref, then
+    // submit; a joiner skips both and meets them in Step 5's shared wait.
     //
     // The backend runs the argv templates the config resolved (user layer —
     // the repo layer cannot set them, trust boundary S-2). Before
@@ -317,67 +318,144 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         }),
         None => CommandBackend::new(),
     };
-
-    // Extract tool, subcommand, and args from the intercepted command
-    // Phase 0.5: tool is always "cargo", cwd_rel is empty (repo root)
-    let tool = "cargo";
-    let cwd_rel = "";
-    let (subcommand, run_args) = match args.split_first() {
-        Some((first, rest)) => (first.as_str(), rest.to_vec()),
-        None => {
-            eprintln!("[gantry] error: no subcommand provided");
-            return 1;
+    // The joiner's claim survives into the shared wait tail: once the joined
+    // run lands a terminal verdict, the claim is what clears the in-flight
+    // entry ([`crate::jointable::AttachHandle::release`]) — the joiner-side
+    // reclaim that closes a key whose originator died before its guard could.
+    let mut joined_claim: Option<crate::jointable::AttachHandle> = None;
+    let (handle, push_duration_ms, queue_duration_ms) = match joined {
+        Some(attach) => {
+            // Joiner: the originator's epoch ref already carries the sha and
+            // its workflow is already running — push and submit would only
+            // duplicate them. The attach contract (plan Component 9:
+            // "stream + wait") starts with the stream: the live run's output
+            // flows here through the same handle the originator holds — the
+            // joiner's view of the bytes its wait below will land a verdict
+            // for. Best-effort per the backend trait's own contract: a
+            // failed stream never fails the join, the shared wait is
+            // authoritative.
+            let handle = attach.handle.clone();
+            joined_claim = Some(attach);
+            let mut stderr = std::io::stderr();
+            let _ = backend.stream_logs(&handle, &mut stderr);
+            (handle, 0, 0)
         }
-    };
+        None => {
+            // Step 3: Push epoch ref via RefPusher
+            let push_start = Instant::now();
+            let push_result = RefPusher::push(config, sha, &run_id);
+            let push_duration_ms = push_start.elapsed().as_millis() as u64;
 
-    let spec = RunSpec::new(tool, subcommand, run_args, repo_url, sha, cwd_rel);
+            if !push_result.success {
+                eprintln!("[gantry] push failed: {}", push_result.reason);
+                eprintln!("[gantry] verdict: PushFailed");
 
-    let handle = match backend.submit(&spec) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("[gantry] submit failed: {}", e);
-            eprintln!("[gantry] verdict: InfraFailure");
-
-            // Flight recorder (plan Component 7, bf-3mc): the backend's own
-            // error text is the raw response a post-mortem wants.
-            record_infra_failure(
-                config,
-                &run_id,
-                "submit",
-                &e.reason,
-                None,
-                Some(&e.reason),
-                None,
-            );
-
-            // Write verdict record if runlog is available (infra failure path)
-            if let Some(rl) = runlog {
-                let _ = write_local_verdict(
-                    &rl,
-                    run_id,
-                    crate::runlog::Verdict::InfraFailure,
-                    1,
-                    Some(Durations {
-                        gate: gate_duration_ms,
-                        push: push_duration_ms,
-                        queue: 0,
-                        run: 0,
-                    }),
+                // Flight recorder (plan Component 7, bf-3mc): the push is where most
+                // infra flakes live (auth, remote reachability), so the bundle gathers
+                // the git state while it is still fresh.
+                // The pusher's reason is the raw response this stage surfaced, so it
+                // rides both the event line and the backend artifact channel.
+                record_infra_failure(
+                    config,
+                    &run_id,
+                    "push",
+                    &push_result.reason,
+                    None,
+                    Some(&push_result.reason),
+                    None,
                 );
+
+                // Write verdict record if runlog is available (infra failure path)
+                if let Some(rl) = runlog {
+                    let _ = write_local_verdict(
+                        &rl,
+                        run_id,
+                        crate::runlog::Verdict::InfraFailure,
+                        1,
+                        Some(Durations {
+                            gate: gate_duration_ms,
+                            push: push_duration_ms,
+                            queue: 0,
+                            run: 0,
+                        }),
+                    );
+                }
+
+                // Return non-zero to indicate infra failure
+                return 1;
             }
 
-            // Return non-zero to indicate infra failure
-            return 1;
+            // Step 4: Submit to the configured backend.
+
+            // Extract tool, subcommand, and args from the intercepted command
+            // Phase 0.5: tool is always "cargo", cwd_rel is empty (repo root)
+            let tool = "cargo";
+            let cwd_rel = "";
+            let (subcommand, run_args) = match args.split_first() {
+                Some((first, rest)) => (first.as_str(), rest.to_vec()),
+                None => {
+                    eprintln!("[gantry] error: no subcommand provided");
+                    return 1;
+                }
+            };
+
+            let spec = RunSpec::new(tool, subcommand, run_args, repo_url, sha, cwd_rel);
+
+            let handle = match backend.submit(&spec) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("[gantry] submit failed: {}", e);
+                    eprintln!("[gantry] verdict: InfraFailure");
+
+                    // Flight recorder (plan Component 7, bf-3mc): the backend's own
+                    // error text is the raw response a post-mortem wants.
+                    record_infra_failure(
+                        config,
+                        &run_id,
+                        "submit",
+                        &e.reason,
+                        None,
+                        Some(&e.reason),
+                        None,
+                    );
+
+                    // Write verdict record if runlog is available (infra failure path)
+                    if let Some(rl) = runlog {
+                        let _ = write_local_verdict(
+                            &rl,
+                            run_id,
+                            crate::runlog::Verdict::InfraFailure,
+                            1,
+                            Some(Durations {
+                                gate: gate_duration_ms,
+                                push: push_duration_ms,
+                                queue: 0,
+                                run: 0,
+                            }),
+                        );
+                    }
+
+                    // Return non-zero to indicate infra failure
+                    return 1;
+                }
+            };
+
+            // Open the attach window (plan Component 9): from here until the
+            // entry guard drops, identical invocations join this handle
+            // instead of submitting their own.
+            if let Some(entry) = &join_entry {
+                entry.record_handle(&handle);
+            }
+
+            eprintln!("[gantry] submitted: {}", handle.handle);
+
+            let queue_end = Instant::now();
+            let queue_duration_ms =
+                (queue_end - push_start - std::time::Duration::from_millis(push_duration_ms))
+                    .as_millis() as u64;
+            (handle, push_duration_ms, queue_duration_ms)
         }
     };
-
-    eprintln!("[gantry] submitted: {}", handle.handle);
-
-    // Step 5: Wait for verdict
-    let queue_end = Instant::now();
-    let queue_duration_ms =
-        (queue_end - push_start - std::time::Duration::from_millis(push_duration_ms)).as_millis()
-            as u64;
 
     let run_start = Instant::now();
     let deadline = Instant::now() + backend_wait_deadline(config);
@@ -426,6 +504,15 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             return 1;
         }
     };
+
+    // Joiner-side reclaim (plan Component 9): the joined run reached a
+    // terminal verdict, so the in-flight entry's job is done — clear it even
+    // if the originator died before its guard could. The wait-failure arms
+    // above skip this deliberately: their run may still be in flight, and
+    // later identical callers should still find it.
+    if let Some(claim) = &joined_claim {
+        claim.release();
+    }
 
     // A terminal InfraFailure verdict is an infra exit like any other (plan
     // Component 7, bf-3mc): the run produced no usable verdict, so the bundle
