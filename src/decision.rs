@@ -39,14 +39,14 @@ fn joiner_dispatch(handle: &RunHandle) -> (RunHandle, u64, u64) {
 /// small seam makes the side-effect boundary testable without weakening the
 /// process-level recording-backend proof.
 fn dispatch_with_join<F>(
-    attached: Option<&RunHandle>,
+    attached: Option<&crate::jointable::AttachHandle>,
     originator_dispatch: F,
 ) -> Result<(RunHandle, u64, u64), i32>
 where
     F: FnOnce() -> Result<(RunHandle, u64, u64), i32>,
 {
     match attached {
-        Some(handle) => Ok(joiner_dispatch(handle)),
+        Some(attach) => Ok(joiner_dispatch(&attach.handle)),
         None => originator_dispatch(),
     }
 }
@@ -282,7 +282,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     // no matter what the user configured. `command: None` (backend = command
     // with no template table) keeps the default templates.
     let backend = build_backend(config);
-    let attached_handle = joined.as_ref().map(|attach| &attach.handle);
+    let attached_handle = joined.as_ref();
     let (handle, push_duration_ms, queue_duration_ms) =
         match dispatch_with_join(attached_handle, || {
             // Step 3: Push epoch ref via RefPusher
@@ -1471,9 +1471,10 @@ mod tests {
 
     mod dispatch_selection {
         use super::*;
+        use crate::jointable::{claim_in, JoinDecision, JoinKey};
         use std::cell::Cell;
 
-        /// A tiny backend recorder keeps this unit test on the same backend
+        /// A tiny backend recorder keeps these unit tests on the same backend
         /// contract as the command recording fixture: a submit is an
         /// observable side effect, not just a returned value.
         #[derive(Default)]
@@ -1496,15 +1497,21 @@ mod tests {
             }
         }
 
-        #[test]
-        fn attach_does_not_invoke_recorded_push_or_submit() {
-            let backend = RecordingBackend::default();
-            let pushes = Cell::new(0);
-            let originator = RunHandle::new("recorded-originator");
+        /// The two dispatch side effects are recorded separately: the epoch
+        /// ref push belongs to the client, while submit belongs to the
+        /// backend. This is the unit-sized equivalent of the integration
+        /// fixture's wire log.
+        #[derive(Default)]
+        struct RecordingDispatch {
+            backend: RecordingBackend,
+            epoch_ref_pushes: Cell<u32>,
+        }
 
-            let (handle, push_ms, queue_ms) = dispatch_with_join(Some(&originator), || {
-                pushes.set(pushes.get() + 1);
-                let submitted = backend
+        impl RecordingDispatch {
+            fn originator_dispatch(&self) -> Result<(RunHandle, u64, u64), i32> {
+                self.epoch_ref_pushes.set(self.epoch_ref_pushes.get() + 1);
+                let submitted = self
+                    .backend
                     .submit(&RunSpec::new(
                         "cargo",
                         "test",
@@ -1515,41 +1522,80 @@ mod tests {
                     ))
                     .map_err(|_| 1)?;
                 Ok((submitted, 17, 23))
-            })
-            .expect("attach dispatch succeeds");
+            }
+        }
 
-            assert_eq!(handle, originator);
-            assert_eq!((push_ms, queue_ms), (0, 0));
-            assert_eq!(pushes.get(), 0, "Attach must skip the epoch-ref push");
-            assert_eq!(backend.submits.get(), 0, "Attach must skip backend submit");
+        fn real_attach() -> (
+            tempfile::TempDir,
+            crate::jointable::JoinEntry,
+            crate::jointable::AttachHandle,
+        ) {
+            let state_dir = tempfile::tempdir().expect("create join state");
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let owner = match claim_in(state_dir.path(), &key, "originator", "recording")
+                .expect("originator claim succeeds")
+            {
+                JoinDecision::Originator(entry) => entry,
+                other => panic!("first claim must originate, got {other:?}"),
+            };
+            owner.record_handle(&RunHandle::new("recorded-originator"));
+
+            let attach = match claim_in(state_dir.path(), &key, "joiner", "recording")
+                .expect("joiner claim succeeds")
+            {
+                JoinDecision::Attach(attach) => attach,
+                other => panic!("handle-bearing claim must attach, got {other:?}"),
+            };
+            (state_dir, owner, attach)
         }
 
         #[test]
-        fn originator_and_unjoined_dispatch_keep_recorded_stages() {
-            for path in ["originator", "unjoined"] {
-                let backend = RecordingBackend::default();
-                let pushes = Cell::new(0);
-                let (handle, push_ms, queue_ms) = dispatch_with_join(None, || {
-                    pushes.set(pushes.get() + 1);
-                    let submitted = backend
-                        .submit(&RunSpec::new(
-                            "cargo",
-                            "test",
-                            Vec::new(),
-                            "file:///repo",
-                            "abc123",
-                            "",
-                        ))
-                        .map_err(|_| 1)?;
-                    Ok((submitted, 17, 23))
-                })
-                .unwrap_or_else(|error| panic!("{path} dispatch failed: {error}"));
+        fn attach_returns_originator_handle_and_skips_recorded_dispatch() {
+            let (_state_dir, _owner, attach) = real_attach();
+            let recorder = RecordingDispatch::default();
 
-                assert_eq!(handle, RunHandle::new("recorded-originator"));
-                assert_eq!((push_ms, queue_ms), (17, 23));
-                assert_eq!(pushes.get(), 1, "{path} must retain the push stage");
-                assert_eq!(backend.submits.get(), 1, "{path} must retain submit");
-            }
+            let (handle, push_ms, queue_ms) =
+                dispatch_with_join(Some(&attach), || recorder.originator_dispatch())
+                    .expect("attach dispatch succeeds");
+
+            assert_eq!(handle, RunHandle::new("recorded-originator"));
+            assert_eq!((push_ms, queue_ms), (0, 0));
+            assert_eq!(
+                recorder.epoch_ref_pushes.get(),
+                0,
+                "Attach must skip the epoch-ref push"
+            );
+            assert_eq!(
+                recorder.backend.submits.get(),
+                0,
+                "Attach must skip backend submit"
+            );
+        }
+
+        #[test]
+        fn originator_dispatch_keeps_recorded_stages() {
+            let recorder = RecordingDispatch::default();
+            let (handle, push_ms, queue_ms) =
+                dispatch_with_join(None, || recorder.originator_dispatch())
+                    .expect("originator dispatch succeeds");
+
+            assert_eq!(handle, RunHandle::new("recorded-originator"));
+            assert_eq!((push_ms, queue_ms), (17, 23));
+            assert_eq!(recorder.epoch_ref_pushes.get(), 1);
+            assert_eq!(recorder.backend.submits.get(), 1);
+        }
+
+        #[test]
+        fn unjoined_dispatch_keeps_recorded_stages() {
+            let recorder = RecordingDispatch::default();
+            let (handle, push_ms, queue_ms) =
+                dispatch_with_join(None, || recorder.originator_dispatch())
+                    .expect("unjoined dispatch succeeds");
+
+            assert_eq!(handle, RunHandle::new("recorded-originator"));
+            assert_eq!((push_ms, queue_ms), (17, 23));
+            assert_eq!(recorder.epoch_ref_pushes.get(), 1);
+            assert_eq!(recorder.backend.submits.get(), 1);
         }
     }
 
