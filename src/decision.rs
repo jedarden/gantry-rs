@@ -1478,58 +1478,7 @@ mod tests {
     mod dispatch_selection {
         use super::*;
         use crate::jointable::{claim, claim_in, JoinDecision, JoinKey};
-        use std::cell::Cell;
-
-        /// A tiny backend recorder keeps these unit tests on the same backend
-        /// contract as the command recording fixture: a submit is an
-        /// observable side effect, not just a returned value.
-        #[derive(Default)]
-        struct RecordingBackend {
-            submits: Cell<u32>,
-        }
-
-        impl RemoteBackend for RecordingBackend {
-            fn submit(&self, _spec: &RunSpec) -> Result<RunHandle, BackendError> {
-                self.submits.set(self.submits.get() + 1);
-                Ok(RunHandle::new("recorded-originator"))
-            }
-
-            fn wait(
-                &self,
-                _handle: &RunHandle,
-                _deadline: Instant,
-            ) -> Result<Verdict, BackendError> {
-                Ok(Verdict::Pass)
-            }
-        }
-
-        /// The two dispatch side effects are recorded separately: the epoch
-        /// ref push belongs to the client, while submit belongs to the
-        /// backend. This is the unit-sized equivalent of the integration
-        /// fixture's wire log.
-        #[derive(Default)]
-        struct RecordingDispatch {
-            backend: RecordingBackend,
-            epoch_ref_pushes: Cell<u32>,
-        }
-
-        impl RecordingDispatch {
-            fn originator_dispatch(&self) -> Result<(RunHandle, u64, u64), i32> {
-                self.epoch_ref_pushes.set(self.epoch_ref_pushes.get() + 1);
-                let submitted = self
-                    .backend
-                    .submit(&RunSpec::new(
-                        "cargo",
-                        "test",
-                        Vec::new(),
-                        "file:///repo",
-                        "abc123",
-                        "",
-                    ))
-                    .map_err(|_| 1)?;
-                Ok((submitted, 17, 23))
-            }
-        }
+        use crate::testutil::{RecordingDispatch, RECORDING_PUSH_MS, RECORDING_QUEUE_MS};
 
         fn real_attach() -> (
             tempfile::TempDir,
@@ -1584,19 +1533,19 @@ mod tests {
 
             let (handle, push_ms, queue_ms) =
                 dispatch_for_decision(JoinDecision::Attach(attach), || {
-                    recorder.originator_dispatch()
+                    recorder.dispatch_originator()
                 })
                 .expect("attach dispatch succeeds");
 
             assert_eq!(handle, RunHandle::new("recorded-originator"));
             assert_eq!((push_ms, queue_ms), (0, 0));
             assert_eq!(
-                recorder.epoch_ref_pushes.get(),
+                recorder.epoch_ref_pushes(),
                 0,
                 "Attach must skip the epoch-ref push"
             );
             assert_eq!(
-                recorder.backend.submits.get(),
+                recorder.backend.submissions().len(),
                 0,
                 "Attach must skip backend submit"
             );
@@ -1611,13 +1560,16 @@ mod tests {
             assert!(matches!(&decision, JoinDecision::Originator(_)));
             let recorder = RecordingDispatch::default();
             let (handle, push_ms, queue_ms) =
-                dispatch_for_decision(decision, || recorder.originator_dispatch())
+                dispatch_for_decision(decision, || recorder.dispatch_originator())
                     .expect("originator dispatch succeeds");
 
             assert_eq!(handle, RunHandle::new("recorded-originator"));
-            assert_eq!((push_ms, queue_ms), (17, 23));
-            assert_eq!(recorder.epoch_ref_pushes.get(), 1);
-            assert_eq!(recorder.backend.submits.get(), 1);
+            assert_eq!((push_ms, queue_ms), (RECORDING_PUSH_MS, RECORDING_QUEUE_MS));
+            assert_eq!(recorder.epoch_ref_pushes(), 1);
+            let submissions = recorder.backend.submissions();
+            assert_eq!(submissions.len(), 1);
+            assert_eq!(submissions[0].handle, handle);
+            assert_eq!(submissions[0].spec.subcommand, "test");
         }
 
         #[test]
@@ -1627,13 +1579,13 @@ mod tests {
             assert!(matches!(&decision, JoinDecision::Unjoined));
             let recorder = RecordingDispatch::default();
             let (handle, push_ms, queue_ms) =
-                dispatch_for_decision(decision, || recorder.originator_dispatch())
+                dispatch_for_decision(decision, || recorder.dispatch_originator())
                     .expect("unjoined dispatch succeeds");
 
             assert_eq!(handle, RunHandle::new("recorded-originator"));
-            assert_eq!((push_ms, queue_ms), (17, 23));
-            assert_eq!(recorder.epoch_ref_pushes.get(), 1);
-            assert_eq!(recorder.backend.submits.get(), 1);
+            assert_eq!((push_ms, queue_ms), (RECORDING_PUSH_MS, RECORDING_QUEUE_MS));
+            assert_eq!(recorder.epoch_ref_pushes(), 1);
+            assert_eq!(recorder.backend.submissions().len(), 1);
         }
     }
 

@@ -7,6 +7,118 @@
 //! (`check_git_gate_in`, `RefPusher::push_in`, `Config::repo_config_path_in`),
 //! and this module provides the tripwire that keeps it that way.
 
+use crate::backend::{BackendError, RemoteBackend, RunHandle, RunSpec, Verdict};
+use std::cell::{Cell, RefCell};
+use std::time::Instant;
+
+/// Deterministic stage values for decision-pipeline unit tests. A normal
+/// originator/unjoined dispatch carries these nonzero values; Attach supplies
+/// `(0, 0)` because it ran neither stage.
+pub(crate) const RECORDING_PUSH_MS: u64 = 17;
+pub(crate) const RECORDING_QUEUE_MS: u64 = 23;
+
+/// One request observed by [`RecordingBackend`], including the opaque handle
+/// it returned to the decision pipeline.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RecordedSubmission {
+    pub(crate) spec: RunSpec,
+    pub(crate) handle: RunHandle,
+}
+
+/// Deterministic in-process backend for decision-pipeline tests. It records
+/// submissions and waits without spawning a process or touching the network.
+#[derive(Debug)]
+pub(crate) struct RecordingBackend {
+    handle: RunHandle,
+    submissions: RefCell<Vec<RecordedSubmission>>,
+}
+
+impl Default for RecordingBackend {
+    fn default() -> Self {
+        Self::new("recorded-originator")
+    }
+}
+
+impl RecordingBackend {
+    pub(crate) fn new(handle: &str) -> Self {
+        Self {
+            handle: RunHandle::new(handle),
+            submissions: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn submissions(&self) -> Vec<RecordedSubmission> {
+        self.submissions.borrow().clone()
+    }
+}
+
+impl RemoteBackend for RecordingBackend {
+    fn submit(&self, spec: &RunSpec) -> Result<RunHandle, BackendError> {
+        let handle = self.handle.clone();
+        self.submissions.borrow_mut().push(RecordedSubmission {
+            spec: spec.clone(),
+            handle: handle.clone(),
+        });
+        Ok(handle)
+    }
+
+    fn wait(&self, _handle: &RunHandle, _deadline: Instant) -> Result<Verdict, BackendError> {
+        Ok(Verdict::Pass)
+    }
+}
+
+/// Records both client-side epoch-ref pushes and backend submissions while
+/// returning the stage durations a normal dispatch would stamp in its runlog.
+#[derive(Debug)]
+pub(crate) struct RecordingDispatch {
+    pub(crate) backend: RecordingBackend,
+    epoch_ref_pushes: Cell<u32>,
+    push_duration_ms: u64,
+    queue_duration_ms: u64,
+}
+
+impl Default for RecordingDispatch {
+    fn default() -> Self {
+        Self::new(RECORDING_PUSH_MS, RECORDING_QUEUE_MS)
+    }
+}
+
+impl RecordingDispatch {
+    pub(crate) fn new(push_duration_ms: u64, queue_duration_ms: u64) -> Self {
+        Self::with_handle("recorded-originator", push_duration_ms, queue_duration_ms)
+    }
+
+    pub(crate) fn with_handle(handle: &str, push_duration_ms: u64, queue_duration_ms: u64) -> Self {
+        Self {
+            backend: RecordingBackend::new(handle),
+            epoch_ref_pushes: Cell::new(0),
+            push_duration_ms,
+            queue_duration_ms,
+        }
+    }
+
+    pub(crate) fn dispatch_originator(&self) -> Result<(RunHandle, u64, u64), i32> {
+        self.epoch_ref_pushes
+            .set(self.epoch_ref_pushes.get().saturating_add(1));
+        let submitted = self
+            .backend
+            .submit(&RunSpec::new(
+                "cargo",
+                "test",
+                Vec::new(),
+                "file:///repo",
+                "abc123",
+                "",
+            ))
+            .map_err(|_| 1)?;
+        Ok((submitted, self.push_duration_ms, self.queue_duration_ms))
+    }
+
+    pub(crate) fn epoch_ref_pushes(&self) -> u32 {
+        self.epoch_ref_pushes.get()
+    }
+}
+
 /// The process working directory as it was when the first test looked.
 ///
 /// Tests assert the cwd still equals this snapshot after running, which fails
