@@ -12,3 +12,6 @@
 
 # Journals
 *.journal
+
+# NEEDLE execution traces are runtime evidence, not bead checkpoints.
+traces/
