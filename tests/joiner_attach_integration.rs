@@ -57,6 +57,13 @@ const EXIT_WAIT: Duration = Duration::from_secs(120);
 /// forged its own run rather than riding the originator's.
 const ORIGINATOR_HANDLE: &str = "handle-originator";
 
+/// The recording fixture deliberately sleeps for 20 ms in both dispatch
+/// stages. Keep the assertion below comfortably below that anchor so scheduler
+/// jitter cannot make the test flaky, while still catching a normal-path
+/// regression that records Attach's zero durations (or another placeholder)
+/// for an originator or unjoined invocation.
+const MIN_RECORDED_DISPATCH_MS: u64 = 10;
+
 /// Everything the scenario needs: the fixture repo, the isolated HOME both
 /// invocations share (one join table between them), the recording executor
 /// and its files, and the join dir the assertions read.
@@ -386,15 +393,17 @@ fn assert_remote_dispatch_record(record: &serde_json::Value, role: &str) {
         durations["push"]
             .as_u64()
             .expect("push duration is numeric")
-            > 0,
-        "{role} push duration must retain the observed RefPusher stage: {record}"
+            >= MIN_RECORDED_DISPATCH_MS,
+        "{role} push duration must retain the measured RefPusher stage (at least
+         {MIN_RECORDED_DISPATCH_MS} ms): {record}"
     );
     assert!(
         durations["queue"]
             .as_u64()
             .expect("queue duration is numeric")
-            > 0,
-        "{role} queue duration must retain the observed submit stage: {record}"
+            >= MIN_RECORDED_DISPATCH_MS,
+        "{role} queue duration must retain the measured submit stage (at least
+         {MIN_RECORDED_DISPATCH_MS} ms): {record}"
     );
     assert!(
         durations["run"].as_u64().expect("run duration is numeric") > 0,
