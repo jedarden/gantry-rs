@@ -247,10 +247,10 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     // caller that must not dedup gets exactly the pre-Component-9 behavior —
     // no claim, no state touched, submit alongside everything else.
     let (join_enabled, join_source) = state::check_join_enabled();
-    let (join_entry, joined) = if !join_enabled {
+    let (join_entry, joined, attached_dispatch) = if !join_enabled {
         eprintln!("[gantry] dedup kill switch active: {}", join_source);
         eprintln!("[gantry] join: submitting without dedup");
-        (None, None)
+        (None, None, None)
     } else {
         match crate::jointable::claim(
             crate::jointable::default_state_dir().as_deref(),
@@ -258,15 +258,20 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             &run_id,
             crate::cli::backend_name(config.remote.backend.clone()),
         ) {
-            crate::jointable::JoinDecision::Originator(entry) => (Some(entry), None),
+            crate::jointable::JoinDecision::Originator(entry) => (Some(entry), None, None),
             crate::jointable::JoinDecision::Attach(attach) => {
                 eprintln!(
                     "[gantry] joining in-flight run {} (identical run already dispatched as {})",
                     attach.handle.handle, attach.originator_run_id
                 );
-                (None, Some(attach))
+                // The originator already pushed the epoch ref and submitted
+                // this run. Consume its handle at the claim boundary so the
+                // joiner enters the shared wait with no dispatch-stage time;
+                // the lazy normal path below is never evaluated for Attach.
+                let dispatch = (attach.handle.clone(), 0, 0);
+                (None, Some(attach), Some(dispatch))
             }
-            crate::jointable::JoinDecision::Unjoined => (None, None),
+            crate::jointable::JoinDecision::Unjoined => (None, None, None),
         }
     };
 
@@ -282,9 +287,9 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     // no matter what the user configured. `command: None` (backend = command
     // with no template table) keeps the default templates.
     let backend = build_backend(config);
-    let attached_handle = joined.as_ref();
-    let (handle, push_duration_ms, queue_duration_ms) =
-        match dispatch_with_join(attached_handle, || {
+    let (handle, push_duration_ms, queue_duration_ms) = match attached_dispatch {
+        Some(dispatch) => dispatch,
+        None => match dispatch_with_join(None, || {
             // Step 3: Push epoch ref via RefPusher
             let push_start = Instant::now();
             let push_result = RefPusher::push(config, sha, &run_id);
@@ -401,7 +406,8 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         }) {
             Ok(dispatch) => dispatch,
             Err(code) => return code,
-        };
+        },
+    };
 
     let run_start = Instant::now();
     let deadline = Instant::now() + backend_wait_deadline(config);
