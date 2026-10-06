@@ -134,6 +134,10 @@ fn fixture() -> JoinFixture {
 
     let bare = root_path.join("remote.git");
     git(&root_path, &["init", "--bare", bare.to_str().unwrap()]);
+    // Keep the push duration observable at the millisecond precision used by
+    // the runlog. This hook is the recording fixture's push-side clock
+    // anchor; the ref count below remains the actual push assertion.
+    write_executable(&bare.join("hooks/pre-receive"), "#!/bin/sh\nsleep 0.02\n");
     git(&fixture, &["init"]);
     git(&fixture, &["config", "user.name", "Joiner Fixture"]);
     git(
@@ -175,7 +179,7 @@ fn fixture() -> JoinFixture {
              BARRIER={}\n\
              printf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> \"$REC\"\n\
              case \"$1\" in\n\
-             submit) echo '{}' ;;\n\
+             submit) sleep 0.02; echo '{}' ;;\n\
              wait)\n\
                n=0\n\
                while [ ! -f \"$BARRIER\" ] && [ \"$n\" -lt 600 ]; do\n\
@@ -217,24 +221,37 @@ fn fixture() -> JoinFixture {
 /// is what makes the run intercepted at all — an absent argv[1] is "cargo
 /// with no subcommand", which falls through to passthrough before any
 /// pipeline stage (and any claim site) is reached.
-fn spawn_run(f: &JoinFixture) -> Child {
-    Command::new(&f.cargo_link)
+fn spawn_run_with_join(f: &JoinFixture, dedup: bool) -> Child {
+    let mut command = Command::new(&f.cargo_link);
+    command
         .current_dir(&f.fixture)
         .arg("test")
         .env("GANTRY_EXEC_PATH", f.executor.to_str().unwrap())
         .env("HOME", f.home.to_str().unwrap())
-        // The dedup switch must be at its default (enabled) for the joiner
-        // path to arm, and no XDG override may steer the user config layer
-        // away from the isolated HOME.
+        // No XDG override may steer the user config layer away from the
+        // isolated HOME. A disabled dedup switch exercises the existing
+        // unjoined dispatch path while keeping the same recording backend.
         .env_remove("GANTRY_JOIN")
         .env_remove("GANTRY_ON")
         .env_remove("GANTRY_LOCAL")
         .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_STATE_HOME");
+    if !dedup {
+        command.env("GANTRY_JOIN", "0");
+    }
+    command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn intercepted run")
+}
+
+fn spawn_run(f: &JoinFixture) -> Child {
+    spawn_run_with_join(f, true)
+}
+
+fn spawn_unjoined_run(f: &JoinFixture) -> Child {
+    spawn_run_with_join(f, false)
 }
 
 /// Read the recording file, if it exists yet.
@@ -340,6 +357,126 @@ fn finish(child: Child, expected: i32, role: &str) -> String {
             }
         }
     }
+}
+
+/// Read the terminal records from the fixture's append-only runlog.
+fn verdict_records(f: &JoinFixture) -> Vec<serde_json::Value> {
+    fs::read_to_string(f.home.join(".local/state/gantry/runs.jsonl"))
+        .expect("the shared runlog exists under the isolated HOME")
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|record: &serde_json::Value| record["rec"] == "verdict")
+        .collect()
+}
+
+/// Originators and unjoined callers both run the remote dispatch stages. The
+/// recording fixture makes each stage measurable: the bare-remote ref proves
+/// `RefPusher::push`, the executor wire proves backend `submit`, and the
+/// deliberate stage delays keep the millisecond durations from collapsing to
+/// zero on a fast local machine.
+fn assert_remote_dispatch_record(record: &serde_json::Value, role: &str) {
+    assert_eq!(record["ran"], "remote", "{role} must run remotely");
+    assert_eq!(record["verdict"], "pass", "{role} must receive Pass");
+    let durations = &record["durations_ms"];
+    assert!(
+        durations.is_object(),
+        "{role} must record durations: {record}"
+    );
+    assert!(
+        durations["push"]
+            .as_u64()
+            .expect("push duration is numeric")
+            > 0,
+        "{role} push duration must retain the observed RefPusher stage: {record}"
+    );
+    assert!(
+        durations["queue"]
+            .as_u64()
+            .expect("queue duration is numeric")
+            > 0,
+        "{role} queue duration must retain the observed submit stage: {record}"
+    );
+    assert!(
+        durations["run"].as_u64().expect("run duration is numeric") > 0,
+        "{role} run duration must be recorded: {record}"
+    );
+}
+
+/// A normal claim makes this invocation the originator. Pin the pre-attach
+/// behavior that the later Attach early return must leave intact: one pushed
+/// epoch ref, one backend submit, and the remote-stage durations in the ledger.
+#[test]
+fn originator_records_push_submit_and_durations() {
+    let f = fixture();
+    let originator = spawn_run(&f);
+
+    let submitted = wait_for_recorded_line(&f, "submit ", RECORD_WAIT);
+    assert_eq!(
+        submitted
+            .iter()
+            .filter(|line| line.starts_with("submit "))
+            .count(),
+        1,
+        "the originator submits exactly once: {submitted:?}"
+    );
+    assert_eq!(
+        remote_epoch_refs(&f).len(),
+        1,
+        "the originator pushes exactly one epoch ref"
+    );
+    wait_until(
+        || recorded(&f).iter().any(|line| line.starts_with("wait ")),
+        ATTACH_WAIT,
+        "originator never reached its backend wait",
+    );
+    // Ensure the run timer also crosses the runlog's millisecond boundary.
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&f.barrier, "go").expect("raise barrier");
+    finish(originator, 0, "originator");
+
+    let verdicts = verdict_records(&f);
+    assert_eq!(verdicts.len(), 1, "one originator verdict: {verdicts:?}");
+    assert_remote_dispatch_record(&verdicts[0], "originator");
+}
+
+/// Disabling dedup leaves the intercepted pipeline unjoined. Pin that path's
+/// existing dispatch contract independently of the Attach case: it still
+/// pushes and submits, and it still records the corresponding durations.
+#[test]
+fn unjoined_run_records_push_submit_and_durations() {
+    let f = fixture();
+    let unjoined = spawn_unjoined_run(&f);
+
+    let submitted = wait_for_recorded_line(&f, "submit ", RECORD_WAIT);
+    assert_eq!(
+        submitted
+            .iter()
+            .filter(|line| line.starts_with("submit "))
+            .count(),
+        1,
+        "the unjoined invocation submits exactly once: {submitted:?}"
+    );
+    assert_eq!(
+        remote_epoch_refs(&f).len(),
+        1,
+        "the unjoined invocation pushes exactly one epoch ref"
+    );
+    assert!(
+        in_flight_entry(&f).is_none(),
+        "an unjoined invocation must not create a join-table entry"
+    );
+    wait_until(
+        || recorded(&f).iter().any(|line| line.starts_with("wait ")),
+        ATTACH_WAIT,
+        "unjoined invocation never reached its backend wait",
+    );
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&f.barrier, "go").expect("raise barrier");
+    finish(unjoined, 0, "unjoined invocation");
+
+    let verdicts = verdict_records(&f);
+    assert_eq!(verdicts.len(), 1, "one unjoined verdict: {verdicts:?}");
+    assert_remote_dispatch_record(&verdicts[0], "unjoined invocation");
 }
 
 /// Mainline: originator live, joiner attaches, nothing is pushed or
@@ -499,6 +636,7 @@ fn joiner_skips_push_and_submit_riding_the_originators_handle() {
         originator_record["handle"], ORIGINATOR_HANDLE,
         "the originator's record carries the same handle it submitted"
     );
+    assert_remote_dispatch_record(originator_record, "originator");
     let joiner_durations = &joiner_record["durations_ms"];
     assert_eq!(
         joiner_durations["push"], 0,
