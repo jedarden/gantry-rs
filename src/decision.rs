@@ -1471,7 +1471,7 @@ mod tests {
 
     mod dispatch_selection {
         use super::*;
-        use crate::jointable::{claim_in, JoinDecision, JoinKey};
+        use crate::jointable::{claim, claim_in, JoinDecision, JoinKey};
         use std::cell::Cell;
 
         /// A tiny backend recorder keeps these unit tests on the same backend
@@ -1549,14 +1549,38 @@ mod tests {
             (state_dir, owner, attach)
         }
 
+        /// Exercise the same decision variants that `run_remote` receives
+        /// from the JoinTable. Originators and unjoined invocations both
+        /// retain the normal dispatch closure; only Attach gets the
+        /// short-circuit. Keeping this adapter in the regression tests makes
+        /// it impossible for both normal paths to accidentally collapse into
+        /// an unexamined `None` fixture.
+        fn dispatch_for_decision<F>(
+            decision: JoinDecision,
+            originator_dispatch: F,
+        ) -> Result<(RunHandle, u64, u64), i32>
+        where
+            F: FnOnce() -> Result<(RunHandle, u64, u64), i32>,
+        {
+            match decision {
+                JoinDecision::Attach(attach) => {
+                    dispatch_with_join(Some(&attach), originator_dispatch)
+                }
+                JoinDecision::Originator(_entry) => dispatch_with_join(None, originator_dispatch),
+                JoinDecision::Unjoined => dispatch_with_join(None, originator_dispatch),
+            }
+        }
+
         #[test]
         fn attach_returns_originator_handle_and_skips_recorded_dispatch() {
             let (_state_dir, _owner, attach) = real_attach();
             let recorder = RecordingDispatch::default();
 
             let (handle, push_ms, queue_ms) =
-                dispatch_with_join(Some(&attach), || recorder.originator_dispatch())
-                    .expect("attach dispatch succeeds");
+                dispatch_for_decision(JoinDecision::Attach(attach), || {
+                    recorder.originator_dispatch()
+                })
+                .expect("attach dispatch succeeds");
 
             assert_eq!(handle, RunHandle::new("recorded-originator"));
             assert_eq!((push_ms, queue_ms), (0, 0));
@@ -1574,9 +1598,14 @@ mod tests {
 
         #[test]
         fn originator_dispatch_keeps_recorded_stages() {
+            let state_dir = tempfile::tempdir().expect("create join state");
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let decision = claim_in(state_dir.path(), &key, "originator", "recording")
+                .expect("originator claim succeeds");
+            assert!(matches!(&decision, JoinDecision::Originator(_)));
             let recorder = RecordingDispatch::default();
             let (handle, push_ms, queue_ms) =
-                dispatch_with_join(None, || recorder.originator_dispatch())
+                dispatch_for_decision(decision, || recorder.originator_dispatch())
                     .expect("originator dispatch succeeds");
 
             assert_eq!(handle, RunHandle::new("recorded-originator"));
@@ -1587,9 +1616,12 @@ mod tests {
 
         #[test]
         fn unjoined_dispatch_keeps_recorded_stages() {
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let decision = claim(None, &key, "unjoined", "recording");
+            assert!(matches!(&decision, JoinDecision::Unjoined));
             let recorder = RecordingDispatch::default();
             let (handle, push_ms, queue_ms) =
-                dispatch_with_join(None, || recorder.originator_dispatch())
+                dispatch_for_decision(decision, || recorder.originator_dispatch())
                     .expect("unjoined dispatch succeeds");
 
             assert_eq!(handle, RunHandle::new("recorded-originator"));
