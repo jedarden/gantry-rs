@@ -10,14 +10,21 @@
 // - systemd-run scope creation probe
 // - Git identity check
 // - Orphaned intent detection from runlog
+// - E2E canary (doctor --e2e): one loopback round trip through the real
+//   RefPusher → executor → verdict pipeline on a self-contained fixture
 // - Overall health summary
 
+use crate::backend::command::{CommandBackend, CommandConfig};
+use crate::backend::{RemoteBackend, RunSpec, Verdict};
 use crate::config::Config;
+use crate::refs::RefPusher;
 use crate::runlog::RunLog;
 use crate::shim::{resolve_real_binary, shim_dir};
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Result of a doctor check.
 #[derive(Debug, Clone, PartialEq)]
@@ -475,20 +482,393 @@ pub fn run_all_checks() -> HealthStatus {
     health
 }
 
+// ============================================================================
+// E2E canary — `gantry doctor --e2e` (plan §8)
+// ============================================================================
+
+/// The reference executor (contrib/gantry-exec.sh), compiled into the binary.
+///
+/// `gantry doctor --e2e` must run on an installed box where no source checkout
+/// — and no `./contrib` — exists (plan DD-6, single static binary). This is the
+/// same file the shipped command-template defaults invoke; embedding it at
+/// build time keeps one source of truth and makes the canary self-contained.
+/// Shared with [`crate::cli::init`], which installs this same copy on an
+/// onboarding target — the script the preset then invokes is the script the
+/// canary ran.
+pub(crate) const E2E_EXECUTOR_SCRIPT: &str = include_str!("../contrib/gantry-exec.sh");
+
+/// The canary fixture's Cargo.toml: a minimal crate with zero dependencies, so
+/// the executor's `cargo test` needs no crates.io access and no warm cache.
+const CANARY_CARGO_TOML: &str = "\
+[package]
+name = \"gantry-e2e-canary\"
+version = \"0.1.0\"
+edition = \"2021\"
+";
+
+/// The canary fixture's single known-good test — the content the round trip
+/// ships. A suite that actually compiles and runs (rather than a help flag)
+/// is the smallest honest proof that push → clone → build → verdict works.
+const CANARY_LIB_RS: &str = "\
+//! `gantry doctor --e2e` canary fixture: a minimal crate with one
+//! known-good test. The canary pushes this content through the real
+//! RefPusher and backend and expects a Pass verdict back.
+
+#[cfg(test)]
+mod canary {
+    #[test]
+    fn round_trip_reaches_the_toolchain() {
+        assert_eq!(2 + 2, 4);
+    }
+}
+";
+
+/// Tunables for the e2e canary round trip.
+///
+/// Production callers use [`E2eCanaryOptions::default()`]; the field exists so
+/// integration tests can aim a known-bad component at a specific leg and
+/// assert the failure names that leg.
+#[derive(Debug, Clone, Default)]
+pub struct E2eCanaryOptions {
+    /// The cargo the loopback executor runs. `None` resolves the real
+    /// toolchain by the shim rules ([`resolve_real_binary`]) — honoring any
+    /// configured `real_binary` override — so the executor never recurses
+    /// into a gantry shim; a resolution failure degrades to the executor's
+    /// own PATH default ("cargo").
+    pub exec_cargo: Option<PathBuf>,
+}
+
 /// Run end-to-end canary test (doctor --e2e).
 ///
-/// Pushes a tiny fixture ref through the real pipeline and asserts the expected pass verdict.
-/// This validates the full pipeline is actually working on the operator's schedule.
+/// One full gantry round trip through the loopback backend (plan §8): a tiny
+/// known-good fixture commit is pushed through the real [`RefPusher`] to a
+/// throwaway bare remote, the embedded reference executor clones that epoch
+/// ref and runs the fixture's `cargo test`, and the command-backend wait maps
+/// the result onto the verdict ladder — push → clone → contract → verdict,
+/// exactly the pipeline a real offloaded run takes, with no external service
+/// involved. The fixture lives under the system temp dir and is removed when
+/// the canary finishes.
+///
+/// `Err` names the leg that failed (`fixture`, `push`, `submit`, `wait`, or
+/// `verdict`) with an actionable message; `gantry doctor --e2e` exits non-zero
+/// with that message (plan §8: "one command answers 'is the pipeline actually
+/// working'").
 pub fn run_e2e_test() -> Result<String, String> {
-    // TODO: Implement e2e canary test
-    // This requires:
-    // 1. Create a trivial test command (cargo --version)
-    // 2. Push it through RefPusher
-    // 3. Submit to backend
-    // 4. Wait for verdict
-    // 5. Assert pass verdict
+    let config = Config::load().config;
+    run_e2e_canary(&config, &E2eCanaryOptions::default())
+}
 
-    Err("E2E test not yet implemented".to_string())
+/// [`run_e2e_test`] against an explicit config and options.
+///
+/// The canary always rides the loopback backend — the embedded reference
+/// executor against the fixture's own bare remote — regardless of the
+/// configured backend: an argo-configured install would otherwise turn a
+/// doctor check into a cluster submission, and the canary's question ("is the
+/// gantry pipeline itself working?") is answerable entirely on this box. The
+/// config still steers what it truthfully can: the fixture remote is added
+/// under the configured `ci_remote` name, the epoch ref follows the
+/// configured `push_mode`, and the wait deadline is [`Config::command_deadline`].
+pub fn run_e2e_canary(config: &Config, opts: &E2eCanaryOptions) -> Result<String, String> {
+    let started = Instant::now();
+
+    // Leg: fixture — loopback remote, known-good commit, executor preset.
+    let fixture = build_canary_fixture(config, opts).map_err(|e| {
+        e2e_failure(
+            "fixture",
+            &format!(
+                "{e} — the canary builds a throwaway git repo and executor \
+                 under {}; disk space and temp-dir permissions are the usual causes",
+                std::env::temp_dir().display()
+            ),
+        )
+    })?;
+
+    let outcome = drive_canary_round_trip(config, &fixture, started);
+    // The fixture is throwaway by construction; a failed round trip must not
+    // leave it behind either. Best effort — a stranded temp dir is cosmetic.
+    let _ = fs::remove_dir_all(&fixture.root);
+    outcome
+}
+
+/// The built canary fixture: everything the round-trip legs need, under one
+/// throwaway root.
+struct CanaryFixture {
+    /// Temp root — removed when the canary finishes.
+    root: PathBuf,
+    /// Work repo holding the known-good commit (the RefPusher runs here).
+    repo_dir: PathBuf,
+    /// The bare loopback remote, as a URL the executor can fetch.
+    remote_url: String,
+    /// The known-good commit the round trip ships.
+    sha: String,
+    /// The command-template backend wired to the fixture's executor wrapper.
+    backend: CommandBackend,
+}
+
+/// Leg "fixture": build the loopback world — bare remote, known-good cargo
+/// fixture commit, and the embedded executor with a wrapper pinning its
+/// private state dir and cargo binary.
+fn build_canary_fixture(config: &Config, opts: &E2eCanaryOptions) -> Result<CanaryFixture, String> {
+    let root = std::env::temp_dir().join(format!(
+        "gantry-e2e-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+
+    // Loopback remote: a bare repo the RefPusher pushes epoch refs to and the
+    // executor fetches them from — the real git transport, no service.
+    let remote_dir = root.join("remote.git");
+    git_in(
+        &root,
+        &[
+            "init",
+            "--bare",
+            "--quiet",
+            &remote_dir.display().to_string(),
+        ],
+    )?;
+    let remote_url = format!("file://{}", remote_dir.display());
+
+    // Work repo with the known-good fixture commit.
+    let repo_dir = root.join("repo");
+    git_in(&root, &["init", "--quiet", &repo_dir.display().to_string()])?;
+    git_in(&repo_dir, &["config", "user.name", "gantry doctor --e2e"])?;
+    git_in(&repo_dir, &["config", "user.email", "gantry-e2e@localhost"])?;
+    fs::write(repo_dir.join("Cargo.toml"), CANARY_CARGO_TOML)
+        .map_err(|e| format!("cannot write fixture Cargo.toml: {e}"))?;
+    fs::create_dir_all(repo_dir.join("src"))
+        .map_err(|e| format!("cannot write fixture src/: {e}"))?;
+    fs::write(repo_dir.join("src/lib.rs"), CANARY_LIB_RS)
+        .map_err(|e| format!("cannot write fixture src/lib.rs: {e}"))?;
+    git_in(&repo_dir, &["add", "."])?;
+    git_in(
+        &repo_dir,
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "gantry doctor --e2e canary fixture",
+        ],
+    )?;
+    let sha = git_in(&repo_dir, &["rev-parse", "HEAD"])?;
+    // Under the configured remote name, so the canary exercises the same
+    // push target name a real run uses.
+    git_in(
+        &repo_dir,
+        &["remote", "add", &config.remote.ci_remote, &remote_url],
+    )?;
+
+    // The reference executor, materialized from the embedded copy, plus a
+    // wrapper that pins the two knobs the canary owns: a private run-state
+    // dir (never the shared /tmp/gantry-runs default) and the cargo binary
+    // (shim-resolved, so a PATH-shimmed box does not recurse).
+    let executor = root.join("gantry-exec.sh");
+    fs::write(&executor, E2E_EXECUTOR_SCRIPT)
+        .map_err(|e| format!("cannot write executor script: {e}"))?;
+    make_executable(&executor)?;
+    let exec_cargo = match &opts.exec_cargo {
+        Some(path) => path.clone(),
+        None => resolve_real_binary(config).unwrap_or_else(|_| PathBuf::from("cargo")),
+    };
+    let state_dir = root.join("executor-state");
+    fs::create_dir_all(&state_dir).map_err(|e| format!("cannot create executor state dir: {e}"))?;
+    let wrapper = root.join("gantry-exec-canary.sh");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/usr/bin/env sh\n\
+             # Generated by `gantry doctor --e2e`: pins the loopback canary's\n\
+             # executor state dir and cargo so the shipped executor needs no\n\
+             # inherited environment.\n\
+             GANTRY_EXEC_STATE_DIR={} GANTRY_EXEC_CARGO={} exec {} \"$@\"\n",
+            sh_quote(&state_dir.to_string_lossy()),
+            sh_quote(&exec_cargo.to_string_lossy()),
+            sh_quote(&executor.to_string_lossy()),
+        ),
+    )
+    .map_err(|e| format!("cannot write executor wrapper: {e}"))?;
+    make_executable(&wrapper)?;
+    let wrapper_str = wrapper.display().to_string();
+
+    let backend = CommandBackend::with_config(CommandConfig {
+        submit: vec![
+            wrapper_str.clone(),
+            "submit".to_string(),
+            "{repo}".to_string(),
+            "{rev}".to_string(),
+            "{args_json}".to_string(),
+        ],
+        logs: vec![
+            wrapper_str.clone(),
+            "logs".to_string(),
+            "{handle}".to_string(),
+        ],
+        wait: vec![wrapper_str, "wait".to_string(), "{handle}".to_string()],
+        status: None,
+    });
+
+    Ok(CanaryFixture {
+        root,
+        repo_dir,
+        remote_url,
+        sha,
+        backend,
+    })
+}
+
+/// Legs "push" → "submit" → "wait" → "verdict": the round trip itself.
+fn drive_canary_round_trip(
+    config: &Config,
+    fixture: &CanaryFixture,
+    started: Instant,
+) -> Result<String, String> {
+    // Leg: push — the real RefPusher, from the fixture repo.
+    let run_id = format!(
+        "doctor-e2e-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let push = RefPusher::push_in_repo(config, &fixture.repo_dir, &fixture.sha, &run_id);
+    if !push.success {
+        return Err(e2e_failure(
+            "push",
+            &format!(
+                "could not push {} to the loopback remote: {} \
+                 — the canary pushes to a local bare repo, so a failure here \
+                 means git itself is broken",
+                push.ref_name, push.reason
+            ),
+        ));
+    }
+
+    // Leg: submit — the command-template backend path, trivial argv.
+    let spec = RunSpec::new(
+        "cargo",
+        "test",
+        Vec::new(),
+        &fixture.remote_url,
+        &fixture.sha,
+        "",
+    );
+    let handle = fixture.backend.submit(&spec).map_err(|e| {
+        e2e_failure(
+            "submit",
+            &format!(
+                "the loopback backend's submit command failed: {} \
+                 — the command-template presets are broken; check [remote.command] \
+                 or reinstall gantry",
+                e.reason
+            ),
+        )
+    })?;
+
+    // Leg: wait — the backend's wait command, deadline-bounded.
+    let deadline = Instant::now() + config.command_deadline();
+    match fixture.backend.wait(&handle, deadline) {
+        Ok(Verdict::Pass) => Ok(format!(
+            "round trip passed (push → clone → cargo test → verdict) in {:?}",
+            started.elapsed()
+        )),
+        Ok(verdict) => Err(e2e_failure_with_logs(
+            fixture,
+            &handle,
+            "verdict",
+            &format!(
+                "the known-good canary suite came back {verdict}, expected Pass \
+                 — the remote contract or the toolchain misclassified it"
+            ),
+        )),
+        Err(e) if e.deadline_exceeded => Err(e2e_failure_with_logs(
+            fixture,
+            &handle,
+            "wait",
+            &format!("deadline exceeded before a verdict: {}", e.reason),
+        )),
+        Err(e) => Err(e2e_failure_with_logs(
+            fixture,
+            &handle,
+            "wait",
+            &format!("wait command failed: {}", e.reason),
+        )),
+    }
+}
+
+/// Format an e2e failure: the leg is always named first, so a non-zero exit
+/// points the operator at the exact stage that broke (plan §8).
+fn e2e_failure(leg: &str, detail: &str) -> String {
+    format!("e2e canary failed at leg '{leg}': {detail}")
+}
+
+/// [`e2e_failure`], plus a best-effort tail of the executor's captured log —
+/// the fastest route from "verdict leg failed" to the stderr line that
+/// explains it.
+fn e2e_failure_with_logs(
+    fixture: &CanaryFixture,
+    handle: &crate::backend::RunHandle,
+    leg: &str,
+    detail: &str,
+) -> String {
+    let mut message = e2e_failure(leg, detail);
+    let mut logs = Vec::new();
+    if fixture.backend.stream_logs(handle, &mut logs).is_ok() && !logs.is_empty() {
+        let text = String::from_utf8_lossy(&logs);
+        let lines: Vec<&str> = text.lines().collect();
+        let tail_start = lines.len().saturating_sub(10);
+        let tail = lines[tail_start..].join("\n");
+        if !tail.is_empty() {
+            message.push_str("; executor log tail:\n");
+            message.push_str(&tail);
+        }
+    }
+    message
+}
+
+/// Run `git <args>` in `dir` and return trimmed stdout; any failure carries
+/// stderr so the failing leg's message is actionable.
+fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Make a script executable (no-op off Unix — the spawn failure surfaces at
+/// the submit leg there, which is this unix-first tool's honest answer).
+fn make_executable(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(path)
+            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+            .permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(path, perm)
+            .map_err(|e| format!("cannot chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Single-quote text for safe inclusion in a POSIX shell command line: the
+/// result is one shell word whose content survives byte-exact (`'` becomes
+/// the close-quote/backslash-quote/open-quote idiom). Shared with
+/// `cli::init`, which builds the ssh forwarder script the same way.
+pub(crate) fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Run fault-injection fire drill (doctor --drill).
@@ -504,4 +884,141 @@ pub fn run_drill() -> Result<String, String> {
     // 5. Assert correct exit code
 
     Err("Fire drill not yet implemented".to_string())
+}
+
+/// Unit tests for the e2e canary's pure helpers. The round trip itself runs
+/// real git and real cargo — that is integration-test territory
+/// (tests/doctor_e2e_integration.rs).
+#[cfg(test)]
+mod e2e_canary_tests {
+    use super::*;
+
+    #[test]
+    fn failure_message_names_the_leg_first() {
+        let msg = e2e_failure("push", "no such remote");
+        assert!(
+            msg.contains("leg 'push'"),
+            "leg must be named for the operator, got: {msg}"
+        );
+        assert!(msg.contains("no such remote"), "got: {msg}");
+    }
+
+    /// Failing path, push leg: with the fixture's loopback remote gone, the
+    /// real RefPusher cannot push, and the round trip must fail naming the
+    /// push leg — infrastructure broke before any suite ran (plan §8).
+    ///
+    /// Single-leg by construction: the failure fires before submit, so no
+    /// cargo is ever invoked — the reason this lives in the unit module
+    /// rather than the integration file, which owns the full round trip.
+    #[test]
+    fn e2e_push_failure_names_the_push_leg() {
+        let config = Config::hardcoded();
+        let fixture = build_canary_fixture(&config, &E2eCanaryOptions::default())
+            .expect("the canary fixture builds wherever git works");
+        git_in(
+            &fixture.repo_dir,
+            &["remote", "remove", &config.remote.ci_remote],
+        )
+        .expect("removing the fixture's own remote must succeed");
+        let err = drive_canary_round_trip(&config, &fixture, Instant::now())
+            .expect_err("a push without a remote must fail the round trip");
+        assert!(
+            err.contains("leg 'push'"),
+            "the error must name the push leg, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&fixture.root);
+    }
+
+    /// Failing path, submit leg: a wrapper whose submit command exits
+    /// non-zero fails the backend submission, and the round trip must fail
+    /// naming the submit leg — the command-template presets, not the suite,
+    /// broke (plan §8). The push leg is intact here, so this exercises the
+    /// first backend leg in isolation.
+    #[test]
+    fn e2e_submit_failure_names_the_submit_leg() {
+        let config = Config::hardcoded();
+        let fixture = build_canary_fixture(&config, &E2eCanaryOptions::default())
+            .expect("the canary fixture builds wherever git works");
+        // A wrapper that fails every subcommand: submit never yields a
+        // handle, so the round trip must stop at the submit leg.
+        let wrapper = fixture.root.join("gantry-exec-canary.sh");
+        fs::write(&wrapper, "#!/usr/bin/env sh\nexit 7\n")
+            .expect("overwriting the fixture's own wrapper must succeed");
+        make_executable(&wrapper).expect("re-chmodding the wrapper must succeed");
+        let err = drive_canary_round_trip(&config, &fixture, Instant::now())
+            .expect_err("a submit command that exits 7 must fail the round trip");
+        assert!(
+            err.contains("leg 'submit'"),
+            "the error must name the submit leg, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&fixture.root);
+    }
+
+    /// Failing path, wait leg: the wait command is spawned, not
+    /// exit-code-mapped — a non-zero wait *exit* would map through the
+    /// verdict ladder onto the verdict leg, so the only fast route to this
+    /// leg is a wait command that cannot even start. The wrapper therefore
+    /// removes itself during submit: push and submit complete, and the wait
+    /// spawn fails with command-not-found, which must fail the round trip
+    /// naming the wait leg (plan §8).
+    ///
+    /// Single-leg by construction: submit emits its handle before the wait
+    /// argv is ever resolved, so no suite, toolchain, or deadline is
+    /// involved — the reason this lives in the unit module rather than the
+    /// integration file, which owns the full round trip.
+    #[test]
+    fn e2e_wait_failure_names_the_wait_leg() {
+        let config = Config::hardcoded();
+        let fixture = build_canary_fixture(&config, &E2eCanaryOptions::default())
+            .expect("the canary fixture builds wherever git works");
+        // A wrapper whose submit leg removes the script (a running script
+        // may unlink itself) and then emits a handle, so the backend's wait
+        // spawn cannot find the command — the wait leg's error path without
+        // any toolchain or deadline involved.
+        let wrapper = fixture.root.join("gantry-exec-canary.sh");
+        fs::write(
+            &wrapper,
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  submit) rm -f \"$0\"; echo doctor-e2e-wait-leg-handle ;;\n  *) exit 0 ;;\nesac\n",
+        )
+        .expect("overwriting the fixture's own wrapper must succeed");
+        make_executable(&wrapper).expect("re-chmodding the wrapper must succeed");
+        let err = drive_canary_round_trip(&config, &fixture, Instant::now())
+            .expect_err("a wait command that cannot spawn must fail the round trip");
+        assert!(
+            err.contains("leg 'wait'"),
+            "the error must name the wait leg, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&fixture.root);
+    }
+
+    #[test]
+    fn sh_quote_survives_hostile_paths() {
+        let quoted = sh_quote("/tmp/it's a test");
+        assert_eq!(quoted, "'/tmp/it'\\''s a test'");
+    }
+
+    #[test]
+    fn embedded_executor_is_the_reference_script() {
+        // include_str! makes a missing file a build error; this guards the
+        // subtler failure of an empty or wrong-file embed.
+        assert!(E2E_EXECUTOR_SCRIPT.starts_with("#!"));
+        assert!(E2E_EXECUTOR_SCRIPT.contains("cmd_submit"));
+        assert!(E2E_EXECUTOR_SCRIPT.contains("cmd_wait"));
+    }
+
+    #[test]
+    fn canary_fixture_is_dependency_free_and_known_good() {
+        // Zero dependencies keeps the executor's cargo test offline-capable.
+        assert!(
+            !CANARY_CARGO_TOML.contains("dependencies"),
+            "the canary fixture must not need crates.io"
+        );
+        assert!(CANARY_LIB_RS.contains("#[test]"));
+    }
+
+    #[test]
+    fn default_options_resolve_exec_cargo_at_call_time() {
+        let opts = E2eCanaryOptions::default();
+        assert!(opts.exec_cargo.is_none());
+    }
 }

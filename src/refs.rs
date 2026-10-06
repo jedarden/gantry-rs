@@ -162,6 +162,19 @@ impl RefPusher {
         Self::push_in(config, Path::new("."), state_dir.as_deref(), sha, run_id)
     }
 
+    /// [`RefPusher::push`] against an explicit repository directory, with the
+    /// default state directory for lease records.
+    ///
+    /// Production pushes always run in the process cwd; this variant exists
+    /// for `doctor --e2e` (plan §8), whose canary pushes from a self-contained
+    /// fixture repo so the check never touches the caller's checkout or its
+    /// remotes. Everything else — lease bookkeeping, the opportunistic GC
+    /// sweep — behaves exactly as a production push.
+    pub fn push_in_repo(config: &Config, repo: &Path, sha: &str, run_id: &str) -> PushResult {
+        let state_dir = dirs::state_dir().map(|d| d.join("gantry"));
+        Self::push_in(config, repo, state_dir.as_deref(), sha, run_id)
+    }
+
     /// [`RefPusher::push`] against an explicit repository and state directory.
     ///
     /// `repo` is where git runs (production passes the process cwd; tests pass

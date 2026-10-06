@@ -39,6 +39,16 @@ fn script_path(p: &Path) -> String {
     p.to_str().expect("temp path is valid utf-8").to_string()
 }
 
+/// A deadline comfortably past every mock's runtime — for the tests that
+/// assert verdict mapping, where the budget must never bite. Expiry
+/// behaviour gets its own dedicated tests in `src/backend/command.rs`.
+/// Mirrors the `generous_deadline` helper in the command-backend unit tests:
+/// an `Instant::now()` deadline is already elapsed, and the enforced wait
+/// deadline kills the mock before it can return a verdict.
+fn generous_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(30)
+}
+
 /// Retry a mock-backed call a few times when exec fails with ETXTBSY
 /// ("Text file busy"). Under the parallel test harness, exec of a
 /// freshly-written mock can transiently race a still-open write handle from
@@ -233,7 +243,7 @@ fn wait_exit_0_maps_to_pass() {
         write_logs_mock(dir.path()),
     );
 
-    let verdict = with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), Instant::now()))
+    let verdict = with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), generous_deadline()))
         .expect("wait should succeed");
     assert_eq!(verdict, Verdict::Pass);
 }
@@ -247,7 +257,7 @@ fn wait_exit_1_maps_to_test_failure() {
         write_logs_mock(dir.path()),
     );
 
-    let verdict = with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), Instant::now()))
+    let verdict = with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), generous_deadline()))
         .expect("wait should succeed");
     assert_eq!(verdict, Verdict::TestFailure);
 }
@@ -264,8 +274,9 @@ fn wait_exit_2_and_higher_map_to_infra_failure() {
             write_wait_mock(dir.path(), code),
             logs.clone(),
         );
-        let verdict = with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), Instant::now()))
-            .expect("wait should succeed");
+        let verdict =
+            with_exec_retry(|| backend.wait(&RunHandle::new("run-1"), generous_deadline()))
+                .expect("wait should succeed");
         assert_eq!(verdict, Verdict::InfraFailure, "exit {}", code);
     }
 }
@@ -279,7 +290,7 @@ fn wait_receives_substituted_handle() {
         write_logs_mock(dir.path()),
     );
 
-    with_exec_retry(|| backend.wait(&RunHandle::new("run-77"), Instant::now()))
+    with_exec_retry(|| backend.wait(&RunHandle::new("run-77"), generous_deadline()))
         .expect("wait should succeed");
 
     let argv = read_argv_record(dir.path(), "wait-argv-0.txt");
@@ -326,8 +337,8 @@ fn round_trip_submit_then_wait_passes() {
     );
 
     let handle = with_exec_retry(|| backend.submit(&spec())).expect("submit should succeed");
-    let verdict =
-        with_exec_retry(|| backend.wait(&handle, Instant::now())).expect("wait should succeed");
+    let verdict = with_exec_retry(|| backend.wait(&handle, generous_deadline()))
+        .expect("wait should succeed");
     assert_eq!(verdict, Verdict::Pass);
 }
 
@@ -341,8 +352,8 @@ fn round_trip_submit_then_wait_fails() {
     );
 
     let handle = with_exec_retry(|| backend.submit(&spec())).expect("submit should succeed");
-    let verdict =
-        with_exec_retry(|| backend.wait(&handle, Instant::now())).expect("wait should succeed");
+    let verdict = with_exec_retry(|| backend.wait(&handle, generous_deadline()))
+        .expect("wait should succeed");
     assert_eq!(verdict, Verdict::TestFailure);
 }
 

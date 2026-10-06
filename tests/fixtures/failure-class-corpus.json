@@ -1,0 +1,150 @@
+{
+  "notes": "Shared producer-reference corpus for the failure taxonomy: ONE fixture set read by BOTH consumers of FailureClass::classify (src/verdict.rs). The classify tests pin the classifier to `expected_class`; the producer-parity test executes the reference producer's own classification snippet (contrib/argo/gantry-verify-workflowtemplate.yml) on every entry and must stamp the same class. `messages` is the archived cargo JSON protocol stream (one object per line, mixed with the harness's human lines that share stdout); `run_log` is the human-visible run output. `expected_class` is the kebab-case class both implementations must stamp, null where the classifiable window leaves the class unset. `producer_attribute` is set only where the producer attributes the class explicitly (gates) instead of deriving it: classify never derives gate-failure.",
+  "entries": [
+    {
+      "name": "compile-error-from-the-protocol-stream",
+      "why": "rustc never finished: an error-level compiler-message in the protocol stream is a compile error whatever else the stream shows (a warning and a build-script record ride along, the way a real failing build does), and the run log carries the rendered diagnostics with no test result at all.",
+      "exit_code": 101,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"warning\",\"message\":\"see rendered\",\"rendered\":\"warning: unused import: `fmt`\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"error\",\"message\":\"see rendered\",\"rendered\":\"error[E0432]: unresolved import `nope`\\n --> src/lib.rs:2:5\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n{\"reason\":\"build-script-executed\",\"package_id\":\"gantry 0.1.0\"}\n",
+      "run_log": "error[E0432]: unresolved import `nope`\n error: could not compile `gantry` (lib) due to 1 previous error\n",
+      "expected_class": "compile-error"
+    },
+    {
+      "name": "compile-error-outranks-later-stream-evidence",
+      "why": "detection order is the producer's exactly: compile-error outranks everything a later stage printed, because rustc never finished and whatever failed after it is noise (here: overflow AND a failed doc section in the run log).",
+      "exit_code": 101,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"error\",\"message\":\"see rendered\",\"rendered\":\"error[E0432]: unresolved import `nope`\\n --> src/lib.rs:2:5\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "thread 'big_stack' has overflowed its stack\nDoc-tests gantry\ntest result: FAILED. 0 passed; 1 failed\n",
+      "expected_class": "compile-error"
+    },
+    {
+      "name": "stack-overflow-harness-panic-from-the-run-log",
+      "why": "a test binary crashed the harness (stack overflow), which the protocol stream never names \u2014 the class is read off the human run log and outranks the FAILED lines a partially-completed target printed before dying. The exit code is cargo's (101: some test binary failed), not the crashed binary's signal code.",
+      "exit_code": 101,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"warning\",\"message\":\"see rendered\",\"rendered\":\"warning: unused\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "running 4 tests\ntest coords ... ok\nthread 'big_stack' has overflowed its stack\nfatal runtime error: stack overflow\ntest result: FAILED. 1 passed; 0 failed; 0 ignored\nerror: test failed, to rerun pass `--lib`\n",
+      "expected_class": "harness-panic"
+    },
+    {
+      "name": "doctest-when-only-the-doc-section-failed",
+      "why": "the lib target passed and the only FAILED `test result:` lines are the ones after the `Doc-tests` section header. A failing doctest assertion never produces an error-level compiler-message, so the protocol stream is benign here, as in a real instrumented run.",
+      "exit_code": 1,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"warning\",\"message\":\"see rendered\",\"rendered\":\"warning: unused\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "running 12 tests\ntest result: ok. 12 passed; 0 failed; 0 ignored\n\nDoc-tests gantry\nrunning 3 tests\ntest src/lib.rs - read_config (line 20) ... FAILED\ntest result: FAILED. 2 passed; 1 failed; 0 ignored\nerror: doctest failed\n",
+      "expected_class": "doctest"
+    },
+    {
+      "name": "mixed-unit-and-doc-failures-are-a-plain-test-failure",
+      "why": "a run whose unit tests failed AND whose doctests failed is a plain test failure: the doctest class names runs where the doc section was the ONLY thing that failed, so 'also fix your doctests' never hides the real signal.",
+      "exit_code": 1,
+      "instrumented": true,
+      "messages": "",
+      "run_log": "running 2 tests\ntest a ... FAILED\ntest result: FAILED. 1 passed; 1 failed\n\nDoc-tests gantry\nrunning 1 test\ntest doc ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n",
+      "expected_class": "test-failure"
+    },
+    {
+      "name": "test-failure-is-the-fallthrough-class",
+      "why": "a failed unit test with no compile error, no panic, no Doc-tests section: everything else is a plain test failure.",
+      "exit_code": 1,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"warning\",\"message\":\"see rendered\",\"rendered\":\"warning: unused\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "running 2 tests\ntest parser::tests::rejects_bad ... FAILED\nfailures:\n\nfailures: parser::tests::rejects_bad\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\nerror: test failed\n",
+      "expected_class": "test-failure"
+    },
+    {
+      "name": "test-failure-shares-the-compile-error-exit-code",
+      "why": "cargo exits 101 for a broken build AND for a failed test binary, so the exit code alone cannot tell a broken build from red tests — the distinction rides entirely on the archived protocol stream. This fixture is the red-test twin of `compile-error-from-the-protocol-stream` (same 101, same instrumented window): with no error-level compiler-message in the stream it must stay a plain test-failure, never borrow the compile-error class from its exit code.",
+      "exit_code": 101,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"warning\",\"message\":\"see rendered\",\"rendered\":\"warning: unused\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "running 2 tests\ntest parser::tests::rejects_bad ... FAILED\nfailures:\n\nfailures: parser::tests::rejects_bad\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\nerror: test failed\n",
+      "expected_class": "test-failure"
+    },
+    {
+      "name": "garbled-protocol-lines-cannot-blind-the-classifier",
+      "why": "leniency the classifier is documented for: a line in the archived protocol stream that is not a JSON object is skipped, not an error \u2014 one garbled line cannot blind the classifier to the error-level diagnostic that follows.",
+      "exit_code": 101,
+      "instrumented": true,
+      "messages": "running 12 tests\n{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"warning\",\"message\":\"see rendered\",\"rendered\":\"warning: unused\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n{not json}\n{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"error\",\"message\":\"see rendered\",\"rendered\":\"error[E0432]: unresolved import `nope`\\n --> src/lib.rs:2:5\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "",
+      "expected_class": "compile-error"
+    },
+    {
+      "name": "passing-suite-has-no-failure-to-name",
+      "why": "a passing suite (exit 0) has no failure to name, even with error-level compiler-messages archived: the window gate dominates whatever the streams show.",
+      "exit_code": 0,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"error\",\"message\":\"see rendered\",\"rendered\":\"error[E0432]: unresolved import `nope`\\n --> src/lib.rs:2:5\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "error: could not compile `gantry` (lib)\n",
+      "expected_class": null
+    },
+    {
+      "name": "command-not-found-window-parity",
+      "why": "exit 127 is command-not-found: the producer later intercepts it as infra and never reads the class it derives here, but the window predicate itself is `exit != 0 && exit < 128` on BOTH sides \u2014 this fixture pins the predicate, so 'fixing' either side alone shows up as drift.",
+      "exit_code": 127,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"error\",\"message\":\"see rendered\",\"rendered\":\"error[E0432]: unresolved import `nope`\\n --> src/lib.rs:2:5\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "error: could not compile `gantry` (lib)\n",
+      "expected_class": "compile-error"
+    },
+    {
+      "name": "exit-128-boundary-is-classless",
+      "why": "128 is the window's first signal exit: the gate is `exit != 0 && exit < 128` on BOTH sides, so a boundary drift to `<= 128` admits this run and stamps a class classify refuses — the one exit where the two sides must disagree about the gate, not just the class.",
+      "exit_code": 128,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"error\",\"message\":\"see rendered\",\"rendered\":\"error[E0432]: unresolved import `nope`\\n --> src/lib.rs:2:5\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "error: could not compile `gantry` (lib)\n",
+      "expected_class": null
+    },
+    {
+      "name": "signal-killed-suite-is-infra",
+      "why": "a signal-killed suite (exit >= 128; 137 is SIGKILL, conventionally the OOM killer) is infra, classified by the verdict ladder \u2014 not a failure class.",
+      "exit_code": 137,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"error\",\"message\":\"see rendered\",\"rendered\":\"error[E0432]: unresolved import `nope`\\n --> src/lib.rs:2:5\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "error: could not compile `gantry` (lib)\n",
+      "expected_class": null
+    },
+    {
+      "name": "oom-killed-suite-is-infra-never-a-failure-class",
+      "why": "the OOM scenario: the run log is a suite cut mid-run by the OOM killer (no test result line, no compiler error, nothing to name), and 137 is the SIGKILL the OOM killer leaves behind. The window gate must leave the class unset because without it this fixture falls through to test-failure — exactly the tests-failed misread an out-of-memory run must never get; the verdict ladder owns it (the producer flags 137 oom on top and stamps the exit-2 infra document).",
+      "exit_code": 137,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"oom-fixture 0.1.0 (path+file:///home/u/oom-fixture)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"oom-fixture\",\"src_path\":\"/home/u/oom-fixture/src/lib.rs\"},\"message\":{\"level\":\"warning\",\"message\":\"see rendered\",\"rendered\":\"warning: unused import: `fmt`\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n{\"reason\":\"build-script-executed\",\"package_id\":\"oom-fixture 0.1.0\"}\n",
+      "run_log": "   Compiling oom-fixture v0.1.0 (/home/u/oom-fixture)\n    Finished test [unoptimized + debuginfo] target(s) in 3.42s\n     Running unittests src/lib.rs (target/debug/deps/oom_fixture-abc123)\n\nrunning 12 tests\ntest oom_fixture::allocates_normally ... ok\ntest oom_fixture::grows_a_vec_without_a_limit ... ",
+      "expected_class": null
+    },
+    {
+      "name": "signal-exit-has-no-class-even-on-overflow-evidence",
+      "why": "even a stack-overflowed log stays unclassified in the signal range: the producer derives classes only under its `exit < 128` gate, so a class read at >=128 would name a run the producer records as class-less \u2014 the ladder's InfraFailure is the whole story.",
+      "exit_code": 134,
+      "instrumented": true,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"error\",\"message\":\"see rendered\",\"rendered\":\"error[E0432]: unresolved import `nope`\\n --> src/lib.rs:2:5\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "thread 'big_stack' has overflowed its stack\n",
+      "expected_class": null
+    },
+    {
+      "name": "uninstrumented-run-has-no-taxonomy",
+      "why": "a caller-chosen --message-format (instrumented false) means the raw protocol was never captured and no class is derivable \u2014 instrumentation must not fight the argv; the exit-code ladder decides, honestly.",
+      "exit_code": 1,
+      "instrumented": false,
+      "messages": "{\"reason\":\"compiler-message\",\"package_id\":\"gantry 0.1.0 (path+file:///home/u/gantry)\",\"target\":{\"kind\":[\"lib\"],\"name\":\"gantry\",\"src_path\":\"/home/u/gantry/src/lib.rs\"},\"message\":{\"level\":\"error\",\"message\":\"see rendered\",\"rendered\":\"error[E0432]: unresolved import `nope`\\n --> src/lib.rs:2:5\\n\",\"code\":null,\"spans\":[],\"children\":[]}}\n",
+      "run_log": "error: could not compile `gantry` (lib)\n",
+      "expected_class": null
+    },
+    {
+      "name": "gate-failure-is-attributed-not-derived",
+      "why": "gates run only after a PASSING suite, so the taxonomy window derives nothing here on either side; the producer attributes gate-failure explicitly (emit_verdict Failed 0 gate-failure false \u2014 the suite's exit 0 stays the truth) and classify never derives it from the streams.",
+      "exit_code": 0,
+      "instrumented": true,
+      "messages": "",
+      "run_log": "running 12 tests\ntest result: ok. 12 passed; 0 failed; 0 ignored\n[gantry] gate: clippy\n[gantry] gate: clippy FAILED\n",
+      "expected_class": null,
+      "producer_attribute": "gate-failure"
+    }
+  ]
+}

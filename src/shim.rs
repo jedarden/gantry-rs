@@ -314,29 +314,54 @@ fn ensure_distinct_from_self(resolved: &std::path::Path) -> Result<(), String> {
 /// commit. [`ensure_distinct_from_self`] (bf-1m69) layers on top here as the
 /// re-exec guard's file-level backstop.
 pub fn resolve_real_binary(cfg: &crate::config::Config) -> Result<std::path::PathBuf, String> {
-    // 1. Explicit override: take it verbatim and skip the PATH search entirely.
-    //    2. Otherwise: exclude gantry's own binary dir so the lookup cannot
-    //       re-resolve `cargo` to the gantry shim's directory, then walk the
-    //       surviving PATH entries left-to-right for `cargo`.
-    let resolved = match cfg.real_binary("cargo") {
-        Some(path) => path.clone(),
-        None => {
-            let shim = shim_dir()?;
-            let path_var = std::env::var("PATH")
-                .map_err(|e| format!("gantry cannot read the PATH environment variable: {e}"))?;
-            let stripped = strip_dir_from_path(&path_var, &shim);
-            find_in_path("cargo", &stripped)?
+    resolve_command_binary(cfg, "cargo")
+}
+
+/// Resolve an arbitrary named program the same way [`resolve_real_binary`]
+/// resolves `cargo` — the rules `gantry run` applies to the wrapped command's
+/// program before any local tail spawns it:
+///
+/// 1. **Path-like name** — a name containing `/` is a path the caller spelled
+///    (relative to the current directory or absolute); it is taken verbatim,
+///    no PATH search. A target that does not exist surfaces through the
+///    guard's canonicalization error below, and a bad exec bit through the
+///    tail's spawn failure — both loud, never a silent pass.
+/// 2. **Override short-circuit** — a configured `real_binary` override for
+///    this exact name is taken verbatim, skipping the PATH search.
+/// 3. **PATH lookup** — otherwise, gantry's own binary dir is stripped from
+///    `PATH` and the survivors walked left-to-right for the name.
+/// 4. **Self-recursion guard** — whichever path landed, the canonical
+///    comparison against the gantry binary runs exactly as for cargo: `gantry
+///    run -- gantry …` (or any spelling that resolves to the gantry binary)
+///    is refused, never re-exec'd (plan §1 "never a fallback-to-self").
+///
+/// The guard is a comparison only; the resolved path is returned unchanged.
+/// Never panics — every fallible step maps to a human-readable `Err`.
+pub fn resolve_command_binary(
+    cfg: &crate::config::Config,
+    name: &str,
+) -> Result<std::path::PathBuf, String> {
+    // A path-like name is its own resolution: no PATH search, no override.
+    let resolved = if name.contains('/') {
+        std::path::PathBuf::from(name)
+    } else {
+        match cfg.real_binary(name) {
+            Some(path) => path.clone(),
+            None => {
+                let shim = shim_dir()?;
+                let path_var = std::env::var("PATH").map_err(|e| {
+                    format!("gantry cannot read the PATH environment variable: {e}")
+                })?;
+                let stripped = strip_dir_from_path(&path_var, &shim);
+                find_in_path(name, &stripped)?
+            }
         }
     };
 
-    // 3. Self-recursion guard (plan §1): refuse to hand off to a path whose
-    //    canonical target is the gantry binary itself. The override bypasses the
-    //    PATH strip, and a gantry-named symlink in a surviving PATH dir evades
-    //    it, so the canonical comparison re-checks whichever path landed — and
-    //    an uncanonicalizable target errors rather than risking a fallback-to-self.
+    // Self-recursion guard (plan §1), file-level backstop: identical to the
+    // cargo path — see resolve_real_binary for the full rationale.
     ensure_distinct_from_self(&resolved)?;
 
-    // The guard is a comparison only; the resolved path is returned unchanged.
     Ok(resolved)
 }
 

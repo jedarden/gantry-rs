@@ -24,7 +24,7 @@ A PATH shim that intercepts expensive build/test commands (cargo-first), gates o
 
 - **In-flight dedup / join.** Two agents running `cargo test` on the same (repo, rev, args) join the same remote run instead of submitting twice. Keyed on content, coordinated via a lock/state dir. Multi-agent boxes hit this constantly.
 - **`gantry run -- <cmd>`** — explicit offload of an arbitrary command without shimming.
-- **Installer + uninstaller.** `install.sh` (curl-pipe): drops the binary, creates the shim symlink in a dir verified to precede the real toolchain in PATH, writes a starter config, runs `doctor`.
+- **Installer + uninstaller.** `install.sh` (curl-pipe): drops the binary, creates the shim symlink in a dir verified to precede the real toolchain in PATH, writes a starter config, runs `doctor`. `gantry uninstall [--dry-run] [--keep-config]` reverses an install — shim symlinks, the binary, the state directory (run ledger, kill switch, crash bundles), the user config, and the systemd slice unit. Use it when retiring gantry from a box or resetting a broken install (`--dry-run` previews first; `--keep-config` preserves backend settings for reinstall). Removal classifies only provably-gantry artifacts — a `cargo` on PATH is touched only when it symlinks to (or is byte-identical to) the gantry binary — so the real toolchain is never at risk, and a clean run exits 0 reporting where `cargo` resolves afterward.
 - **SSH backend.** `git push` a ref to the target host (or fetch from origin), run the command remotely under a cgroup scope, stream stdout. Serves the "I have a big desktop and a laptop" audience — no Kubernetes required.
 - **Timeout/deadline config** per backend, with a clear "timed out, here's the run URL" message.
 

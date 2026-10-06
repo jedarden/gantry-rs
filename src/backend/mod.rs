@@ -121,11 +121,26 @@ impl fmt::Display for Verdict {
 /// Error type for backend operations.
 ///
 /// Phase 0.5: minimal string-based error type.
-/// Phase 1a will expand this to include InfraFailure classification.
+/// Phase 1a: the structured `deadline_exceeded` flag (features.md v1.x
+/// "timeout/deadline config per backend") lets the caller distinguish a run
+/// that outlived its deadline from every other backend failure. Both are
+/// InfraFailure — but a deadline expiry prints the "timed out, here's the
+/// run URL" line instead of the generic wait-failure line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackendError {
     /// Human-readable reason for the error.
     pub reason: String,
+    /// True when the error is a deadline expiry (the run's configured
+    /// timeout elapsed before a verdict). Never true for spawn errors,
+    /// parse errors, or remote test results.
+    pub deadline_exceeded: bool,
+    /// Where the abandoned run can still be watched — the backend's own run
+    /// URL/identifier (the argo UI URL for the argo backend). Deadline
+    /// expiry stops the watch but leaves the run alive on the remote, so
+    /// the `[gantry] timeout` line appends this to point the operator at
+    /// it. `None` on every other error, and on a backend with no watchable
+    /// URL (the line then names the run by handle alone).
+    pub run_url: Option<String>,
 }
 
 impl BackendError {
@@ -133,6 +148,30 @@ impl BackendError {
     pub fn new(reason: &str) -> Self {
         BackendError {
             reason: reason.to_string(),
+            deadline_exceeded: false,
+            run_url: None,
+        }
+    }
+
+    /// Create a deadline-expiry BackendError: the run outlived its
+    /// configured timeout without producing a verdict.
+    pub fn deadline(reason: &str) -> Self {
+        BackendError {
+            reason: reason.to_string(),
+            deadline_exceeded: true,
+            run_url: None,
+        }
+    }
+
+    /// Create a deadline-expiry BackendError carrying the run URL: like
+    /// [`BackendError::deadline`], plus where the abandoned run can still
+    /// be watched (features.md v1.x "a clear timed-out, here's-the-run-URL
+    /// message"). Expiry stops the watch; it does not cancel the run.
+    pub fn deadline_with_url(reason: &str, run_url: &str) -> Self {
+        BackendError {
+            reason: reason.to_string(),
+            deadline_exceeded: true,
+            run_url: Some(run_url.to_string()),
         }
     }
 }
@@ -229,6 +268,32 @@ pub trait RemoteBackend {
     /// Phase 0.5: wait runs the configured wait argv with the handle and maps
     /// the exit code to a Verdict using the minimal ladder.
     fn wait(&self, h: &RunHandle, deadline: std::time::Instant) -> BackendResult<Verdict>;
+
+    /// Wait for the remote run to complete and return its outcome: the
+    /// verdict plus the failure class the remote attributed to it (plan
+    /// §Component 5 failure taxonomy, verdict.json v2).
+    ///
+    /// This is what the client half of the taxonomy records into runs.jsonl
+    /// ([`crate::runlog::VerdictRecord::failure_class`]): a remote run that
+    /// died carries *what it died of* alongside *that it died*. The class is
+    /// `None` for every shape of "not known from a parsed document" — no
+    /// usable verdict.json (absent, malformed, newer schema), a backend that
+    /// never reads documents at all — so the runlog's field contract (null
+    /// for uninstrumented producers) falls out of the plumbing instead of
+    /// being enforced per call site. Whether a threaded class belongs on the
+    /// record for the verdict it arrived with is the runlog contract's call,
+    /// applied where the record is built.
+    ///
+    /// Default: [`Self::wait`]'s verdict with no class. Backends that parse
+    /// verdict.json override this; every other implementation — and every
+    /// consumer written against the plain ladder — keeps compiling unchanged.
+    fn wait_outcome(
+        &self,
+        h: &RunHandle,
+        deadline: std::time::Instant,
+    ) -> BackendResult<(Verdict, Option<FailureClass>)> {
+        self.wait(h, deadline).map(|verdict| (verdict, None))
+    }
 
     /// Describe a run for human consumption (e.g., a URL to view logs).
     ///
@@ -464,6 +529,32 @@ mod tests {
         // object so the impl cannot silently disappear.
         let boxed: Box<dyn std::error::Error> = Box::new(e.clone());
         assert_eq!(boxed.to_string(), "workflow vanished");
+    }
+
+    #[test]
+    fn backend_error_deadline_constructors_flag_expiry_and_carry_the_url() {
+        // Only the expiry constructors raise the flag — a spawn error or a
+        // parse error must never print the timeout line — and the run URL
+        // rides only the constructor built for it: the plain expiry keeps
+        // the bare timeout line (the command backend's contract), the
+        // with-url expiry hands the operator something to watch.
+        let plain = BackendError::new("pod vanished");
+        assert!(!plain.deadline_exceeded);
+        assert_eq!(plain.run_url, None);
+
+        let expiry = BackendError::deadline("run h-1 deadline exceeded");
+        assert!(expiry.deadline_exceeded);
+        assert_eq!(expiry.run_url, None);
+
+        let with_url = BackendError::deadline_with_url(
+            "run h-2 deadline exceeded",
+            "https://argo.example.com/workflows/ns/h-2",
+        );
+        assert!(with_url.deadline_exceeded);
+        assert_eq!(
+            with_url.run_url.as_deref(),
+            Some("https://argo.example.com/workflows/ns/h-2")
+        );
     }
 
     /// A backend that does not override status() inherits the Phase-0.5 default

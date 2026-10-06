@@ -281,6 +281,31 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
         // valid status), 2 usage error.
         "status" => ExitCode::from(gantry::cli::status::cli(&argv[2..]) as u8),
 
+        // run: explicit offload — `gantry run [--backend B] -- <cmd…>`
+        // routes the wrapped command through the same GitGate → RefPusher →
+        // backend pipeline as an intercepted invocation (plan §"CLI
+        // surface"), with the same capped-local fallback ladder. The exit
+        // code is the wrapped command's (local arms) or the verdict
+        // ladder's (remote success) — fidelity the caller can branch on.
+        "run" => {
+            let repo_url = get_repo_url();
+            let sha = get_current_sha();
+            ExitCode::from(gantry::cli::run::cli(&argv[2..], &repo_url, &sha))
+        }
+
+        // init: SSH-first onboarding (plan §8: "`gantry init --ssh user@host`
+        // performs the whole SSH-first setup — verifies git+cargo on the
+        // target, writes the command-template preset config, and finishes
+        // with `doctor --e2e`"). Exit codes are init::cli's: 0 onboarded
+        // with the canary green, 1 a leg failed (the message names the leg),
+        // 2 usage error.
+        "init" => ExitCode::from(gantry::cli::init::cli(&argv[2..]) as u8),
+
+        // uninstall: reverse an install — shims, binary, state, config,
+        // slice unit (plan §8: "`gantry uninstall` reverses it"). Exit codes
+        // are uninstall::cli's: 0 clean, 1 leftovers remain, 2 usage error.
+        "uninstall" => ExitCode::from(gantry::uninstall::cli(&argv[2..]) as u8),
+
         // Unknown command: print a hint and exit 2 (conventional for CLI misuse).
         _ => {
             eprintln!("gantry: unknown command '{subcommand}'");
@@ -330,6 +355,13 @@ fn print_usage() {
     println!("  gantry explain      Dry run: gates, backend, exact ref — no network");
     println!("                      (explain -- cargo test; add --json)");
     println!("  gantry status       Recent and in-flight runs (--json, --limit N)");
+    println!("  gantry run          Offload an arbitrary command without shimming:");
+    println!("                      gantry run [--backend B] -- <cmd> [args…]");
+    println!("  gantry init --ssh <target>");
+    println!("                      Onboard a host: verify git+cargo, install the");
+    println!("                      executor, write the preset, end with doctor --e2e");
+    println!("  gantry uninstall    Remove shims, binary, state, and config");
+    println!("                      (--dry-run to preview, --keep-config to keep settings)");
     println!();
     println!("Cargo tool profile:");
     println!("  cargo test          Run cargo test (passthrough in Phase 0.5)");
@@ -397,6 +429,31 @@ mod tests {
     #[test]
     fn test_management_cli_unknown_command() {
         let argv = vec!["gantry".to_string(), "unknown".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn test_management_cli_run_arm_reaches_the_run_cli() {
+        // The `run` arm: the management dispatch resolves the repo identity
+        // and hands the tail to cli::run::cli. A bare `gantry run` carries no
+        // `-- <cmd…>` separator, so parse rejects it with the usage exit 2
+        // before any gate, backend, or ledger touch — the cheapest proof the
+        // arm is wired and reachable end to end.
+        let argv = vec!["gantry".to_string(), "run".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::from(2));
+
+        // A usage error from the parser itself (unknown backend value) takes
+        // the same arm and the same exit code.
+        let argv = vec![
+            "gantry".to_string(),
+            "run".to_string(),
+            "--backend".to_string(),
+            "bogus".to_string(),
+            "--".to_string(),
+            "true".to_string(),
+        ];
         let exit_code = run_management_cli(&argv);
         assert_eq!(exit_code, ExitCode::from(2));
     }

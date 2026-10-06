@@ -85,9 +85,15 @@ pub struct CrashRecord<'a> {
     /// Backend run handle, when the failure happened after submit.
     pub handle: Option<&'a str>,
     /// Raw backend response/error text, when one exists. Redacted like
-    /// everything else.
+    /// everything else. The remote-pipeline call sites hand over the exact
+    /// text the backend surfaced (git's push stderr, the command backend's
+    /// error reason) — the same string the `[gantry]` line carries, but
+    /// tail-capped here so a multi-megabyte dump cannot own the bundle.
     pub backend_response: Option<&'a str>,
-    /// Recent stderr tail, when the caller has one to hand over.
+    /// Recent stderr tail, when the caller has one to hand over. Legitimately
+    /// empty at today's call sites: no backend streams through a gantry-owned
+    /// buffer yet, and inventing a capture there would be a lie (plan
+    /// §"argo").
     pub recent_stderr: Option<&'a str>,
 }
 
@@ -151,6 +157,35 @@ pub fn record(config: &Config, rec: &CrashRecord<'_>) -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Field-based production entry point: build a [`CrashRecord`] and [`record`]
+/// it, in one call.
+///
+/// The single home of the flight-recorder contract (plan Component 7): every
+/// site that ends a run in `InfraFailure` — remote pipeline stages *and* the
+/// local tails (`run_fallback`, Tier-0's `execute_locally`) — calls this
+/// first. Best effort like [`record`]: the bundle degrades to a
+/// `[gantry] warning:` line and never changes the verdict, the exit code, or
+/// the trailer the caller is about to write.
+pub fn record_stage(
+    config: &Config,
+    run_id: &str,
+    stage: &str,
+    infra_reason: &str,
+    handle: Option<&str>,
+    backend_response: Option<&str>,
+    recent_stderr: Option<&str>,
+) -> Option<PathBuf> {
+    let rec = CrashRecord {
+        run_id,
+        stage,
+        infra_reason,
+        handle,
+        backend_response,
+        recent_stderr,
+    };
+    record(config, &rec)
 }
 
 /// Write (or extend) a bundle under an explicit state directory.
@@ -362,11 +397,17 @@ fn write_manifest(dir: &Path, state_dir: &Path, rec: &CrashRecord<'_>) -> Result
         "files": files,
         "state_dir": state_dir.display().to_string(),
     });
+    // Redacted like every other artifact — the module invariant is that no
+    // code path writes unredacted input, and the manifest embeds caller-supplied
+    // strings (`run_id`, the state-dir path) that must not get a free pass.
+    // JSON-safe by construction: quoted values redact content-in-quotes.
     write_artifact(
         dir,
         "manifest.json",
-        &serde_json::to_string_pretty(&manifest)
-            .unwrap_or_else(|_| "{\"schema_version\":0}".to_string()),
+        &redact(
+            &serde_json::to_string_pretty(&manifest)
+                .unwrap_or_else(|_| "{\"schema_version\":0}".to_string()),
+        ),
     )
 }
 
@@ -549,7 +590,12 @@ fn redact_line(line: &str) -> String {
 }
 
 /// Rule 1: URL userinfo. Every `scheme://…@` span on the line.
-fn redact_url_userinfo(line: &str) -> String {
+///
+/// Public as the single home of S-5's "strip userinfo before logging": the
+/// runlog's intent records strip their remote URL through this same function
+/// (`IntentRecord::new`), so a stored URL and a bundled URL are sanitized
+/// identically and the rule has exactly one implementation to audit.
+pub fn redact_url_userinfo(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(pos) = rest.find("://") {
@@ -560,7 +606,12 @@ fn redact_url_userinfo(line: &str) -> String {
         // '@' inside it.
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = &rest[..authority_end];
-        match authority.find('@') {
+        // Split at the LAST '@': userinfo runs to the final '@' before the
+        // host, and real credentials carry a literal '@' freely — splitting
+        // at the first one turns `https://u:p@ssw0rd@git.example/…` into
+        // `[REDACTED]@ssw0rd@git.example`, leaking most of the password as
+        // a fake host.
+        match authority.rfind('@') {
             Some(at) => {
                 out.push_str("[REDACTED]");
                 out.push_str(&authority[at..]);
@@ -576,7 +627,13 @@ fn redact_url_userinfo(line: &str) -> String {
 /// Rule 2: `Bearer <token>` / `Basic <token>` — the token run is redacted,
 /// the scheme kept so the post-mortem still sees the auth style.
 fn redact_scheme_credentials(line: &str) -> String {
-    let lower = line.to_lowercase();
+    // ASCII-only case folding: `str::to_lowercase` can change byte lengths
+    // (`İ` folds to two chars), desynchronizing every index below from
+    // `line` itself — at best a misaligned cut, at worst a `line[start..]`
+    // panic on a non-char-boundary (the redactor runs on adversarial bytes
+    // by definition). The scheme words matched here are ASCII, so folding
+    // only the ASCII range is exactly enough, and it is byte-for-byte.
+    let lower = line.to_ascii_lowercase();
     let mut cuts: Vec<(usize, usize)> = Vec::new();
     for scheme in ["bearer ", "basic "] {
         let mut from = 0;
@@ -598,11 +655,21 @@ fn redact_scheme_credentials(line: &str) -> String {
     apply_cuts(line, &mut cuts, "[REDACTED]")
 }
 
+/// The redaction replacement mark. A constant because the redactor runs
+/// more than once over the same logical text — `write_manifest` re-redacts
+/// the stored `events.jsonl`, `print_bundle` re-redacts every stored
+/// artifact — and idempotency is what makes that safe: a value already
+/// carrying the mark is left alone (see [`redact_kv_secrets`]).
+const REDACTION_MARK: &str = "[REDACTED]";
+
 /// Keys whose *value* is treated as a credential. A key matches when its
-/// full lowercase form, or its last `-`/`_`-separated segment, is in this
-/// set — so `api_token`, `GITHUB_TOKEN`, `client_secret`, `x-api-key` and
-/// `password` all match, while `tokenize`, `keynote` and `generate_name`
-/// do not.
+/// full lowercase form, or **any** `-`/`_`-separated segment of it, is in
+/// this set — so `api_token`, `GITHUB_TOKEN`, `client_secret`, `x-api-key`,
+/// `password` and `client-key-data` all match, while `tokenize`, `keynote`
+/// and `generate_name` do not. Any-segment, not last-segment, because real
+/// credential channels hide the secret word mid-key (`client-key-data` in a
+/// kubeconfig is base64 private-key material) and over-redacting a
+/// non-secret is merely annoying (S-5).
 const SECRET_KEY_WORDS: &[&str] = &[
     "token",
     "secret",
@@ -610,6 +677,7 @@ const SECRET_KEY_WORDS: &[&str] = &[
     "passwd",
     "pwd",
     "key",
+    "pem",
     "apikey",
     "auth",
     "authorization",
@@ -632,9 +700,8 @@ fn key_is_secret(raw_key: &str) -> bool {
     if SECRET_KEY_WORDS.contains(&key.as_str()) {
         return true;
     }
-    key.rsplit(['-', '_', ' '])
-        .next()
-        .is_some_and(|segment| SECRET_KEY_WORDS.contains(&segment))
+    key.split(['-', '_', ' '])
+        .any(|segment| SECRET_KEY_WORDS.contains(&segment))
 }
 
 /// Rule 3: key/value secrets. For every `:` or `=` on the line, look at the
@@ -708,6 +775,19 @@ fn redact_kv_secrets(line: &str) -> String {
             (j, k)
         };
         if value_end > value_start {
+            // The mark itself is never a secret: re-redacting stored text
+            // (`write_manifest` over events.jsonl, `print_bundle` over every
+            // artifact) must leave a value that already carries
+            // [`REDACTION_MARK`] alone. The unquoted scan stops at the
+            // mark's closing `]`, so cutting here would replace `[REDACTED`
+            // and grow a stray `]` on every pass — `token=[REDACTED]]`.
+            if line
+                .get(value_start..)
+                .is_some_and(|rest| rest.starts_with(REDACTION_MARK))
+            {
+                i = value_end.max(i + 1);
+                continue;
+            }
             cuts.push((value_start, value_end));
             i = value_end;
         } else {
@@ -1062,6 +1142,59 @@ mod tests {
     }
 
     #[test]
+    fn re_redacting_a_marked_line_is_a_no_op() {
+        // write_manifest re-redacts the stored events.jsonl and print_bundle
+        // re-redacts every stored artifact, so each `[REDACTED]` the first
+        // pass wrote is itself input to the second. These are the marked
+        // shapes the first pass actually emits, one per mark-producing rule;
+        // before the [`REDACTION_MARK`] guard the unquoted KV scan cut
+        // `[REDACTED` out of the mark and grew a stray `]` on every pass
+        // (`token=[REDACTED]]`, then `]]`, forever).
+        let marked = [
+            // Rule 1: URL userinfo
+            "remote: https://[REDACTED]@git.example/repo.git",
+            // Rule 2: scheme credential (emitted shape — the run cut to the
+            // closing whitespace, so no quote follows the mark)
+            "AUTH Basic [REDACTED]",
+            // Rule 3: quoted and bare key/value values
+            "\"api_token\": \"[REDACTED]\",",
+            "GITHUB_TOKEN=[REDACTED]",
+            "password = '[REDACTED]'",
+            // Rule 4: token shape — the prefix survives, the body is the mark
+            "creds ghp_[REDACTED] in logs",
+        ];
+        for line in marked {
+            assert_eq!(redact(line), line, "marked line was not stable: {line}");
+        }
+    }
+
+    #[test]
+    fn a_second_redaction_pass_is_byte_identical_to_the_first() {
+        // The fixed point itself, over live-shaped lines: redact ∘ redact =
+        // redact. The last line is the exact shape write_manifest re-reads
+        // from events.jsonl — a stored mark beside a live value, proving the
+        // guard skips only the mark and still redacts its neighbor.
+        let live = [
+            "remote: https://builder:hunter2@git.example/repo.git",
+            "curl -H 'Authorization: Bearer abc.def.ghi' https://x.example",
+            "{\"namespace\": \"iad-ci\", \"api_token\": \"abc123\", \"n\": 4}",
+            concat!("GITHUB_TOKEN=ghp_", "0123456789abcdef0123456789abcdef0123"),
+            "password = 'hunter2'",
+            concat!("creds AKIA", "IOSFODNN7EXAMPLE", " in env"),
+            "{\"api_token\": \"[REDACTED]\", \"password\": \"hunter2\"}",
+        ];
+        for line in live {
+            let once = redact(line);
+            assert!(
+                once.contains("[REDACTED]"),
+                "first pass never engaged: {line}"
+            );
+            let twice = redact(&once);
+            assert_eq!(twice, once, "second pass diverged for: {line}");
+        }
+    }
+
+    #[test]
     fn known_token_shapes_are_redacted_even_without_a_key() {
         // The fake token bodies are `concat!`-split on purpose: this repo's
         // Forgejo pre-receive scanner flags contiguous token-shaped literals
@@ -1082,6 +1215,72 @@ mod tests {
 
         // Too short to be real: left alone (test fixtures say ghp_ and mean it).
         assert_eq!(redact("ghp_short"), "ghp_short");
+    }
+
+    #[test]
+    fn scheme_redaction_stays_byte_aligned_on_multibyte_lines() {
+        // `str::to_lowercase` can change byte lengths (`İ` folds to two
+        // chars), which threw the scheme scan's indexes off `line` and
+        // panicked the redactor on a non-char-boundary — on the
+        // InfraFailure tail, where such backend text lands.
+        let line = concat!(
+            "\u{130} bearer \u{e9}tok ",
+            "ghp_",
+            "0123456789abcdef0123456789abcd"
+        );
+        let out = redact(line); // must not panic
+        assert!(out.contains("bearer [REDACTED]"), "{out}");
+        assert!(!out.contains("0123456789abcdef"), "{out}");
+    }
+
+    #[test]
+    fn userinfo_redaction_survives_at_signs_inside_the_password() {
+        // Userinfo runs to the LAST '@' before the host; a password with a
+        // literal '@' must not survive as a fake host.
+        let out = redact("git push https://u:p@ssw0rd@git.example/repo.git");
+        assert!(!out.contains("ssw0rd"), "{out}");
+        assert!(out.contains("[REDACTED]@git.example"), "{out}");
+    }
+
+    #[test]
+    fn credential_words_hidden_mid_key_are_redacted() {
+        // kubeconfig's client-key-data is base64 private-key material; the
+        // secret word sits mid-key, so any-segment matching is load-bearing.
+        // The fixture body is concat!-split like the token fixtures: the
+        // Forgejo pre-receive scanner flags contiguous token-shaped
+        // literals, and it does not honor gitleaks:allow.
+        let out = redact(concat!("\"client-key-data\": \"c3VwZXJzZWNyZXQ", "=\""));
+        assert!(out.contains("\"client-key-data\": \"[REDACTED]\""), "{out}");
+
+        // A pem-named value is key material by definition.
+        let out = redact("tls_pem = 'notchecked'");
+        assert!(out.contains("tls_pem = '[REDACTED]'"), "{out}");
+
+        // Segment matching, not substring matching: `monkey` contains `key`
+        // but is not a secret key name.
+        assert_eq!(redact("monkey = true"), "monkey = true");
+    }
+
+    #[test]
+    fn public_certificate_data_keys_are_not_redacted() {
+        // Consistent with the CERTIFICATE allowance: a CA cert is public
+        // material, and its kubeconfig channel carries no secret word.
+        let line = "certificate-authority-data: LS0tLS1CRUdJTlY=";
+        assert_eq!(redact(line), line);
+    }
+
+    #[test]
+    fn the_manifest_is_redacted_like_every_other_artifact() {
+        let state = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let mut rec = sample_record("run-manifest");
+        // The run id is caller-supplied and lands in the manifest raw; the
+        // module invariant gives it no free pass.
+        rec.run_id = concat!("leak-", "ghp_", "0123456789abcdef0123456789abcdef0123");
+        let dir = record_in(state.path(), cwd.path(), &Config::tier_0_defaults(), &rec).unwrap();
+        let manifest = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert!(!manifest.contains("0123456789abcdef"), "{manifest}");
+        assert!(manifest.contains("[REDACTED]"), "{manifest}");
     }
 
     #[test]
@@ -1187,6 +1386,7 @@ mod tests {
                 ],
                 logs: vec!["echo".to_string()],
                 wait: vec!["true".to_string()],
+                deadline_minutes: None,
             }),
         };
         let mut tools = HashMap::new();

@@ -5,7 +5,10 @@
 // when podGC ate the logs.
 //
 // The Argo backend implements RemoteBackend using kubectl as the execution layer:
-// - submit: builds Workflow manifest with serde, runs kubectl create -f -
+// - submit: builds Workflow manifest with serde, runs kubectl create -f -;
+//   every submission carries `contract-version` (CONTRACT_VERSION) — the
+//   client half of the verdict.json handshake the reference template echoes
+//   back, and a foreign echo classifies the run infra in wait() below
 // - stream_logs: kubectl logs -f on the workflow's pod
 // - wait: polls kubectl get workflow status.phase until terminal or deadline
 // - status: one-shot status.phase → RunStatus snapshot (never blocks, never
@@ -21,7 +24,10 @@
 // outside the seam: streaming needs live process stdout to copy from as the
 // run progresses, not a captured end-of-run result.
 
-use crate::backend::{BackendError, RemoteBackend, RunSpec, RunStatus, Verdict, VerdictJson};
+use crate::backend::{
+    BackendError, FailureClass, RemoteBackend, RunSpec, RunStatus, Verdict, VerdictJson,
+};
+use crate::verdict::CONTRACT_VERSION;
 use std::io::{Read, Write};
 use std::process::{Command, Output};
 use std::thread;
@@ -39,13 +45,15 @@ const STATUS_POLL: Duration = Duration::from_secs(2);
 /// Argo Workflow manifest structures (serde-based, no string splicing).
 ///
 /// Phase 1a implements minimal Workflow submit spec matching the gantry-verify
-/// template contract: parameters (repo, revision, args-json, builder-image),
-/// generateName, entrypoint, and a workflowTemplateRef to the cluster's
-/// WorkflowTemplate. Workflow-level arguments are merged with the template's
-/// arguments (argo-workflows docs §"Workflow Templates"): names the workflow
-/// supplies take effect; names it omits keep the template's default — which is
-/// how an unconfigured builder-image falls back to the template default.
+/// template contract: parameters (repo, revision, args-json, contract-version,
+/// builder-image), generateName, and a workflowTemplateRef to the cluster's
+/// WorkflowTemplate. Workflow-level arguments are merged with the
+/// template's arguments (argo-workflows docs §"Workflow Templates"): names the
+/// workflow supplies take effect; names it omits keep the template's default —
+/// which is how an unconfigured builder-image falls back to the template
+/// default.
 mod workflow {
+    use crate::verdict::CONTRACT_VERSION;
     use serde::{Deserialize, Serialize};
 
     /// Workflow submit manifest.
@@ -67,7 +75,16 @@ mod workflow {
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct WorkflowSpec {
-        pub entrypoint: String,
+        /// No workflow-level `entrypoint`: the referenced WorkflowTemplate owns
+        /// its entrypoint, and argo resolves a templateRef'd spec's entrypoint
+        /// from the template. A client-specified entrypoint would override it —
+        /// and must name an inner template *of that template* — so the old
+        /// hardcoded "gantry-verify" failed every submit against a template
+        /// that does not define one (`invalid spec: template reference
+        /// <name>.gantry-verify not found`, observed live on iad-ci). Omitting
+        /// it changes nothing for the shipped contrib template, whose own
+        /// entrypoint is `gantry-verify`.
+        ///
         /// Reference to the cluster's WorkflowTemplate (namespaced by default:
         /// clusterScope false, same namespace as the workflow).
         pub workflow_template_ref: WorkflowTemplateRef,
@@ -166,7 +183,14 @@ mod workflow {
         ///
         /// Parameters follow the gantry-verify template contract (plan §argo):
         /// repo, revision, args-json always; builder-image only when configured
-        /// (omitting it lets the WorkflowTemplate default apply).
+        /// (omitting it lets the WorkflowTemplate default apply). `contract-version`
+        /// is always sent — the client half of the handshake (plan §"Versioning &
+        /// compatibility"): the template echoes it back verbatim in verdict.json,
+        /// and the client reading a different echo is contract drift
+        /// (src/verdict.rs). Gates stay unsent here: they are opt-in from trusted
+        /// user config and the template's faithful-argv default ("[]") already
+        /// implements Q-2. No workflow-level `entrypoint` is sent — see
+        /// [`WorkflowSpec`].
         pub fn new(
             generate_name: &str,
             template_name: &str,
@@ -188,6 +212,10 @@ mod workflow {
                     name: "args-json".to_string(),
                     value: args_json.to_string(),
                 },
+                Parameter {
+                    name: "contract-version".to_string(),
+                    value: CONTRACT_VERSION.to_string(),
+                },
             ];
             if let Some(image) = builder_image {
                 parameters.push(Parameter {
@@ -203,7 +231,6 @@ mod workflow {
                     generate_name: generate_name.to_string(),
                 },
                 spec: WorkflowSpec {
-                    entrypoint: "gantry-verify".to_string(),
                     workflow_template_ref: WorkflowTemplateRef {
                         name: template_name.to_string(),
                         // Namespaced: the WorkflowTemplate lives in the same
@@ -858,14 +885,36 @@ impl RemoteBackend for ArgoBackend {
         }
     }
 
-    /// Wait for the workflow to complete and return its verdict.
+    /// Wait for the workflow to complete and return its verdict — the verdict
+    /// rung of [`Self::wait_outcome`], which owns the polling loop and the
+    /// verdict.json interpretation this delegates to. The taxonomy fields ride
+    /// [`Self::wait_outcome`]; this signature stays the ladder's shape so
+    /// verdict-only consumers compile unchanged.
+    fn wait(
+        &self,
+        h: &crate::backend::RunHandle,
+        deadline: Instant,
+    ) -> Result<Verdict, BackendError> {
+        // One watch, shared: the taxonomy needs the same poll this verdict
+        // comes from, and running the loop twice would double every poll.
+        self.wait_outcome(h, deadline)
+            .map(|(verdict, _failure_class)| verdict)
+    }
+
+    /// Wait for the workflow to complete and return its outcome: the verdict
+    /// plus the failure class the run's own verdict.json attributed to it
+    /// (plan §Component 5 failure taxonomy) — the pair the client records
+    /// into runs.jsonl so a failed run carries what it died of.
     ///
     /// Polls `kubectl get workflow -o json` until `status.phase` reaches a
     /// terminal rung or the deadline expires, whichever comes first. The loop
     /// is deadline-aware in both directions: it re-checks the deadline before
     /// every poll, and each pending sleep is clamped to the time remaining —
     /// wait() can never loop (or sleep) past its deadline. Expiry is a loud
-    /// [`BackendError`], which the caller classifies as InfraFailure.
+    /// [`BackendError`] (structured `deadline_exceeded`, so the caller
+    /// classifies it InfraFailure — never a fabricated verdict) carrying
+    /// [`Self::describe`]: the watch is abandoned, the workflow itself keeps
+    /// running on the cluster, and the run URL is how the operator finds it.
     ///
     /// The phase ladder is explicit ([`WorkflowPhase`]): no status / bare
     /// status / Pending / Running are pending; Succeeded / Failed / Error are
@@ -883,19 +932,34 @@ impl RemoteBackend for ArgoBackend {
     /// [`BackendError`] on stderr. Either way the terminal phase classifies
     /// the run (Succeeded → Pass, Failed → TestFailure, Error →
     /// InfraFailure). status.phase remains the authoritative terminal signal.
-    /// Attributions gate failures to "[gantry] gate:" in output.
-    fn wait(
+    /// Attributions gate failures to "[gantry] gate:" in output, and a
+    /// contract-version echo this client does not speak surfaces as the
+    /// explicit "contract drift" message the plan's versioning section
+    /// requires before its InfraFailure classification.
+    ///
+    /// The failure class is the parsed document's own, threaded verbatim —
+    /// the degradation paths (no usable document) have none, and whether a
+    /// class belongs on the record for the verdict it arrived with is the
+    /// runlog field contract's call, applied where the record is built.
+    fn wait_outcome(
         &self,
         h: &crate::backend::RunHandle,
         deadline: Instant,
-    ) -> Result<Verdict, BackendError> {
+    ) -> Result<(Verdict, Option<FailureClass>), BackendError> {
         loop {
             // Deadline first: no poll, sleep, or verdict may happen past it.
+            // The expiry abandons the watch — it does not cancel the
+            // workflow — so the error carries describe(): the run URL (or
+            // bare identifier) the operator needs once gantry stops
+            // watching (features.md v1.x "here's-the-run-URL message").
             if Instant::now() >= deadline {
-                return Err(BackendError::new(&format!(
-                    "workflow {} deadline exceeded while polling status.phase",
-                    h.handle
-                )));
+                return Err(BackendError::deadline_with_url(
+                    &format!(
+                        "workflow {} deadline exceeded while polling status.phase",
+                        h.handle
+                    ),
+                    &self.describe(h),
+                ));
             }
 
             // The `status` stanza is absent until the controller first
@@ -919,12 +983,25 @@ impl RemoteBackend for ArgoBackend {
             if let Some(value) = status.as_ref().and_then(|s| s.output_parameter("verdict")) {
                 match VerdictJson::parse(value) {
                     Ok(vj) => {
+                        // Contract drift first, loudly: the document echoed a
+                        // contract this client does not speak, so nothing
+                        // else it claims can be trusted — to_verdict()
+                        // classifies it InfraFailure, and the plan's
+                        // versioning section requires that classification to
+                        // arrive with an explicit "contract drift" message,
+                        // never as a bare verdict.
+                        if let Some(echo) = vj.contract_drift() {
+                            eprintln!(
+                                "[gantry] contract drift: verdict.json echoes contract_version {:?}, this client speaks {:?} — treating as infra failure",
+                                echo, CONTRACT_VERSION
+                            );
+                        }
                         let verdict = vj.to_verdict();
                         // Attributions for gate failures
                         if verdict == Verdict::GateFailure {
                             eprintln!("[gantry] gate: quality gate failed");
                         }
-                        return Ok(verdict);
+                        return Ok((verdict, vj.failure_class));
                     }
                     Err(e) => {
                         // The typed parse error (malformed JSON, unsupported
@@ -941,7 +1018,9 @@ impl RemoteBackend for ArgoBackend {
             // exit-code-only classifier ([`VerdictJson::from_exit_code`], via
             // [`WorkflowPhase::fallback_verdict`]) — the same ladder a parsed
             // document runs, fed only what the terminal phase can vouch for.
-            return Ok(phase.fallback_verdict());
+            // No document, no failure class: the degradation knows only what
+            // the phase can vouch for, and the class is not among it.
+            return Ok((phase.fallback_verdict(), None));
         }
     }
 
@@ -1013,6 +1092,7 @@ impl RemoteBackend for ArgoBackend {
 mod tests {
     use super::*;
     use crate::backend::RunHandle;
+    use crate::verdict::CONTRACT_VERSION;
 
     #[test]
     fn test_workflow_manifest_serialization() {
@@ -1035,9 +1115,10 @@ mod tests {
 
     /// The serialized manifest must match the expected Kubernetes/YAML structure
     /// exactly: k8s camelCase key names, the gantry-verify template contract, and
-    /// all four parameters (repo, revision, args-json, builder-image). kubectl
-    /// receives JSON on stdin, and JSON is a YAML subset, so this pins the YAML
-    /// manifest shape too. Object key order is irrelevant to the comparison.
+    /// all five parameters (repo, revision, args-json, contract-version,
+    /// builder-image). kubectl receives JSON on stdin, and JSON is a YAML subset,
+    /// so this pins the YAML manifest shape too. Object key order is irrelevant
+    /// to the comparison.
     #[test]
     fn test_workflow_manifest_matches_expected_yaml_structure() {
         let workflow = Workflow::new(
@@ -1059,7 +1140,6 @@ mod tests {
                 "generateName": "gantry-"
             },
             "spec": {
-                "entrypoint": "gantry-verify",
                 "workflowTemplateRef": {
                     "name": "gantry-verify"
                 },
@@ -1068,6 +1148,7 @@ mod tests {
                         { "name": "repo", "value": "https://github.com/example/repo" },
                         { "name": "revision", "value": "abc123" },
                         { "name": "args-json", "value": r#"["test","--","--nocapture"]"# },
+                        { "name": "contract-version", "value": CONTRACT_VERSION },
                         { "name": "builder-image", "value": "rust:1.83" },
                     ]
                 }
@@ -1079,6 +1160,7 @@ mod tests {
 
     /// Unconfigured builder image must omit the parameter entirely, so the
     /// WorkflowTemplate default applies (an empty-value override would break it).
+    /// `contract-version` is not optional — it rides every submission.
     #[test]
     fn test_workflow_manifest_omits_builder_image_when_unset() {
         let workflow = Workflow::new(
@@ -1093,7 +1175,7 @@ mod tests {
         let actual: serde_json::Value =
             serde_json::to_value(&workflow).expect("manifest must serialize");
 
-        // The whole manifest must match the three-parameter shape exactly:
+        // The whole manifest must match the four-parameter shape exactly:
         // no `builder-image` parameter, no `clusterScope` in the template
         // ref, and no other structural drift.
         let expected = serde_json::json!({
@@ -1103,7 +1185,6 @@ mod tests {
                 "generateName": "gantry-"
             },
             "spec": {
-                "entrypoint": "gantry-verify",
                 "workflowTemplateRef": {
                     "name": "gantry-verify"
                 },
@@ -1112,6 +1193,7 @@ mod tests {
                         { "name": "repo", "value": "https://github.com/example/repo" },
                         { "name": "revision", "value": "abc123" },
                         { "name": "args-json", "value": "[]" },
+                        { "name": "contract-version", "value": CONTRACT_VERSION },
                     ]
                 }
             }
@@ -1134,60 +1216,13 @@ mod tests {
         assert_eq!(config.base_url, None);
     }
 
-    #[test]
-    fn test_verdict_json_parse_pass() {
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Succeeded",
-            "exit_code": 0,
-            "oom": false,
-            "deadline_exceeded": false
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        assert_eq!(vj.to_verdict(), Verdict::Pass);
-    }
-
-    #[test]
-    fn test_verdict_json_parse_test_failure() {
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "test-failure"
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        assert_eq!(vj.to_verdict(), Verdict::TestFailure);
-    }
-
-    #[test]
-    fn test_verdict_json_parse_oom_is_infra_failure() {
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": true,
-            "deadline_exceeded": false
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        assert_eq!(vj.to_verdict(), Verdict::InfraFailure);
-    }
-
-    #[test]
-    fn test_verdict_json_parse_unsupported_version() {
-        let json = r#"{
-            "schema_version": 2,
-            "phase": "Succeeded",
-            "exit_code": 0
-        }"#;
-
-        let result = VerdictJson::parse(json);
-        assert!(result.is_err());
-    }
+    // verdict.json parser tests (schema versioning, failure_class presence /
+    // absence / invalid shapes, oom and deadline_exceeded defaults, the verdict
+    // ladder) live in src/verdict.rs — the single definition site of the
+    // verdict.json schema — rather than being duplicated here against the
+    // extraction (bf-2jnj, gantry-3eb02ee9). The tests below cover the
+    // *backend* side: wait() feeding a fetched verdict.json document through
+    // VerdictJson::parse to the Verdict it reports.
 
     #[test]
     fn test_argo_backend_describe_without_base_url() {
@@ -1247,92 +1282,6 @@ mod tests {
             description,
             "https://argo.example.com/workflows/my-namespace/test-workflow-abc123"
         );
-    }
-
-    #[test]
-    fn test_verdict_json_parse_gate_failure() {
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "gate-failure"
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        assert_eq!(vj.to_verdict(), Verdict::GateFailure);
-    }
-
-    #[test]
-    fn test_verdict_json_gate_failure_with_tests_passed() {
-        // Scenario: tests passed (exit 0) but clippy gate failed (overall exit 1)
-        // The verdict.json explicitly indicates gate failure
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "gate-failure"
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        let verdict = vj.to_verdict();
-
-        assert_eq!(verdict, Verdict::GateFailure);
-        // Verify gate failure never triggers local fallback (infra-only)
-        assert!(!verdict.is_infra_failure());
-        // Verify gate failure is considered a test result (tests ran)
-        assert!(verdict.has_test_result());
-    }
-
-    #[test]
-    fn test_verdict_json_test_failure_vs_gate_failure() {
-        // Test failure: no failure_class, exit 1, phase Failed
-        let test_json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false
-        }"#;
-
-        let test_vj = VerdictJson::parse(test_json).unwrap();
-        assert_eq!(test_vj.to_verdict(), Verdict::TestFailure);
-
-        // Gate failure: explicit failure_class
-        let gate_json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "gate-failure"
-        }"#;
-
-        let gate_vj = VerdictJson::parse(gate_json).unwrap();
-        assert_eq!(gate_vj.to_verdict(), Verdict::GateFailure);
-    }
-
-    #[test]
-    fn test_verdict_json_gate_failure_not_infra_failure() {
-        // Gate failures should NOT trigger local fallback
-        let json = r#"{
-            "schema_version": 1,
-            "phase": "Failed",
-            "exit_code": 1,
-            "oom": false,
-            "deadline_exceeded": false,
-            "failure_class": "gate-failure"
-        }"#;
-
-        let vj = VerdictJson::parse(json).unwrap();
-        let verdict = vj.to_verdict();
-
-        assert_eq!(verdict, Verdict::GateFailure);
-        assert_eq!(verdict.to_exit_code(), 1); // Same exit code as test failure
-        assert!(!verdict.is_infra_failure()); // Does NOT trigger local fallback
     }
 
     /// Write an executable mock kubectl into `dir` and return its path
@@ -1717,6 +1666,9 @@ mod tests {
         assert_eq!(value_of("repo"), "https://github.com/example/repo");
         assert_eq!(value_of("revision"), "abc123");
         assert_eq!(value_of("args-json"), r#"["--nocapture"]"#);
+        // The handshake rides every submission: the template echoes this back
+        // in verdict.json and the client reads a different echo as drift.
+        assert_eq!(value_of("contract-version"), CONTRACT_VERSION);
         assert_eq!(value_of("builder-image"), "rust:1.83");
     }
 
@@ -1888,6 +1840,36 @@ mod tests {
             with_exec_retry(|| backend.wait(&handle, Instant::now() + Duration::from_secs(5)))
                 .expect("wait must return on terminal phase");
         assert_eq!(verdict, Verdict::InfraFailure);
+    }
+
+    /// A verdict.json echoing a foreign contract_version is contract drift:
+    /// wait() classifies it InfraFailure no matter what the rest of the
+    /// document claims — here a *passing* document (Succeeded, exit 0) flips
+    /// to infra, the "never a misread verdict" half of the plan's handshake
+    /// rule. The explicit drift message itself is stderr surface (the
+    /// parse-level drift semantics are pinned in src/verdict.rs tests).
+    #[test]
+    fn test_wait_contract_drift_echo_is_infra_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let drifted = status_json_with_verdict(
+            "Succeeded",
+            r#"{"schema_version":1,"phase":"Succeeded","exit_code":0,"oom":false,"deadline_exceeded":false,"contract_version":"9"}"#,
+        );
+        let kubectl = write_mock_kubectl(
+            tmp.path(),
+            &format!("#!/usr/bin/env bash\ncat <<'JSON'\n{}\nJSON\n", drifted),
+        );
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let verdict =
+            with_exec_retry(|| backend.wait(&handle, Instant::now() + Duration::from_secs(5)))
+                .expect("wait must return on terminal phase");
+        assert_eq!(verdict, Verdict::InfraFailure);
+        assert!(verdict.is_infra_failure());
     }
 
     // --- the status.phase ladder --------------------------------------------
@@ -2067,7 +2049,7 @@ mod tests {
     fn wait_unsupported_schema_version_degrades_to_exit_code_only() {
         // Claims exit 1 — but a document this parser rejects is not
         // interpreted at all: the Succeeded phase decides, and that is Pass.
-        let future = r#"{"schema_version": 2, "phase": "Succeeded", "exit_code": 1}"#;
+        let future = r#"{"schema_version": 3, "phase": "Succeeded", "exit_code": 1}"#;
         let (fake, _) = FakeKubectl::serving(vec![ok_outcome(&status_json_with_verdict(
             "Succeeded",
             future,
@@ -2093,7 +2075,7 @@ mod tests {
             None,
             Some("{not json".to_string()),
             Some(String::new()),
-            Some(r#"{"schema_version": 2, "phase": "Succeeded", "exit_code": 1}"#.to_string()),
+            Some(r#"{"schema_version": 3, "phase": "Succeeded", "exit_code": 1}"#.to_string()),
         ];
         for shape in &shapes {
             let status_for = |terminal: &str| match shape {
@@ -2147,6 +2129,168 @@ mod tests {
         // Exactly one poll happened: the clamped sleep lands at (or past)
         // the deadline, so the loop errors before a second kubectl call.
         assert_eq!(calls_of(&calls).len(), 1, "wait polled past its deadline");
+    }
+
+    /// The expiry error is the structured deadline expiry AND it names the
+    /// run URL: the watch is abandoned, the workflow keeps running on the
+    /// cluster, and the operator needs describe() to find it (features.md
+    /// v1.x "a clear timed-out, here's-the-run-URL message").
+    #[test]
+    fn wait_expiry_error_is_structured_and_carries_the_run_url() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(tmp.path(), "#!/usr/bin/env bash\nexit 1\n");
+        let base = "https://argo.example.com";
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            base_url: Some(base.to_string()),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .wait(&handle, Instant::now() - Duration::from_secs(1))
+            .expect_err("wait must fail once the deadline has passed");
+        assert!(
+            err.deadline_exceeded,
+            "expiry must be the structured deadline error, got: {}",
+            err.reason
+        );
+        let expected_url = format!(
+            "{}/workflows/{}/gantry-abc123",
+            base, backend.config.namespace
+        );
+        assert_eq!(
+            err.run_url.as_deref(),
+            Some(expected_url.as_str()),
+            "the expiry error must carry describe()'s run URL"
+        );
+    }
+
+    /// A run that never reaches a terminal phase stops being watched at the
+    /// deadline: the structured expiry (with the run URL) comes out, and no
+    /// poll happens past the deadline — the watch loop cannot hang forever
+    /// on a workflow that never finishes.
+    #[test]
+    fn wait_midpoll_expiry_stops_watching_and_names_the_run_url() {
+        let (fake, _calls) = FakeKubectl::serving(vec![ok_outcome(&status_json("Running"))]);
+        let base = "https://argo.example.com";
+        let backend = ArgoBackend::with_runner(
+            ArgoConfig {
+                base_url: Some(base.to_string()),
+                ..ArgoConfig::default()
+            },
+            fake,
+        );
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .wait(&handle, Instant::now() + Duration::from_millis(150))
+            .expect_err("a never-finishing run must hit the deadline");
+        assert!(
+            err.deadline_exceeded,
+            "mid-poll expiry must be the structured deadline error, got: {}",
+            err.reason
+        );
+        assert!(
+            err.run_url
+                .as_deref()
+                .is_some_and(|u| u.contains("/workflows/") && u.ends_with("/gantry-abc123")),
+            "the expiry must carry describe()'s run URL, got: {:?}",
+            err.run_url
+        );
+    }
+
+    /// Without a configured base_url, describe() degrades to the bare
+    /// `workflow/<name>` identifier — the timeout line still points the
+    /// operator at something findable (`kubectl get workflow <name>`),
+    /// never at nothing.
+    #[test]
+    fn wait_expiry_without_base_url_falls_back_to_the_workflow_identifier() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kubectl = write_mock_kubectl(tmp.path(), "#!/usr/bin/env bash\nexit 1\n");
+        let backend = ArgoBackend::new(ArgoConfig {
+            kubectl_path: kubectl.to_string_lossy().into_owned(),
+            ..ArgoConfig::default()
+        });
+        let handle = RunHandle::new("gantry-abc123");
+
+        let err = backend
+            .wait(&handle, Instant::now() - Duration::from_secs(1))
+            .expect_err("wait must fail once the deadline has passed");
+        assert!(err.deadline_exceeded);
+        assert_eq!(
+            err.run_url.as_deref(),
+            Some("workflow/gantry-abc123"),
+            "no base_url must degrade to the workflow identifier"
+        );
+    }
+
+    /// The expiry/generic discrimination, both ways, out of the same wait
+    /// loop: a run that outlives its deadline surfaces as the structured
+    /// expiry — flag raised, the distinct "deadline exceeded while polling
+    /// status.phase" reason, the run URL — while a wait failure that is not
+    /// expiry (here a malformed status document, under a far-future
+    /// deadline) surfaces with the flag down, no run URL, and its own
+    /// reason. The caller's timeout line and InfraFailure classification
+    /// key off this flag, so a generic wait failure must never be able to
+    /// wear it — the two failure classes must stay tellable apart at the
+    /// wait boundary itself.
+    #[test]
+    fn wait_expiry_is_distinguishable_from_a_generic_wait_failure() {
+        let handle = RunHandle::new("gantry-abc123");
+
+        // Expiry: the workflow never leaves Running, so the loop-top
+        // deadline check is what ends the wait.
+        let (fake, _calls) = FakeKubectl::serving(vec![ok_outcome(&status_json("Running"))]);
+        let base = "https://argo.example.com";
+        let backend = ArgoBackend::with_runner(
+            ArgoConfig {
+                base_url: Some(base.to_string()),
+                ..ArgoConfig::default()
+            },
+            fake,
+        );
+        let expiry = backend
+            .wait(&handle, Instant::now() + Duration::from_millis(150))
+            .expect_err("a never-finishing run must hit its deadline");
+        assert!(
+            expiry.deadline_exceeded,
+            "expiry must raise the structured flag, got: {}",
+            expiry.reason
+        );
+        assert!(
+            expiry
+                .reason
+                .contains("deadline exceeded while polling status.phase"),
+            "expiry must carry the distinct deadline reason, got: {}",
+            expiry.reason
+        );
+        assert!(
+            expiry.run_url.is_some(),
+            "expiry must carry describe()'s run URL"
+        );
+
+        // Generic wait failure: the same entry point, but the status
+        // document is malformed and the deadline never passes — the error
+        // must come from the ladder, not from expiry.
+        let (fake, _calls) =
+            FakeKubectl::serving(vec![ok_outcome(r#"{"status":{"phase":"Succeeded""#)]);
+        let generic = backend_with_runner(fake)
+            .wait(&handle, Instant::now() + Duration::from_secs(30))
+            .expect_err("a malformed status document must fail the wait");
+        assert!(
+            !generic.deadline_exceeded,
+            "a generic wait failure must not wear the expiry flag: {}",
+            generic.reason
+        );
+        assert_eq!(
+            generic.run_url, None,
+            "only deadline expiry carries the run URL"
+        );
+        assert_ne!(
+            generic.reason, expiry.reason,
+            "the two failure classes must not share a reason string"
+        );
     }
 
     /// An unrecognized phase string is a loud error naming the value — not a

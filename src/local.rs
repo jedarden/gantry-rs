@@ -120,6 +120,17 @@ const POLL_MAX: Duration = Duration::from_millis(1000);
 /// unchanged position. Loud does not mean one line per 100 ms poll.
 const QUEUE_LINE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Bounded retries while locking a freshly minted ticket (`mint_ticket`).
+/// The only legitimate competing holder of that lock is another waiter's
+/// `ahead_count` scan, which holds it for the single marker read it takes
+/// to classify the ticket, so a handful of short retries sits orders of
+/// magnitude above any real hold; exhaustion means genuine breakage and
+/// still fails the mint loudly (EC-08 degrades, it never spins).
+const MINT_LOCK_RETRIES: u32 = 50;
+
+/// Pause between [`MINT_LOCK_RETRIES`] attempts.
+const MINT_LOCK_RETRY_PAUSE: Duration = Duration::from_millis(2);
+
 // ============================================================================
 // Kernel locks
 // ============================================================================
@@ -243,9 +254,9 @@ impl QueueClass {
 
 /// The single systemd user slice every gantry-spawned local run lands in
 /// (plan Component 6). The slice unit carries the box-level *sum* cap —
-/// `local.slice_cpu_quota_pct` / `local.slice_memory_max` — so the total load
-/// of all gantry runs stays inside it no matter how many per-run scopes nest
-/// beneath.
+/// fixed at 12 CPU / 32G until the `local.slice_*` tuning keys land with
+/// the slice-config surface — so the total load of all gantry runs stays
+/// inside it no matter how many per-run scopes nest beneath.
 pub const SLICE_NAME: &str = "gantry.slice";
 
 /// How the next local child is spawned.
@@ -324,6 +335,21 @@ fn slice_launch_command(
 /// `~/.config/systemd/user`) — where the slice unit is provisioned.
 fn user_unit_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("systemd").join("user"))
+}
+
+/// The slice unit file's path — the single spelling of where the unit lives,
+/// shared by provisioning ([`provision_slice`]) and retirement
+/// (`crate::uninstall`), so the two can never disagree about the location.
+pub(crate) fn slice_unit_path() -> Option<PathBuf> {
+    user_unit_dir().map(|d| d.join(SLICE_NAME))
+}
+
+/// Reload the user systemd manager after a slice-unit change on disk
+/// (provisioning reloads after a write; uninstall after a removal).
+/// Best-effort by contract: the caller degrades with a note — a stale
+/// manager view is never worth failing an uninstall over.
+pub(crate) fn reload_user_manager() -> Result<(), String> {
+    systemctl_user(&["daemon-reload"])
 }
 
 /// Find an executable `name` in a PATH-style string. Pure over the supplied
@@ -473,6 +499,13 @@ struct Decision {
 /// [`Self::spawn`], which returns the child's [`ExitStatus`] unchanged — the
 /// systemd-run wrapper (when active) waits for the child and propagates its
 /// exit code, so every call site keeps its existing INV-3 mapping.
+/// Boxwide `gantry.slice` sum-cap defaults (plan Component 6): 12 CPU / 32G.
+/// These mirror the `crate::config::DEFAULT_SLICE_*` surface, which lands
+/// with the slice-config slice; until then the sum cap is fixed here and the
+/// placement cannot be switched off via config.
+const DEFAULT_SLICE_CPU_QUOTA_PCT: u32 = 1200;
+const DEFAULT_SLICE_MEMORY_MAX: &str = "32G";
+
 pub struct SlicePlacement {
     enabled: bool,
     cpu_quota_pct: u32,
@@ -486,11 +519,16 @@ impl SlicePlacement {
     /// Read the placement configuration from the layered config.
     pub fn from_config(config: &Config) -> Self {
         Self {
-            enabled: config.local.slice_enabled,
+            // `local.slice_enabled` (the operator opt-out) and the
+            // `local.slice_*` tuning keys land with the slice-config
+            // surface; until then the placement is always on at the default
+            // sum cap, and `decide` degrades loudly when systemd-run is
+            // unavailable.
+            enabled: true,
             cpu_quota_pct: u32::from(config.local.cpu_quota_pct),
             memory_max: config.local.memory_max.clone(),
-            slice_cpu_quota_pct: config.local.slice_cpu_quota_pct,
-            slice_memory_max: config.local.slice_memory_max.clone(),
+            slice_cpu_quota_pct: DEFAULT_SLICE_CPU_QUOTA_PCT,
+            slice_memory_max: DEFAULT_SLICE_MEMORY_MAX.to_string(),
             decision: std::sync::OnceLock::new(),
         }
     }
@@ -742,6 +780,7 @@ impl FallbackSemaphore {
     /// degraded), hold its exclusive lock from this instant, and mark it with
     /// the waiter's [`QueueClass`] — the only record of the class another
     /// waiter (which cannot see this process's environment) can read.
+    #[allow(clippy::io_other_error)] // Keep the crate's Rust 1.70 MSRV.
     fn mint_ticket(&self, class: QueueClass) -> Result<Ticket, SemaphoreError> {
         let tickets_dir = self.dir.join("tickets");
         io_map(fs::create_dir_all(&tickets_dir), &tickets_dir)?;
@@ -773,18 +812,25 @@ impl FallbackSemaphore {
         write_counter(&tickets_dir, number)?;
         drop(queue_lock);
 
-        // We just created the file, so the lock cannot already be held —
-        // failure here would mean the world changed underneath us; fail
-        // loudly rather than queue out of order.
-        if !try_lock_exclusive(&file) {
-            return Err(SemaphoreError::Io {
-                path,
-                // `io::Error::other` is 1.74+ and this crate's MSRV is 1.70.
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "freshly minted ticket is already locked",
-                ),
-            });
+        // Created here, so a held lock can only be the transient kind of
+        // racer documented on [`MINT_LOCK_RETRIES`] — another waiter's
+        // `ahead_count` scan, one marker read long. Ride it out with the
+        // bounded retries; exhaustion is genuine breakage and still fails
+        // the mint loudly rather than queue out of order.
+        let mut attempts = 0;
+        while !try_lock_exclusive(&file) {
+            attempts += 1;
+            if attempts >= MINT_LOCK_RETRIES {
+                return Err(SemaphoreError::Io {
+                    path,
+                    // `io::Error::other` is 1.74+ and this crate's MSRV is 1.70.
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "freshly minted ticket is already locked",
+                    ),
+                });
+            }
+            std::thread::sleep(MINT_LOCK_RETRY_PAUSE);
         }
 
         // Mark the ticket with its queue class before any scanner can count
@@ -948,6 +994,11 @@ pub struct FallbackContext<'a> {
     pub gate_ms: u64,
     /// RefPusher duration already spent upstream (ms).
     pub push_ms: u64,
+    /// Deadline-expiry detail ([`crate::runlog::TimeoutExpiry`]) to stamp on
+    /// the terminal record: which backend's watch ran out, on which of its
+    /// runs, and the expiry reason. `Some` only when this fallback follows a
+    /// deadline expiry — every other fallback names no timeout.
+    pub timeout: Option<crate::runlog::TimeoutExpiry>,
 }
 
 /// Run a degraded local invocation through the admission semaphore — the
@@ -968,6 +1019,48 @@ pub struct FallbackContext<'a> {
 /// outranks the cap (module docs).
 pub fn run_fallback(
     config: &Config,
+    args: &[String],
+    infra_reason: &str,
+    ctx: &FallbackContext<'_>,
+) -> i32 {
+    // Same resolution contract as every local tail: the shim's rules, never
+    // a fallback-to-self (plan §1).
+    let real = match crate::shim::resolve_real_binary(config) {
+        Ok(path) => path,
+        Err(why) => {
+            eprintln!("[gantry] {why}");
+            // Flight recorder (plan Component 7): the fallback is an
+            // InfraFailure tail like the remote stages, so the bundle is
+            // written before the verdict record closes the run.
+            crate::crash::record_stage(
+                config,
+                ctx.run_id,
+                "fallback-resolve",
+                &why.to_string(),
+                None,
+                None,
+                None,
+            );
+            record_fallback_verdict(ctx, Verdict::InfraFailure, 1, 0, 0);
+            eprintln!("[gantry] verdict: InfraFailure");
+            return 1;
+        }
+    };
+    run_fallback_program(config, &real, args, infra_reason, ctx)
+}
+
+/// The fallback tail for an already-resolved program — [`run_fallback`] with
+/// the spawn target supplied by the caller instead of resolved `cargo`.
+///
+/// `gantry run` lands here on every remote-path infra failure: the wrapped
+/// command is not cargo, so resolution is the caller's business (it applies
+/// [`crate::shim::resolve_command_binary`] to the wrapped argv's own program
+/// and owns the resolve-failure contract); this tail is everything after —
+/// the loud infra lines, the admission slot, the capped spawn, and the
+/// `ran: local_after_infra` verdict record.
+pub fn run_fallback_program(
+    config: &Config,
+    program: &Path,
     args: &[String],
     infra_reason: &str,
     ctx: &FallbackContext<'_>,
@@ -1011,24 +1104,8 @@ pub fn run_fallback(
     }
     let queue_ms = queue_start.elapsed().as_millis() as u64;
 
-    // Same resolution contract as every local tail: the shim's rules, never
-    // a fallback-to-self (plan §1).
     let run_start = Instant::now();
-    let real = match crate::shim::resolve_real_binary(config) {
-        Ok(path) => path,
-        Err(why) => {
-            eprintln!("[gantry] {why}");
-            record_fallback_verdict(
-                ctx,
-                Verdict::InfraFailure,
-                1,
-                queue_ms,
-                run_start.elapsed().as_millis() as u64,
-            );
-            eprintln!("[gantry] verdict: InfraFailure");
-            return 1;
-        }
-    };
+    let real = program.to_path_buf();
 
     // Slice-placed and per-run-capped (plan Component 6): the capped fallback
     // is exactly the run class the boxwide slice exists to bound.
@@ -1046,6 +1123,17 @@ pub fn run_fallback(
         }
         Err(why) => {
             eprintln!("[gantry] failed to run `{}`: {why}", real.display());
+            // Flight recorder (plan Component 7): same InfraFailure tail
+            // contract as the resolve failure above.
+            crate::crash::record_stage(
+                config,
+                ctx.run_id,
+                "fallback-spawn",
+                &why.to_string(),
+                None,
+                None,
+                None,
+            );
             (Verdict::InfraFailure, 1)
         }
     };
@@ -1086,7 +1174,11 @@ fn record_fallback_verdict(
                 queue: queue_ms,
                 run: run_ms,
             }),
-        );
+        )
+        // A deadline expiry's timeout detail rides the context so the one
+        // terminal record names the timeout instead of losing it to this
+        // local rerun's outcome; every other fallback carries none.
+        .with_timeout(ctx.timeout.clone());
         if let Err(e) = rl.close_verdict(&record) {
             eprintln!("[gantry] warning: cannot write verdict record: {}", e);
         }
@@ -1124,6 +1216,137 @@ mod tests {
 
     fn semaphore(dir: PathBuf, slots: u32, wait_ms: u64) -> FallbackSemaphore {
         FallbackSemaphore::open_with(dir, slots, Duration::from_millis(wait_ms)).unwrap()
+    }
+
+    /// The fallback ladder's ledger side of the deadline tail (plan
+    /// Component 6, DD-4): the expiry rides the context onto the one
+    /// terminal record, and fallbacks without an expiry keep the field off
+    /// the wire.
+    mod fallback_timeout_stamping {
+        use super::*;
+        use crate::runlog::{Decision, GateInputs, IntentRecord, TimeoutExpiry};
+
+        /// The remote-run intent the ladder closes (the AS-2 shape).
+        fn intent() -> IntentRecord {
+            IntentRecord::new(
+                "cargo".to_string(),
+                vec!["test".to_string()],
+                "https://github.com/example/repo".to_string(),
+                "abc123".to_string(),
+                PathBuf::from("."),
+                GateInputs {
+                    worktree: true,
+                    head: true,
+                    remote: true,
+                    clean: true,
+                },
+                Decision::Remote,
+                String::new(),
+                "argo".to_string(),
+            )
+        }
+
+        fn verdict_lines(raw: &str) -> Vec<&str> {
+            raw.lines()
+                .filter(|line| line.contains(r#""rec":"verdict""#))
+                .collect()
+        }
+
+        #[test]
+        fn expiry_fallback_stamps_the_deadline_expiry_on_the_one_terminal_record() {
+            let dir = TempDir::new().unwrap();
+            let rl = RunLog::open_in(dir.path());
+            let intent = intent();
+            rl.open_intent(&intent).unwrap();
+
+            // The expiry the decision tail builds: the backend in its config
+            // spelling, the abandoned run's handle, the reason verbatim.
+            let expiry = TimeoutExpiry {
+                backend: "argo".to_string(),
+                handle: "gantry-x7k2p".to_string(),
+                reason: "workflow gantry-x7k2p deadline exceeded while polling status.phase"
+                    .to_string(),
+            };
+            let ctx = FallbackContext {
+                runlog: Some(&rl),
+                run_id: &intent.run_id,
+                gate_ms: 5,
+                push_ms: 7,
+                timeout: Some(expiry.clone()),
+            };
+
+            record_fallback_verdict(&ctx, Verdict::Pass, 0, 3, 11);
+
+            // One terminal record: the ladder's, closing the intent. The
+            // remote attempt writes none on this path — its classification
+            // home is the flight recorder.
+            let ledger = rl.read_entries().unwrap();
+            assert_eq!(
+                ledger.entries.len(),
+                1,
+                "the expiry path closes the run with exactly one record"
+            );
+            let record = ledger.entries[0]
+                .verdict
+                .as_ref()
+                .expect("the fallback closes the intent");
+            assert_eq!(record.ran, RanLocation::LocalAfterInfra);
+            assert_eq!(record.verdict, Verdict::Pass);
+            assert_eq!(record.timeout.as_ref(), Some(&expiry));
+
+            // On the wire: `ran: local_after_infra` naming the expiry.
+            let raw = fs::read_to_string(dir.path().join("runs.jsonl")).unwrap();
+            let lines = verdict_lines(&raw);
+            assert_eq!(lines.len(), 1, "one verdict line, not two: {raw}");
+            assert!(
+                lines[0].contains(r#""ran":"local_after_infra""#),
+                "{}",
+                lines[0]
+            );
+            assert!(lines[0].contains(r#""timeout":{"#), "{}", lines[0]);
+            let wire: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(wire["timeout"]["backend"], "argo");
+            assert_eq!(wire["timeout"]["handle"], "gantry-x7k2p");
+            assert_eq!(
+                wire["timeout"]["reason"],
+                "workflow gantry-x7k2p deadline exceeded while polling status.phase"
+            );
+        }
+
+        #[test]
+        fn non_expiry_fallback_writes_no_timeout_detail() {
+            // The local-decision fallback's context names no timeout (its
+            // watch never started), so its record keeps the field absent on
+            // the wire — the additive contract the bare wait-failure exit's
+            // record holds too.
+            let dir = TempDir::new().unwrap();
+            let rl = RunLog::open_in(dir.path());
+            let intent = intent();
+            rl.open_intent(&intent).unwrap();
+
+            let ctx = FallbackContext {
+                runlog: Some(&rl),
+                run_id: &intent.run_id,
+                gate_ms: 5,
+                push_ms: 7,
+                timeout: None,
+            };
+
+            record_fallback_verdict(&ctx, Verdict::TestFailure, 101, 3, 11);
+
+            let raw = fs::read_to_string(dir.path().join("runs.jsonl")).unwrap();
+            let lines = verdict_lines(&raw);
+            assert_eq!(lines.len(), 1, "one verdict line: {raw}");
+            assert!(
+                !lines[0].contains("timeout"),
+                "a fallback with no expiry must not name a timeout: {}",
+                lines[0]
+            );
+            let record: VerdictRecord = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(record.timeout, None);
+            assert_eq!(record.ran, RanLocation::LocalAfterInfra);
+            assert_eq!(record.verdict, Verdict::TestFailure);
+        }
     }
 
     #[test]
@@ -1548,8 +1771,8 @@ mod tests {
             enabled: true,
             cpu_quota_pct: 200,
             memory_max: "6G".to_string(),
-            slice_cpu_quota_pct: crate::config::DEFAULT_SLICE_CPU_QUOTA_PCT,
-            slice_memory_max: crate::config::DEFAULT_SLICE_MEMORY_MAX.to_string(),
+            slice_cpu_quota_pct: super::DEFAULT_SLICE_CPU_QUOTA_PCT,
+            slice_memory_max: super::DEFAULT_SLICE_MEMORY_MAX.to_string(),
             decision: std::sync::OnceLock::new(),
         };
         sp.decision
