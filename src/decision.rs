@@ -51,6 +51,19 @@ where
     }
 }
 
+/// Keep an originator's claim guard owned by the run path until that path
+/// returns. Passing the guard as an argument to this boundary makes the
+/// lifetime explicit: the dispatch/wait/fallback closure can only borrow it,
+/// and the guard is dropped after the closure returns on every exit path.
+fn run_with_originator_entry<T, F>(entry: Option<crate::jointable::JoinEntry>, run: F) -> T
+where
+    F: FnOnce(Option<&crate::jointable::JoinEntry>) -> T,
+{
+    let result = run(entry.as_ref());
+    drop(entry);
+    result
+}
+
 /// Run the decision pipeline for an intercepted subcommand.
 ///
 /// This is the core remote execution path (plan §"Architecture"):
@@ -275,96 +288,43 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         }
     };
 
-    // Steps 3 and 4 (originator and unjoined): push the epoch ref, then
-    // submit; a joiner skips both and meets them in Step 5's shared wait.
-    //
-    // The backend runs the argv templates the config resolved (user layer —
-    // the repo layer cannot set them, trust boundary S-2). Before
-    // gantry-f6c93e5a this site built the default-templated backend
-    // unconditionally, so a
-    // configured `[remote.command]` was silently dead: every submit ran the
-    // `./contrib/gantry-exec.sh` default and failed with "command not found"
-    // no matter what the user configured. `command: None` (backend = command
-    // with no template table) keeps the default templates.
-    let backend = build_backend(config);
-    let (handle, push_duration_ms, queue_duration_ms) = match attached_dispatch {
-        Some(dispatch) => dispatch,
-        None => match dispatch_with_join(None, || {
-            // Step 3: Push epoch ref via RefPusher
-            let push_start = Instant::now();
-            let push_result = RefPusher::push(config, sha, &run_id);
-            let push_duration_ms = push_start.elapsed().as_millis() as u64;
+    run_with_originator_entry(join_entry, |join_entry| {
+        // Steps 3 and 4 (originator and unjoined): push the epoch ref, then
+        // submit; a joiner skips both and meets them in Step 5's shared wait.
+        //
+        // The backend runs the argv templates the config resolved (user layer —
+        // the repo layer cannot set them, trust boundary S-2). Before
+        // gantry-f6c93e5a this site built the default-templated backend
+        // unconditionally, so a
+        // configured `[remote.command]` was silently dead: every submit ran the
+        // `./contrib/gantry-exec.sh` default and failed with "command not found"
+        // no matter what the user configured. `command: None` (backend = command
+        // with no template table) keeps the default templates.
+        let backend = build_backend(config);
+        let (handle, push_duration_ms, queue_duration_ms) = match attached_dispatch {
+            Some(dispatch) => dispatch,
+            None => match dispatch_with_join(None, || {
+                // Step 3: Push epoch ref via RefPusher
+                let push_start = Instant::now();
+                let push_result = RefPusher::push(config, sha, &run_id);
+                let push_duration_ms = push_start.elapsed().as_millis() as u64;
 
-            if !push_result.success {
-                eprintln!("[gantry] push failed: {}", push_result.reason);
-                eprintln!("[gantry] verdict: PushFailed");
+                if !push_result.success {
+                    eprintln!("[gantry] push failed: {}", push_result.reason);
+                    eprintln!("[gantry] verdict: PushFailed");
 
-                // Flight recorder (plan Component 7, bf-3mc): the push is where most
-                // infra flakes live (auth, remote reachability), so the bundle gathers
-                // the git state while it is still fresh.
-                // The pusher's reason is the raw response this stage surfaced, so it
-                // rides both the event line and the backend artifact channel.
-                record_infra_failure(
-                    config,
-                    &run_id,
-                    "push",
-                    &push_result.reason,
-                    None,
-                    Some(&push_result.reason),
-                    None,
-                );
-
-                // Write verdict record if runlog is available (infra failure path)
-                if let Some(rl) = &runlog {
-                    let _ = write_local_verdict(
-                        rl,
-                        run_id.clone(),
-                        crate::runlog::Verdict::InfraFailure,
-                        1,
-                        Some(Durations {
-                            gate: gate_duration_ms,
-                            push: push_duration_ms,
-                            queue: 0,
-                            run: 0,
-                        }),
-                    );
-                }
-
-                // Return non-zero to indicate infra failure
-                return Err(1);
-            }
-
-            // Step 4: Submit to the configured backend.
-
-            // Extract tool, subcommand, and args from the intercepted command
-            // Phase 0.5: tool is always "cargo", cwd_rel is empty (repo root)
-            let tool = "cargo";
-            let cwd_rel = "";
-            let (subcommand, run_args) = match args.split_first() {
-                Some((first, rest)) => (first.as_str(), rest.to_vec()),
-                None => {
-                    eprintln!("[gantry] error: no subcommand provided");
-                    return Err(1);
-                }
-            };
-
-            let spec = RunSpec::new(tool, subcommand, run_args, repo_url, sha, cwd_rel);
-
-            let handle = match backend.submit(&spec) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("[gantry] submit failed: {}", e);
-                    eprintln!("[gantry] verdict: InfraFailure");
-
-                    // Flight recorder (plan Component 7, bf-3mc): the backend's own
-                    // error text is the raw response a post-mortem wants.
+                    // Flight recorder (plan Component 7, bf-3mc): the push is where most
+                    // infra flakes live (auth, remote reachability), so the bundle gathers
+                    // the git state while it is still fresh.
+                    // The pusher's reason is the raw response this stage surfaced, so it
+                    // rides both the event line and the backend artifact channel.
                     record_infra_failure(
                         config,
                         &run_id,
-                        "submit",
-                        &e.reason,
+                        "push",
+                        &push_result.reason,
                         None,
-                        Some(&e.reason),
+                        Some(&push_result.reason),
                         None,
                     );
 
@@ -387,154 +347,209 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                     // Return non-zero to indicate infra failure
                     return Err(1);
                 }
-            };
 
-            // Open the attach window (plan Component 9): from here until the
-            // entry guard drops, identical invocations join this handle
-            // instead of submitting their own.
-            if let Some(entry) = &join_entry {
-                entry.record_handle(&handle);
+                // Step 4: Submit to the configured backend.
+
+                // Extract tool, subcommand, and args from the intercepted command
+                // Phase 0.5: tool is always "cargo", cwd_rel is empty (repo root)
+                let tool = "cargo";
+                let cwd_rel = "";
+                let (subcommand, run_args) = match args.split_first() {
+                    Some((first, rest)) => (first.as_str(), rest.to_vec()),
+                    None => {
+                        eprintln!("[gantry] error: no subcommand provided");
+                        return Err(1);
+                    }
+                };
+
+                let spec = RunSpec::new(tool, subcommand, run_args, repo_url, sha, cwd_rel);
+
+                let handle = match backend.submit(&spec) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("[gantry] submit failed: {}", e);
+                        eprintln!("[gantry] verdict: InfraFailure");
+
+                        // Flight recorder (plan Component 7, bf-3mc): the backend's own
+                        // error text is the raw response a post-mortem wants.
+                        record_infra_failure(
+                            config,
+                            &run_id,
+                            "submit",
+                            &e.reason,
+                            None,
+                            Some(&e.reason),
+                            None,
+                        );
+
+                        // Write verdict record if runlog is available (infra failure path)
+                        if let Some(rl) = &runlog {
+                            let _ = write_local_verdict(
+                                rl,
+                                run_id.clone(),
+                                crate::runlog::Verdict::InfraFailure,
+                                1,
+                                Some(Durations {
+                                    gate: gate_duration_ms,
+                                    push: push_duration_ms,
+                                    queue: 0,
+                                    run: 0,
+                                }),
+                            );
+                        }
+
+                        // Return non-zero to indicate infra failure
+                        return Err(1);
+                    }
+                };
+
+                // Open the attach window (plan Component 9): from here until the
+                // entry guard drops, identical invocations join this handle
+                // instead of submitting their own.
+                if let Some(entry) = join_entry {
+                    entry.record_handle(&handle);
+                }
+
+                eprintln!("[gantry] submitted: {}", handle.handle);
+
+                let queue_end = Instant::now();
+                let queue_duration_ms =
+                    (queue_end - push_start - std::time::Duration::from_millis(push_duration_ms))
+                        .as_millis() as u64;
+                Ok((handle, push_duration_ms, queue_duration_ms))
+            }) {
+                Ok(dispatch) => dispatch,
+                Err(code) => return code,
+            },
+        };
+
+        let run_start = Instant::now();
+        let deadline = Instant::now() + backend_wait_deadline(config);
+        let verdict_result = backend.wait(&handle, deadline);
+        let run_duration_ms = run_start.elapsed().as_millis() as u64;
+
+        let verdict = match verdict_result {
+            Ok(v) => {
+                // A joiner owns a waiter registration, not the originator's
+                // entry. Once the shared backend returns a terminal verdict,
+                // reclaim the entry as well: the originator may have died after
+                // recording its handle but before its guard reached Drop.
+                if let Some(attach) = joined.as_ref() {
+                    attach.release();
+                }
+                v
             }
+            Err(e) => {
+                report_wait_failure(&e, &handle.handle);
 
-            eprintln!("[gantry] submitted: {}", handle.handle);
+                // Flight recorder (plan Component 7, bf-3mc): the failure happened
+                // after submit, so the bundle names the handle the run was watched
+                // under.
+                record_infra_failure(
+                    config,
+                    &run_id,
+                    "wait",
+                    &e.reason,
+                    Some(&handle.handle),
+                    Some(&e.reason),
+                    None,
+                );
 
-            let queue_end = Instant::now();
-            let queue_duration_ms =
-                (queue_end - push_start - std::time::Duration::from_millis(push_duration_ms))
-                    .as_millis() as u64;
-            Ok((handle, push_duration_ms, queue_duration_ms))
-        }) {
-            Ok(dispatch) => dispatch,
-            Err(code) => return code,
-        },
-    };
+                // A deadline expiry is the one wait failure that does not end the
+                // run here (DD-4, plan Component 6: "deadline-exceeded classify
+                // as InfraFailure → fallback"): the attempt above is classified
+                // and flight-recorded as the InfraFailure it is — never a
+                // fabricated verdict — and the run degrades through the capped-
+                // local ladder (AS-3) so the caller still lands a real result
+                // instead of a bare infra exit. The ladder closes the intent with
+                // the local outcome (`ran: local_after_infra`); the flight
+                // recorder is the remote attempt's classification home.
+                //
+                // Every other wait failure keeps this tail's bare InfraFailure
+                // exit: the degrade-to-local is the case the plan names for the
+                // expiry specifically, not a general wait-failure policy.
+                if e.deadline_exceeded {
+                    // The expiry's runs.jsonl home is the terminal record the
+                    // ladder below writes, so the timeout detail rides the
+                    // context: the backend in its config spelling, the abandoned
+                    // run's handle, and the expiry reason. That is what lets the
+                    // ledger's one record identify the deadline timeout instead
+                    // of losing it to the local rerun's outcome.
+                    let expiry = deadline_expiry(config, &handle, &e.reason);
+                    let ctx = crate::local::FallbackContext {
+                        runlog: runlog.as_ref(),
+                        run_id: &run_id,
+                        gate_ms: gate_duration_ms,
+                        push_ms: push_duration_ms + queue_duration_ms,
+                        timeout: Some(expiry),
+                    };
+                    return crate::local::run_fallback(config, args, &e.reason, &ctx);
+                }
 
-    let run_start = Instant::now();
-    let deadline = Instant::now() + backend_wait_deadline(config);
-    let verdict_result = backend.wait(&handle, deadline);
-    let run_duration_ms = run_start.elapsed().as_millis() as u64;
+                eprintln!("[gantry] verdict: InfraFailure");
 
-    let verdict = match verdict_result {
-        Ok(v) => {
-            // A joiner owns a waiter registration, not the originator's
-            // entry. Once the shared backend returns a terminal verdict,
-            // reclaim the entry as well: the originator may have died after
-            // recording its handle but before its guard reached Drop.
-            if let Some(attach) = joined.as_ref() {
-                attach.release();
+                // Write verdict record if runlog is available (infra failure path)
+                if let Some(rl) = runlog {
+                    let _ = write_verdict(
+                        &rl,
+                        run_id.clone(),
+                        Verdict::InfraFailure,
+                        RanLocation::Remote,
+                        1,
+                        handle.handle.clone(),
+                        Some(Durations {
+                            gate: gate_duration_ms,
+                            push: push_duration_ms,
+                            queue: queue_duration_ms,
+                            run: run_duration_ms,
+                        }),
+                    );
+                }
+
+                // Return non-zero to indicate infra failure
+                return 1;
             }
-            v
-        }
-        Err(e) => {
-            report_wait_failure(&e, &handle.handle);
+        };
 
-            // Flight recorder (plan Component 7, bf-3mc): the failure happened
-            // after submit, so the bundle names the handle the run was watched
-            // under.
+        // A terminal InfraFailure verdict is an infra exit like any other (plan
+        // Component 7, bf-3mc): the run produced no usable verdict, so the bundle
+        // is written even though wait() itself returned cleanly. Checked before
+        // the record below because Verdict is Copy but the runlog write moves it.
+        if verdict == Verdict::InfraFailure {
             record_infra_failure(
                 config,
                 &run_id,
-                "wait",
-                &e.reason,
+                "remote-verdict",
+                "remote run ended in InfraFailure",
                 Some(&handle.handle),
-                Some(&e.reason),
+                None,
                 None,
             );
-
-            // A deadline expiry is the one wait failure that does not end the
-            // run here (DD-4, plan Component 6: "deadline-exceeded classify
-            // as InfraFailure → fallback"): the attempt above is classified
-            // and flight-recorded as the InfraFailure it is — never a
-            // fabricated verdict — and the run degrades through the capped-
-            // local ladder (AS-3) so the caller still lands a real result
-            // instead of a bare infra exit. The ladder closes the intent with
-            // the local outcome (`ran: local_after_infra`); the flight
-            // recorder is the remote attempt's classification home.
-            //
-            // Every other wait failure keeps this tail's bare InfraFailure
-            // exit: the degrade-to-local is the case the plan names for the
-            // expiry specifically, not a general wait-failure policy.
-            if e.deadline_exceeded {
-                // The expiry's runs.jsonl home is the terminal record the
-                // ladder below writes, so the timeout detail rides the
-                // context: the backend in its config spelling, the abandoned
-                // run's handle, and the expiry reason. That is what lets the
-                // ledger's one record identify the deadline timeout instead
-                // of losing it to the local rerun's outcome.
-                let expiry = deadline_expiry(config, &handle, &e.reason);
-                let ctx = crate::local::FallbackContext {
-                    runlog: runlog.as_ref(),
-                    run_id: &run_id,
-                    gate_ms: gate_duration_ms,
-                    push_ms: push_duration_ms + queue_duration_ms,
-                    timeout: Some(expiry),
-                };
-                return crate::local::run_fallback(config, args, &e.reason, &ctx);
-            }
-
-            eprintln!("[gantry] verdict: InfraFailure");
-
-            // Write verdict record if runlog is available (infra failure path)
-            if let Some(rl) = runlog {
-                let _ = write_verdict(
-                    &rl,
-                    run_id.clone(),
-                    Verdict::InfraFailure,
-                    RanLocation::Remote,
-                    1,
-                    handle.handle.clone(),
-                    Some(Durations {
-                        gate: gate_duration_ms,
-                        push: push_duration_ms,
-                        queue: queue_duration_ms,
-                        run: run_duration_ms,
-                    }),
-                );
-            }
-
-            // Return non-zero to indicate infra failure
-            return 1;
         }
-    };
 
-    // A terminal InfraFailure verdict is an infra exit like any other (plan
-    // Component 7, bf-3mc): the run produced no usable verdict, so the bundle
-    // is written even though wait() itself returned cleanly. Checked before
-    // the record below because Verdict is Copy but the runlog write moves it.
-    if verdict == Verdict::InfraFailure {
-        record_infra_failure(
-            config,
-            &run_id,
-            "remote-verdict",
-            "remote run ended in InfraFailure",
-            Some(&handle.handle),
-            None,
-            None,
-        );
-    }
+        // Step 6: Write terminal verdict record (successful completion path)
+        if let Some(rl) = runlog {
+            let exit_code = verdict.to_exit_code();
+            let _ = write_verdict(
+                &rl,
+                run_id.clone(),
+                verdict,
+                RanLocation::Remote,
+                exit_code,
+                handle.handle.clone(),
+                Some(Durations {
+                    gate: gate_duration_ms,
+                    push: push_duration_ms,
+                    queue: queue_duration_ms,
+                    run: run_duration_ms,
+                }),
+            );
+        }
 
-    // Step 6: Write terminal verdict record (successful completion path)
-    if let Some(rl) = runlog {
-        let exit_code = verdict.to_exit_code();
-        let _ = write_verdict(
-            &rl,
-            run_id.clone(),
-            verdict,
-            RanLocation::Remote,
-            exit_code,
-            handle.handle.clone(),
-            Some(Durations {
-                gate: gate_duration_ms,
-                push: push_duration_ms,
-                queue: queue_duration_ms,
-                run: run_duration_ms,
-            }),
-        );
-    }
-
-    // Step 7: Print verdict trailer and return faithful exit code
-    eprintln!("[gantry] verdict: {}", verdict);
-    verdict.to_exit_code()
+        // Step 7: Print verdict trailer and return faithful exit code
+        eprintln!("[gantry] verdict: {}", verdict);
+        verdict.to_exit_code()
+    })
 }
 
 // ============================================================================
@@ -1521,7 +1536,9 @@ mod tests {
                 JoinDecision::Attach(attach) => {
                     dispatch_with_join(Some(&attach), originator_dispatch)
                 }
-                JoinDecision::Originator(_entry) => dispatch_with_join(None, originator_dispatch),
+                JoinDecision::Originator(entry) => run_with_originator_entry(Some(entry), |_| {
+                    dispatch_with_join(None, originator_dispatch)
+                }),
                 JoinDecision::Unjoined => dispatch_with_join(None, originator_dispatch),
             }
         }
@@ -1570,6 +1587,37 @@ mod tests {
             assert_eq!(submissions.len(), 1);
             assert_eq!(submissions[0].handle, handle);
             assert_eq!(submissions[0].spec.subcommand, "test");
+        }
+
+        #[test]
+        fn originator_entry_lives_through_run_path_then_releases_claim() {
+            use std::fs;
+
+            let state_dir = tempfile::tempdir().expect("create join state");
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let entry = match claim_in(state_dir.path(), &key, "originator", "recording")
+                .expect("originator claim succeeds")
+            {
+                JoinDecision::Originator(entry) => entry,
+                other => panic!("first claim must originate, got {other:?}"),
+            };
+
+            let saw_claim_during_run = run_with_originator_entry(Some(entry), |_| {
+                fs::read_dir(state_dir.path().join("join"))
+                    .expect("join directory exists while run owns claim")
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.path().extension().is_some_and(|ext| ext == "run"))
+            });
+            assert!(
+                saw_claim_during_run,
+                "the originator run must retain its claim through the run-path body"
+            );
+
+            assert!(matches!(
+                claim_in(state_dir.path(), &key, "next-originator", "recording")
+                    .expect("claim after run path returns succeeds"),
+                JoinDecision::Originator(_)
+            ));
         }
 
         #[test]
