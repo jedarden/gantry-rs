@@ -661,3 +661,66 @@ fn joiner_skips_push_and_submit_riding_the_originators_handle() {
         "the joiner submitted nothing: zero queue duration on its record"
     );
 }
+
+/// If the originator dies after submit, its guard cannot close the entry.
+/// The joiner still receives the shared terminal verdict and must reclaim the
+/// dead originator's entry itself.
+#[test]
+fn joiner_terminal_verdict_reclaims_dead_originator_entry() {
+    let f = fixture();
+
+    let mut originator = spawn_run(&f);
+    wait_for_recorded_line(&f, "submit ", RECORD_WAIT);
+    wait_until(
+        || recorded(&f).iter().any(|line| line.starts_with("wait ")),
+        ATTACH_WAIT,
+        "originator never reached its backend wait",
+    );
+
+    let entry = in_flight_entry(&f).expect("originator's claim is in flight");
+    wait_until(
+        || {
+            fs::read(&entry)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|doc| doc["handle"] == ORIGINATOR_HANDLE)
+        },
+        ATTACH_WAIT,
+        "originator entry never recorded the submitted handle",
+    );
+
+    let joiner = spawn_run(&f);
+    wait_until(
+        || {
+            recorded(&f)
+                .iter()
+                .filter(|line| line.starts_with("wait "))
+                .count()
+                >= 2
+        },
+        ATTACH_WAIT,
+        "joiner never attached before the originator died",
+    );
+
+    // SIGKILL bypasses the originator's guard. The joiner is now the only
+    // participant capable of closing the handle-bearing claim.
+    originator.kill().expect("SIGKILL the originator");
+    let status = originator.wait().expect("reap killed originator");
+    assert!(!status.success(), "the originator must not exit cleanly");
+
+    fs::write(&f.barrier, "go").expect("raise barrier");
+    finish(joiner, 0, "joiner");
+
+    assert!(
+        in_flight_entry(&f).is_none(),
+        "the joiner's terminal verdict must reclaim the dead originator entry"
+    );
+    assert_eq!(
+        recorded(&f)
+            .iter()
+            .filter(|line| line.starts_with("submit "))
+            .count(),
+        1,
+        "reclaim must not make the joiner submit a second run"
+    );
+}

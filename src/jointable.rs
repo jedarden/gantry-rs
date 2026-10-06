@@ -316,13 +316,7 @@ impl Drop for JoinEntry {
         // joiner reclaims it (module docs, Cleanup); an entry re-claimed by
         // a fresh invocation after a joiner's release is that claimant's,
         // and this drop must not close their key.
-        let ours = read_entry(&self.entry_path)
-            .ok()
-            .flatten()
-            .is_some_and(|doc| doc.run_id == self.run_id);
-        if ours {
-            let _ = fs::remove_file(&self.entry_path);
-        }
+        let _ = remove_entry_if_owner(&self.entry_path, &self.run_id);
     }
 }
 
@@ -353,13 +347,7 @@ impl AttachHandle {
     /// joiner's release let a new invocation originate mid-wait) must leave
     /// that new claim alone.
     pub fn release(&self) {
-        let ours = read_entry(&self.entry_path)
-            .ok()
-            .flatten()
-            .is_some_and(|doc| doc.run_id == self.originator_run_id);
-        if ours {
-            let _ = fs::remove_file(&self.entry_path);
-        }
+        let _ = remove_entry_if_owner(&self.entry_path, &self.originator_run_id);
     }
 }
 
@@ -750,6 +738,39 @@ fn poll_for_handle(
 // Entry and lock plumbing
 // ============================================================================
 
+/// Remove an entry only while it still belongs to `run_id`.
+///
+/// The ownership check and removal share the claim lock. Without that
+/// critical section, an old originator guard or joiner release could read its
+/// own document, lose the lock to a fresh claim, and then remove the fresh
+/// epoch's entry. Cleanup is best-effort at its call sites, but it must never
+/// cross an epoch boundary when the filesystem is healthy.
+fn remove_entry_if_owner(entry_path: &Path, run_id: &str) -> Result<(), JoinError> {
+    let lock_path = entry_path.with_extension("lock");
+    let lock = open_lock_file(&lock_path).map_err(|source| JoinError::Io {
+        path: lock_path,
+        source,
+    })?;
+    lock_exclusive_blocking(&lock);
+
+    if read_entry(entry_path)?
+        .as_ref()
+        .is_some_and(|doc| doc.run_id == run_id)
+    {
+        match fs::remove_file(entry_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(JoinError::Io {
+                    path: entry_path.to_path_buf(),
+                    source,
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read the entry document at `path`; `None` when there is none. A document
 /// that is not JSON of [`ENTRY_SCHEMA`] — malformed, or well-formed from a
 /// different schema version — is a parse error, never a stealable claim: it
@@ -1050,6 +1071,38 @@ mod tests {
             }
             other => panic!("handle-bearing entry must attach, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn joiner_release_reclaims_a_handle_bearing_dead_originator() {
+        // A SIGKILLed originator cannot run JoinEntry::drop. Once a joiner
+        // waits out the real handle, its terminal release must close that
+        // orphaned claim so the next identical invocation can originate.
+        let dir = tempfile::tempdir().unwrap();
+        let k = key("file:///r", "sha1", "test", &[]);
+        forge(dir.path(), &k, "run-dead-handle", "run-dead", dead_pid());
+
+        let attach = match claim_in(dir.path(), &k, "run-B", "command").unwrap() {
+            JoinDecision::Attach(attach) => attach,
+            other => panic!("dead handle-bearing originator must attach, got {other:?}"),
+        };
+        assert_eq!(
+            attachment_count(dir.path(), &k).unwrap(),
+            1,
+            "only the live joiner counts after the originator dies"
+        );
+
+        attach.release();
+        drop(attach);
+        assert_eq!(attachment_count(dir.path(), &k).unwrap(), 0);
+        assert!(
+            matches!(
+                claim_in(dir.path(), &k, "run-C", "command").unwrap(),
+                JoinDecision::Originator(_)
+            ),
+            "a terminal joiner release must reopen the key"
+        );
     }
 
     #[test]

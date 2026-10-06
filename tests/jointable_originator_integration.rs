@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use gantry::jointable::{attachment_count, JoinKey};
 use tempfile::TempDir;
 
 /// The handle the mock submit reports — what `record_handle` must land in
@@ -212,6 +213,37 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+fn git_output(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn originator_key(f: &Fixture) -> JoinKey {
+    let remote = git_output(f.repo.path(), &["remote", "get-url", "origin"]);
+    let repo_url = if remote.starts_with('/') || remote.starts_with('.') {
+        format!("file://{remote}")
+    } else {
+        remote
+    };
+    JoinKey::new(
+        &repo_url,
+        &git_output(f.repo.path(), &["rev-parse", "HEAD"]),
+        "cargo",
+        "test",
+        &[],
+    )
+}
+
 /// Spawn the intercepted run (`cargo test` through the gantry symlink) in
 /// the fixture repo, under the isolated HOME. Ambient GANTRY_* switches are
 /// stripped so the run takes the default arms (dedup on, remote eligible)
@@ -347,6 +379,15 @@ fn originator_entry_is_visible_in_flight_and_gone_after_terminal() {
         entries(f.home.path()).len(),
         1,
         "the attachment stays visible while the run is in flight"
+    );
+    assert!(
+        attachment_count(
+            &f.home.path().join(".local/state/gantry"),
+            &originator_key(&f),
+        )
+        .expect("count the originator attachment")
+            >= 1,
+        "the in-flight originator counts as a live attachment"
     );
 
     // Terminal: release the parked wait and let the run reach its verdict.

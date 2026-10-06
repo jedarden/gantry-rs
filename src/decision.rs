@@ -409,7 +409,16 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     let run_duration_ms = run_start.elapsed().as_millis() as u64;
 
     let verdict = match verdict_result {
-        Ok(v) => v,
+        Ok(v) => {
+            // A joiner owns a waiter registration, not the originator's
+            // entry. Once the shared backend returns a terminal verdict,
+            // reclaim the entry as well: the originator may have died after
+            // recording its handle but before its guard reached Drop.
+            if let Some(attach) = joined.as_ref() {
+                attach.release();
+            }
+            v
+        }
         Err(e) => {
             report_wait_failure(&e, &handle.handle);
 
