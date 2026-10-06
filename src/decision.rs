@@ -33,6 +33,24 @@ fn joiner_dispatch(handle: &RunHandle) -> (RunHandle, u64, u64) {
     (handle.clone(), 0, 0)
 }
 
+/// Select the pre-wait dispatch for an invocation. An attached invocation has
+/// already inherited both dispatch stages from its originator, so the
+/// originator closure must not be evaluated. Keeping that short-circuit in a
+/// small seam makes the side-effect boundary testable without weakening the
+/// process-level recording-backend proof.
+fn dispatch_with_join<F>(
+    attached: Option<&RunHandle>,
+    originator_dispatch: F,
+) -> Result<(RunHandle, u64, u64), i32>
+where
+    F: FnOnce() -> Result<(RunHandle, u64, u64), i32>,
+{
+    match attached {
+        Some(handle) => Ok(joiner_dispatch(handle)),
+        None => originator_dispatch(),
+    }
+}
+
 /// Run the decision pipeline for an intercepted subcommand.
 ///
 /// This is the core remote execution path (plan §"Architecture"):
@@ -264,19 +282,9 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     // no matter what the user configured. `command: None` (backend = command
     // with no template table) keeps the default templates.
     let backend = build_backend(config);
-    let (handle, push_duration_ms, queue_duration_ms) = match joined {
-        Some(attach) => {
-            // Joiner: the originator's epoch ref already carries the sha and
-            // its workflow is already running — push and submit would only
-            // duplicate them, so the joiner skips both outright and takes
-            // the originator's handle into Step 5's shared wait with zero
-            // push/queue durations: the recording wire shows exactly one
-            // submission per joined run. (Streaming the live run's output
-            // and the terminal-arm reclaim are the attach tail's remaining
-            // split children.)
-            joiner_dispatch(&attach.handle)
-        }
-        None => {
+    let attached_handle = joined.as_ref().map(|attach| &attach.handle);
+    let (handle, push_duration_ms, queue_duration_ms) =
+        match dispatch_with_join(attached_handle, || {
             // Step 3: Push epoch ref via RefPusher
             let push_start = Instant::now();
             let push_result = RefPusher::push(config, sha, &run_id);
@@ -302,10 +310,10 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                 );
 
                 // Write verdict record if runlog is available (infra failure path)
-                if let Some(rl) = runlog {
+                if let Some(rl) = &runlog {
                     let _ = write_local_verdict(
-                        &rl,
-                        run_id,
+                        rl,
+                        run_id.clone(),
                         crate::runlog::Verdict::InfraFailure,
                         1,
                         Some(Durations {
@@ -318,7 +326,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                 }
 
                 // Return non-zero to indicate infra failure
-                return 1;
+                return Err(1);
             }
 
             // Step 4: Submit to the configured backend.
@@ -331,7 +339,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                 Some((first, rest)) => (first.as_str(), rest.to_vec()),
                 None => {
                     eprintln!("[gantry] error: no subcommand provided");
-                    return 1;
+                    return Err(1);
                 }
             };
 
@@ -356,10 +364,10 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                     );
 
                     // Write verdict record if runlog is available (infra failure path)
-                    if let Some(rl) = runlog {
+                    if let Some(rl) = &runlog {
                         let _ = write_local_verdict(
-                            &rl,
-                            run_id,
+                            rl,
+                            run_id.clone(),
                             crate::runlog::Verdict::InfraFailure,
                             1,
                             Some(Durations {
@@ -372,7 +380,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                     }
 
                     // Return non-zero to indicate infra failure
-                    return 1;
+                    return Err(1);
                 }
             };
 
@@ -389,9 +397,11 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             let queue_duration_ms =
                 (queue_end - push_start - std::time::Duration::from_millis(push_duration_ms))
                     .as_millis() as u64;
-            (handle, push_duration_ms, queue_duration_ms)
-        }
-    };
+            Ok((handle, push_duration_ms, queue_duration_ms))
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(code) => return code,
+        };
 
     let run_start = Instant::now();
     let deadline = Instant::now() + backend_wait_deadline(config);
@@ -1448,6 +1458,90 @@ mod tests {
         let (handle, push_ms, queue_ms) = joiner_dispatch(&RunHandle::new("handle-originator"));
         assert_eq!(handle.handle, "handle-originator");
         assert_eq!((push_ms, queue_ms), (0, 0));
+    }
+
+    mod dispatch_selection {
+        use super::*;
+        use std::cell::Cell;
+
+        /// A tiny backend recorder keeps this unit test on the same backend
+        /// contract as the command recording fixture: a submit is an
+        /// observable side effect, not just a returned value.
+        #[derive(Default)]
+        struct RecordingBackend {
+            submits: Cell<u32>,
+        }
+
+        impl RemoteBackend for RecordingBackend {
+            fn submit(&self, _spec: &RunSpec) -> Result<RunHandle, BackendError> {
+                self.submits.set(self.submits.get() + 1);
+                Ok(RunHandle::new("recorded-originator"))
+            }
+
+            fn wait(
+                &self,
+                _handle: &RunHandle,
+                _deadline: Instant,
+            ) -> Result<Verdict, BackendError> {
+                Ok(Verdict::Pass)
+            }
+        }
+
+        #[test]
+        fn attach_does_not_invoke_recorded_push_or_submit() {
+            let backend = RecordingBackend::default();
+            let pushes = Cell::new(0);
+            let originator = RunHandle::new("recorded-originator");
+
+            let (handle, push_ms, queue_ms) = dispatch_with_join(Some(&originator), || {
+                pushes.set(pushes.get() + 1);
+                let submitted = backend
+                    .submit(&RunSpec::new(
+                        "cargo",
+                        "test",
+                        Vec::new(),
+                        "file:///repo",
+                        "abc123",
+                        "",
+                    ))
+                    .map_err(|_| 1)?;
+                Ok((submitted, 17, 23))
+            })
+            .expect("attach dispatch succeeds");
+
+            assert_eq!(handle, originator);
+            assert_eq!((push_ms, queue_ms), (0, 0));
+            assert_eq!(pushes.get(), 0, "Attach must skip the epoch-ref push");
+            assert_eq!(backend.submits.get(), 0, "Attach must skip backend submit");
+        }
+
+        #[test]
+        fn originator_and_unjoined_dispatch_keep_recorded_stages() {
+            for path in ["originator", "unjoined"] {
+                let backend = RecordingBackend::default();
+                let pushes = Cell::new(0);
+                let (handle, push_ms, queue_ms) = dispatch_with_join(None, || {
+                    pushes.set(pushes.get() + 1);
+                    let submitted = backend
+                        .submit(&RunSpec::new(
+                            "cargo",
+                            "test",
+                            Vec::new(),
+                            "file:///repo",
+                            "abc123",
+                            "",
+                        ))
+                        .map_err(|_| 1)?;
+                    Ok((submitted, 17, 23))
+                })
+                .unwrap_or_else(|error| panic!("{path} dispatch failed: {error}"));
+
+                assert_eq!(handle, RunHandle::new("recorded-originator"));
+                assert_eq!((push_ms, queue_ms), (17, 23));
+                assert_eq!(pushes.get(), 1, "{path} must retain the push stage");
+                assert_eq!(backend.submits.get(), 1, "{path} must retain submit");
+            }
+        }
     }
 
     mod wait_failure_reporting {
