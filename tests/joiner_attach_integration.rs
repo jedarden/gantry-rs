@@ -504,9 +504,23 @@ fn joiner_skips_push_and_submit_riding_the_originators_handle() {
     // Its run id is the originator's — the discriminator that tells the two
     // terminal records apart in the shared ledger once both runs land.
     let entry = in_flight_entry(&f).expect("originator's claim is in flight");
+    wait_until(
+        || {
+            fs::read(&entry)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|doc| doc["handle"] == ORIGINATOR_HANDLE)
+        },
+        ATTACH_WAIT,
+        "originator entry never recorded the submitted handle",
+    );
     let entry_doc: serde_json::Value =
         serde_json::from_slice(&fs::read(&entry).expect("read entry document"))
             .expect("entry document is JSON");
+    assert_eq!(
+        entry_doc["handle"], ORIGINATOR_HANDLE,
+        "the in-flight originator entry must expose the handle returned by submit"
+    );
     let originator_run_id = entry_doc["run_id"]
         .as_str()
         .expect("the entry carries the originator's run id")
