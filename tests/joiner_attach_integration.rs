@@ -39,20 +39,32 @@ struct RunningChild {
 
 impl RunningChild {
     fn spawn(fixture: &Fixture) -> Self {
-        let child = Command::new(&fixture.cargo)
+        Self::spawn_with_join(fixture, true)
+    }
+
+    fn spawn_unjoined(fixture: &Fixture) -> Self {
+        Self::spawn_with_join(fixture, false)
+    }
+
+    fn spawn_with_join(fixture: &Fixture, join_enabled: bool) -> Self {
+        let mut command = Command::new(&fixture.cargo);
+        command
             .current_dir(&fixture.repo)
             .arg("test")
             .env("HOME", &fixture.home)
             .env("GANTRY_EXEC_PATH", &fixture.executor)
-            .env_remove("GANTRY_JOIN")
             .env_remove("GANTRY_LOCAL")
             .env_remove("GANTRY_ON")
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_STATE_HOME")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn intercepted cargo test");
+            .stderr(Stdio::piped());
+        if join_enabled {
+            command.env_remove("GANTRY_JOIN");
+        } else {
+            command.env("GANTRY_JOIN", "0");
+        }
+        let child = command.spawn().expect("spawn intercepted cargo test");
         Self { child }
     }
 
@@ -166,7 +178,7 @@ fn fixture() -> Fixture {
             "#!/bin/sh\n\
              printf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> '{}'\n\
              case \"$1\" in\n\
-             submit) printf '{}\\n' ;;\n\
+             submit) sleep 0.05; printf '{}\\n' ;;\n\
              wait) while [ ! -f '{}' ]; do sleep 0.01; done ;;\n\
              *) exit 3 ;;\n\
              esac\n",
@@ -250,6 +262,112 @@ fn verdicts(fixture: &Fixture) -> Vec<serde_json::Value> {
         .filter_map(|line| serde_json::from_str(line).ok())
         .filter(|record: &serde_json::Value| record["rec"] == "verdict")
         .collect()
+}
+
+fn assert_normal_dispatch(
+    fixture: &Fixture,
+    child: RunningChild,
+    expected_stderr: Option<&str>,
+) -> serde_json::Value {
+    wait_until(
+        || {
+            recorded(fixture)
+                .iter()
+                .any(|line| line.starts_with("submit "))
+        },
+        "normal dispatch submit",
+    );
+    wait_until(
+        || epoch_refs(fixture).len() == 1,
+        "normal originator epoch-ref push",
+    );
+
+    fs::write(&fixture.barrier, "release").expect("release recording wait");
+    let stderr = child.finish();
+    assert!(
+        !stderr.contains("joining in-flight run"),
+        "a non-joiner must not take the Attach path: {stderr}"
+    );
+    if let Some(expected) = expected_stderr {
+        assert!(
+            stderr.contains(expected),
+            "normal dispatch missed expected path marker {expected:?}: {stderr}"
+        );
+    }
+
+    let wire = recorded(fixture);
+    assert_eq!(
+        wire.iter()
+            .filter(|line| line.starts_with("submit "))
+            .count(),
+        1,
+        "a non-joiner submits exactly once: {wire:?}"
+    );
+    let wait_handles: Vec<&str> = wire
+        .iter()
+        .filter(|line| line.starts_with("wait "))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .collect();
+    assert_eq!(wait_handles, vec![HANDLE]);
+    assert_eq!(epoch_refs(fixture).len(), 1);
+
+    let records = verdicts(fixture);
+    assert_eq!(
+        records.len(),
+        1,
+        "one normal invocation finishes: {records:?}"
+    );
+    let record = records.into_iter().next().expect("normal verdict");
+    assert_eq!(record["handle"], HANDLE);
+    let durations = record["durations_ms"]
+        .as_object()
+        .expect("normal verdict records stage durations");
+    assert!(durations["push"].is_u64());
+    assert!(durations["queue"].is_u64());
+    assert!(durations["run"].is_u64());
+    assert!(
+        durations["push"].as_u64().unwrap_or_default() > 0
+            || durations["queue"].as_u64().unwrap_or_default() > 0,
+        "normal dispatch must record measured dispatch time: {durations:?}"
+    );
+    record
+}
+
+#[test]
+fn originator_pushes_submits_and_records_dispatch_durations() {
+    let fixture = fixture();
+    let originator = RunningChild::spawn(&fixture);
+
+    wait_until(
+        || handle_bearing_entry(&fixture).is_some(),
+        "originator claim with submitted handle",
+    );
+    let (entry_path, entry) = handle_bearing_entry(&fixture).expect("read originator entry");
+    assert_eq!(entry["handle"], HANDLE);
+
+    let record = assert_normal_dispatch(&fixture, originator, None);
+    assert!(
+        !entry_path.exists(),
+        "the originator claim is released after its terminal verdict"
+    );
+    assert!(record["durations_ms"]["push"].is_u64());
+}
+
+#[test]
+fn unjoined_pushes_submits_and_records_dispatch_durations() {
+    let fixture = fixture();
+    let unjoined = RunningChild::spawn_unjoined(&fixture);
+
+    let record = assert_normal_dispatch(
+        &fixture,
+        unjoined,
+        Some("[gantry] dedup kill switch active: GANTRY_JOIN=0"),
+    );
+    assert!(
+        handle_bearing_entry(&fixture).is_none(),
+        "an unjoined invocation must not create an originator claim"
+    );
+    assert!(record["durations_ms"]["queue"].is_u64());
 }
 
 #[test]
