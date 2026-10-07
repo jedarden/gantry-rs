@@ -294,6 +294,17 @@ impl JoinEntry {
     /// exits, poll budget while it lives) — dedup degrades, dispatch never
     /// fails for the ledger's sake.
     pub fn record_handle(&self, handle: &RunHandle) {
+        // Recording changes the same document that reclaim and guard-drop
+        // remove. Keep the ownership check and replacement under the claim
+        // lock, otherwise a fresh claim could be installed between the read
+        // and write and receive a stale originator's handle.
+        let lock_path = self.entry_path.with_extension("lock");
+        let lock = match open_lock_file(&lock_path) {
+            Ok(lock) => lock,
+            Err(_) => return,
+        };
+        lock_exclusive_blocking(&lock);
+
         let updated = match read_entry(&self.entry_path) {
             Ok(Some(doc)) if doc.run_id == self.run_id => EntryDoc {
                 handle: handle.handle.clone(),

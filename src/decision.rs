@@ -1648,12 +1648,13 @@ mod tests {
                 other => panic!("first claim must originate, got {other:?}"),
             };
 
-            let result = record_originator_dispatch(Some(&owner), || Err(17));
+            let result = run_with_originator_entry(Some(owner), |entry| {
+                record_originator_dispatch(entry, || Err(17))
+            });
             assert_eq!(result, Err(17));
 
-            // A failed submit leaves the claim handle-less; the guard can
-            // then close it normally, allowing a fresh originator to claim.
-            drop(owner);
+            // A failed submit leaves the claim handle-less; the run boundary
+            // closes it normally, allowing a fresh originator to claim.
             assert!(matches!(
                 claim_in(state_dir.path(), &key, "next-originator", "recording")
                     .expect("claim after failed dispatch succeeds"),
