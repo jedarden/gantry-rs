@@ -8,7 +8,7 @@
 //! and this module provides the tripwire that keeps it that way.
 
 use crate::backend::{BackendError, RemoteBackend, RunHandle, RunSpec, Verdict};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::time::Instant;
 
 /// Deterministic stage values for decision-pipeline unit tests. A normal
@@ -23,6 +23,15 @@ pub(crate) const RECORDING_QUEUE_MS: u64 = 23;
 pub(crate) struct RecordedSubmission {
     pub(crate) spec: RunSpec,
     pub(crate) handle: RunHandle,
+}
+
+/// One epoch-ref push observed by [`RecordingDispatch`]. Keeping the inputs
+/// makes the fixture useful for more than counting calls: a dispatch test can
+/// prove that the push was made for the run it later submits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedPush {
+    pub(crate) sha: String,
+    pub(crate) run_id: String,
 }
 
 /// Deterministic in-process backend for decision-pipeline tests. It records
@@ -72,7 +81,7 @@ impl RemoteBackend for RecordingBackend {
 #[derive(Debug)]
 pub(crate) struct RecordingDispatch {
     pub(crate) backend: RecordingBackend,
-    epoch_ref_pushes: Cell<u32>,
+    epoch_ref_pushes: RefCell<Vec<RecordedPush>>,
     push_duration_ms: u64,
     queue_duration_ms: u64,
 }
@@ -91,15 +100,14 @@ impl RecordingDispatch {
     pub(crate) fn with_handle(handle: &str, push_duration_ms: u64, queue_duration_ms: u64) -> Self {
         Self {
             backend: RecordingBackend::new(handle),
-            epoch_ref_pushes: Cell::new(0),
+            epoch_ref_pushes: RefCell::new(Vec::new()),
             push_duration_ms,
             queue_duration_ms,
         }
     }
 
     pub(crate) fn dispatch_originator(&self) -> Result<(RunHandle, u64, u64), i32> {
-        self.epoch_ref_pushes
-            .set(self.epoch_ref_pushes.get().saturating_add(1));
+        self.record_ref_push("abc123", "recorded-run");
         let submitted = self
             .backend
             .submit(&RunSpec::new(
@@ -114,8 +122,19 @@ impl RecordingDispatch {
         Ok((submitted, self.push_duration_ms, self.queue_duration_ms))
     }
 
+    pub(crate) fn record_ref_push(&self, sha: &str, run_id: &str) {
+        self.epoch_ref_pushes.borrow_mut().push(RecordedPush {
+            sha: sha.to_string(),
+            run_id: run_id.to_string(),
+        });
+    }
+
+    pub(crate) fn ref_pushes(&self) -> Vec<RecordedPush> {
+        self.epoch_ref_pushes.borrow().clone()
+    }
+
     pub(crate) fn epoch_ref_pushes(&self) -> u32 {
-        self.epoch_ref_pushes.get()
+        self.epoch_ref_pushes.borrow().len() as u32
     }
 }
 

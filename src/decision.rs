@@ -1506,7 +1506,9 @@ mod tests {
     mod dispatch_selection {
         use super::*;
         use crate::jointable::{claim, claim_in, JoinDecision, JoinKey};
-        use crate::testutil::{RecordingDispatch, RECORDING_PUSH_MS, RECORDING_QUEUE_MS};
+        use crate::testutil::{
+            RecordedPush, RecordingDispatch, RECORDING_PUSH_MS, RECORDING_QUEUE_MS,
+        };
 
         fn real_attach() -> (
             tempfile::TempDir,
@@ -1574,6 +1576,10 @@ mod tests {
                 0,
                 "Attach must skip the epoch-ref push"
             );
+            assert!(
+                recorder.ref_pushes().is_empty(),
+                "Attach must not record a RefPusher::push call"
+            );
             assert_eq!(
                 recorder.backend.submissions().len(),
                 0,
@@ -1596,10 +1602,20 @@ mod tests {
             assert_eq!(handle, RunHandle::new("recorded-originator"));
             assert_eq!((push_ms, queue_ms), (RECORDING_PUSH_MS, RECORDING_QUEUE_MS));
             assert_eq!(recorder.epoch_ref_pushes(), 1);
+            assert_eq!(
+                recorder.ref_pushes(),
+                vec![RecordedPush {
+                    sha: "abc123".to_string(),
+                    run_id: "recorded-run".to_string(),
+                }]
+            );
             let submissions = recorder.backend.submissions();
             assert_eq!(submissions.len(), 1);
             assert_eq!(submissions[0].handle, handle);
+            assert_eq!(submissions[0].spec.tool, "cargo");
             assert_eq!(submissions[0].spec.subcommand, "test");
+            assert_eq!(submissions[0].spec.repo_url, "file:///repo");
+            assert_eq!(submissions[0].spec.sha, "abc123");
         }
 
         #[test]
@@ -1735,7 +1751,18 @@ mod tests {
             assert_eq!(handle, RunHandle::new("recorded-originator"));
             assert_eq!((push_ms, queue_ms), (RECORDING_PUSH_MS, RECORDING_QUEUE_MS));
             assert_eq!(recorder.epoch_ref_pushes(), 1);
-            assert_eq!(recorder.backend.submissions().len(), 1);
+            assert_eq!(
+                recorder.ref_pushes(),
+                vec![RecordedPush {
+                    sha: "abc123".to_string(),
+                    run_id: "recorded-run".to_string(),
+                }]
+            );
+            let submissions = recorder.backend.submissions();
+            assert_eq!(submissions.len(), 1);
+            assert_eq!(submissions[0].handle, handle);
+            assert_eq!(submissions[0].spec.subcommand, "test");
+            assert_eq!(submissions[0].spec.sha, "abc123");
         }
     }
 
