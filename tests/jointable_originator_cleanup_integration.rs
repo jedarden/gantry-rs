@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use gantry::jointable::{attachment_count, JoinKey};
 use tempfile::TempDir;
 
 const HANDLE: &str = "cleanup-handle";
@@ -87,6 +88,22 @@ impl Fixture {
             work,
             cargo,
         }
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.home.path().join(".local/state/gantry")
+    }
+
+    fn join_key(&self) -> JoinKey {
+        let output = Command::new("git")
+            .current_dir(self.repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git revision");
+        assert!(output.status.success(), "git rev-parse HEAD failed");
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let repo_url = format!("file://{}", self._remote.path().display());
+        JoinKey::new(&repo_url, &sha, "cargo", "test", &[])
     }
 }
 
@@ -227,11 +244,17 @@ fn release(fixture: &Fixture) {
 #[test]
 fn originator_entry_clears_after_terminal_verdict() {
     let fixture = Fixture::new();
+    let key = fixture.join_key();
+    let state_dir = fixture.state_dir();
     let child = spawn_run(&fixture);
     let document = wait_for_entry(&fixture, HANDLE);
     assert_eq!(document["backend"], "command");
     assert_eq!(document["pid"].as_u64(), Some(u64::from(child.id())));
     assert_eq!(entries(fixture.home.path()).len(), 1);
+    assert!(
+        attachment_count(&state_dir, &key).expect("count in-flight attachments") >= 1,
+        "an in-flight originator must be observable as an attachment"
+    );
 
     release(&fixture);
     let stderr = finish(child, 0);
@@ -243,11 +266,18 @@ fn originator_entry_clears_after_terminal_verdict() {
         entries(fixture.home.path()).is_empty(),
         "terminal originator guard left a claim behind"
     );
+    assert_eq!(
+        attachment_count(&state_dir, &key).expect("count terminal attachments"),
+        0,
+        "terminal originator must no longer be observable as an attachment"
+    );
 }
 
 #[test]
 fn failed_dispatch_clears_key_for_the_next_originator() {
     let fixture = Fixture::new();
+    let key = fixture.join_key();
+    let state_dir = fixture.state_dir();
     write_script(
         &fixture.work.path().join("submit"),
         "#!/usr/bin/env bash\necho submit-failed >&2\nexit 42\n",
@@ -255,6 +285,11 @@ fn failed_dispatch_clears_key_for_the_next_originator() {
     let stderr = finish(spawn_run(&fixture), 1);
     assert!(stderr.contains("verdict: InfraFailure"), "stderr: {stderr}");
     assert!(entries(fixture.home.path()).is_empty());
+    assert_eq!(
+        attachment_count(&state_dir, &key).expect("count after failed dispatch"),
+        0,
+        "failed dispatch must release the originator claim"
+    );
 
     write_script(
         &fixture.work.path().join("submit"),
@@ -263,6 +298,10 @@ fn failed_dispatch_clears_key_for_the_next_originator() {
     let second = spawn_run(&fixture);
     let document = wait_for_entry(&fixture, HANDLE);
     assert_eq!(document["pid"].as_u64(), Some(u64::from(second.id())));
+    assert!(
+        attachment_count(&state_dir, &key).expect("count second in-flight originator") >= 1,
+        "a failed dispatch must not wedge the next originator"
+    );
     release(&fixture);
     let stderr = finish(second, 0);
     assert!(
