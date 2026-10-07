@@ -60,13 +60,16 @@ impl RunLog {
         Ok(RunLog { log_path })
     }
 
-    /// Open a RunLog at an explicit path — the hermetic-test constructor (the
-    /// same seam as the gate's `_in` functions: `$HOME` is process-global
-    /// state, and tests never touch it). The parent directory must exist;
-    /// the log file itself is created on first append.
+    /// Open a runlog at an explicit state directory — the test seam that
+    /// keeps environment redirection out of the test process (a unit test
+    /// cannot export HOME, so it points the log at its temp dir instead;
+    /// same explicit-path convention as `check_git_gate_in` and
+    /// `RefPusher::push_in`).
     #[cfg(test)]
-    pub(crate) fn at_path(log_path: PathBuf) -> Self {
-        RunLog { log_path }
+    pub(crate) fn open_in(state_dir: &std::path::Path) -> Self {
+        RunLog {
+            log_path: state_dir.join("runs.jsonl"),
+        }
     }
 
     /// Write an OPEN intent record BEFORE dispatch.
@@ -378,34 +381,6 @@ pub struct IntentRecord {
 
     /// Backend chosen for this run (argo/command/none).
     pub backend: String,
-
-    /// Content hash of the tested tree (`git rev-parse HEAD^{tree}`) — the
-    /// ledger-intelligence identity of *what* was tested (plan Component 10).
-    /// Memoization keys on the tree rather than the sha (rebases/amends with
-    /// identical content hit), and flake flagging compares verdicts at
-    /// identical trees. Additive like `failure_class`: `None` on records
-    /// written before this field existed, and a record without it never
-    /// matches a memo key, gets superseded, or flags a flake.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tree_hash: Option<String>,
-
-    /// Originator process id, for the supersede zero-attachment rule (plan
-    /// Component 10): a still-running sibling is only superseded when its
-    /// originator is provably gone. `None` (legacy records) means liveness is
-    /// unprovable — such a sibling is never yanked.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u32>,
-
-    /// Toolchain identity (`rustc --version` output) — a memo key part (plan
-    /// Component 10): the same tree under a different toolchain is a
-    /// different test run.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toolchain: Option<String>,
-
-    /// Backend image digest when the producer pins one (`GANTRY_IMAGE_DIGEST`)
-    /// — a memo key part (plan Component 10). `None` matches only `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_digest: Option<String>,
 }
 
 impl IntentRecord {
@@ -441,10 +416,6 @@ impl IntentRecord {
             decision,
             reason,
             backend,
-            tree_hash: None,
-            pid: None,
-            toolchain: None,
-            image_digest: None,
         }
     }
 
@@ -487,6 +458,30 @@ pub enum Decision {
     Remote,
     /// Run locally (original decision).
     Local,
+}
+
+/// Deadline-expiry detail: which backend's watch ran out, on which of its
+/// runs, and why (features.md v1.x "timeout/deadline config per backend").
+///
+/// Stamped onto the terminal record of a run whose remote watch outlived its
+/// configured per-backend deadline — the expiry is classified upstream as
+/// [`Verdict::InfraFailure`] (DD-4, never a fabricated verdict) and the run
+/// degrades through the capped-local ladder, so this detail is how the
+/// ledger's one terminal record still identifies the timeout instead of
+/// losing it to the local rerun's outcome. The record's own `run_id` is the
+/// gantry run identifier; `handle` is the backend's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutExpiry {
+    /// The backend whose wait expired, in the config spelling
+    /// ([`crate::cli::backend_name`]: "argo", "command", "none").
+    pub backend: String,
+    /// The backend's own run identifier — the abandoned run's handle (the
+    /// argo workflow name, e.g.), still watchable on the remote after the
+    /// expiry abandoned it.
+    pub handle: String,
+    /// The backend's expiry reason, verbatim — the same string the
+    /// `[gantry] timeout` line printed.
+    pub reason: String,
 }
 
 /// Verdict record: terminal record written on every exit path.
@@ -535,20 +530,25 @@ pub struct VerdictRecord {
     )]
     pub failure_class: Option<crate::verdict::FailureClass>,
 
+    /// Deadline-expiry detail ([`TimeoutExpiry`]): present only on the
+    /// terminal record of a run whose remote watch outlived its configured
+    /// per-backend deadline. The expiry itself is classified InfraFailure
+    /// (DD-4, never a fabricated verdict) and the run degrades through the
+    /// capped-local ladder, so this is how the ledger's one terminal record
+    /// still identifies the timeout — backend, run handle, expiry reason —
+    /// instead of losing it to the local rerun's outcome. `None` on every
+    /// other record. Additive on write (skipped when absent), so records
+    /// from either schema parse everywhere the ledger does —
+    /// `SCHEMA_VERSION` stays 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<TimeoutExpiry>,
+
     /// Backend handle (workflow name, etc.) for `gantry why`.
     pub handle: String,
 
     /// Duration breakdown (milliseconds) for performance visibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durations_ms: Option<Durations>,
-
-    /// Flake flag (plan Component 10): the suite's outcome flipped a prior
-    /// terminal outcome at the same `(tree_hash, tool, args)` — the same
-    /// tree+args producing opposite results is the flake signature. Set by
-    /// [`crate::ledger::mark_flaky_if_flip`] before the record lands;
-    /// append-only ledger means only the flipping run carries the flag.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flaky_suspect: Option<bool>,
 }
 
 impl VerdictRecord {
@@ -572,10 +572,41 @@ impl VerdictRecord {
             ran,
             exit_code,
             failure_class: None,
+            timeout: None,
             handle,
             durations_ms,
-            flaky_suspect: None,
         }
+    }
+
+    /// Stamp the failure class a remote run died of (verdict.json v2, plan
+    /// §Component 5) onto the record.
+    ///
+    /// The remote arm's opt-in: `new()` defaults the field to `None` — the
+    /// shape every local run, infra path, and uninstrumented producer writes
+    /// per the field contract on the field above — and only the remote
+    /// pipeline calls this, with the class its parsed document carried. The
+    /// caller that knows the verdict decides whether a threaded class belongs
+    /// on the record it arrived with ([`crate::decision`]); this builder only
+    /// carries it.
+    pub fn with_failure_class(
+        mut self,
+        failure_class: Option<crate::verdict::FailureClass>,
+    ) -> Self {
+        self.failure_class = failure_class;
+        self
+    }
+
+    /// Stamp the deadline-expiry detail on the record.
+    ///
+    /// The expiry arm's opt-in: `new()` defaults the field to `None` — the
+    /// shape every non-expiry record writes, per the field contract above —
+    /// and only the deadline path calls this, with the backend, handle, and
+    /// reason its expiry carried. The caller that watched the run decides
+    /// whether an expiry belongs on the record it degrades ([`crate::decision`]);
+    /// this builder only carries it.
+    pub fn with_timeout(mut self, timeout: Option<TimeoutExpiry>) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Get current Unix timestamp in milliseconds.
@@ -784,57 +815,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ledger_key_fields_round_trip_additively() {
-        let mut intent = IntentRecord::new(
-            "cargo".to_string(),
-            vec!["test".to_string()],
-            "https://example.com/repo.git".to_string(),
-            "abc123".to_string(),
-            PathBuf::from("."),
-            GateInputs {
-                worktree: true,
-                head: true,
-                remote: true,
-                clean: true,
-            },
-            Decision::Remote,
-            "clean".to_string(),
-            "command".to_string(),
-        );
-        intent.tree_hash = Some("tree1234".to_string());
-        intent.pid = Some(4242);
-        intent.toolchain = Some("rustc 1.98.1".to_string());
-        intent.image_digest = Some("sha256:abc".to_string());
-
-        let json = serde_json::to_string(&intent).unwrap();
-        assert!(json.contains("\"tree_hash\":\"tree1234\""));
-        assert!(json.contains("\"pid\":4242"));
-
-        let parsed: IntentRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.tree_hash.as_deref(), Some("tree1234"));
-        assert_eq!(parsed.pid, Some(4242));
-        assert_eq!(parsed.toolchain.as_deref(), Some("rustc 1.98.1"));
-        assert_eq!(parsed.image_digest.as_deref(), Some("sha256:abc"));
-    }
-
-    #[test]
-    fn records_without_ledger_key_fields_parse_as_none() {
-        // A legacy intent record (pre-Component-10 shape): no tree_hash, pid,
-        // toolchain, or image_digest. The additive rule — they parse as None.
-        let legacy_intent = r#"{"rec":"intent","schema_version":1,"run_id":"r1","ts":1,"tool":"cargo","args":["test"],"repo":"https://example.com/r.git","sha":"abc","cwd_rel":".","gate":{"worktree":true,"head":true,"remote":true,"clean":true},"decision":"remote","reason":"clean","backend":"command"}"#;
-        let parsed: IntentRecord = serde_json::from_str(legacy_intent).unwrap();
-        assert_eq!(parsed.tree_hash, None);
-        assert_eq!(parsed.pid, None);
-        assert_eq!(parsed.toolchain, None);
-        assert_eq!(parsed.image_digest, None);
-
-        // Same for a legacy verdict record without the flake flag.
-        let legacy_verdict = r#"{"rec":"verdict","schema_version":1,"run_id":"r1","ts":2,"verdict":"pass","ran":"remote","exit_code":0,"handle":"wf"}"#;
-        let parsed: VerdictRecord = serde_json::from_str(legacy_verdict).unwrap();
-        assert_eq!(parsed.flaky_suspect, None);
-    }
-
-    #[test]
     fn intent_record_serializes_correctly() {
         let intent = IntentRecord::new(
             "cargo".to_string(),
@@ -877,10 +857,7 @@ mod tests {
         let intent = IntentRecord::new(
             "cargo".to_string(),
             vec!["test".to_string()],
-            format!(
-                "https://ci:{}@git.example/repo.git",
-                ["gantry", "synthetic", "pw"].join("-")
-            ),
+            "https://ci:hunter2@git.example/repo.git".to_string(),
             "abc123".to_string(),
             PathBuf::from("."),
             GateInputs {
@@ -893,11 +870,7 @@ mod tests {
             "clean".to_string(),
             "argo".to_string(),
         );
-        assert!(
-            !intent.repo.contains("gantry-synthetic-pw"),
-            "{}",
-            intent.repo
-        );
+        assert!(!intent.repo.contains("hunter2"), "{}", intent.repo);
         assert_eq!(intent.repo, "https://[REDACTED]@git.example/repo.git");
 
         // A clean URL is stored as given — S-5 strips userinfo, nothing else.
@@ -1229,5 +1202,348 @@ mod tests {
         assert_eq!(ledger.entries.len(), 2);
         assert_eq!(ledger.entries[0].intent.run_id, first.run_id);
         assert_eq!(ledger.entries[1].intent.run_id, second.run_id);
+    }
+
+    /// Every FailureClass survives the record's serde round trip as its
+    /// kebab-case wire name (plan §Component 5): the class a producer
+    /// stamped reads back as the same class, not as absent.
+    #[test]
+    fn verdict_record_failure_class_round_trips_through_the_kebab_wire_form() {
+        let classes = [
+            (crate::verdict::FailureClass::CompileError, "compile-error"),
+            (crate::verdict::FailureClass::TestFailure, "test-failure"),
+            (crate::verdict::FailureClass::Doctest, "doctest"),
+            (crate::verdict::FailureClass::HarnessPanic, "harness-panic"),
+            (crate::verdict::FailureClass::GateFailure, "gate-failure"),
+        ];
+        for (class, wire) in &classes {
+            let verdict = VerdictRecord::new(
+                "class-run".to_string(),
+                Verdict::TestFailure,
+                RanLocation::Remote,
+                101,
+                "gantry-x7k2p".to_string(),
+                None,
+            )
+            .with_failure_class(Some(class.clone()));
+
+            let json = serde_json::to_string(&verdict).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed["failure_class"], *wire, "class {class:?}");
+
+            let round: VerdictRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(round.failure_class.as_ref(), Some(class), "class {class:?}");
+            assert_eq!(round.run_id, "class-run");
+            assert_eq!(round.verdict, Verdict::TestFailure);
+            assert_eq!(round.ran, RanLocation::Remote);
+            assert_eq!(round.exit_code, 101);
+        }
+    }
+
+    /// A None class — the `new()` default every local run, infra path, and
+    /// uninstrumented producer writes — is additive on write: the key is
+    /// skipped entirely, and an old schema-1 line without the key reads
+    /// back as None rather than demanding it.
+    #[test]
+    fn verdict_record_without_failure_class_skips_the_field_and_reads_back_none() {
+        let verdict = VerdictRecord::new(
+            "plain-run".to_string(),
+            Verdict::Pass,
+            RanLocation::Remote,
+            0,
+            "gantry-x7k2p".to_string(),
+            None,
+        );
+        assert_eq!(verdict.failure_class, None);
+
+        let json = serde_json::to_string(&verdict).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.get("failure_class").is_none(),
+            "an absent class must not be written: {json}"
+        );
+
+        let round: VerdictRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.failure_class, None);
+
+        // The pre-taxonomy producer shape: no failure_class key at all.
+        let schema1: VerdictRecord = serde_json::from_str(
+            r#"{"rec":"verdict","schema_version":1,"run_id":"old","ts":1,"verdict":"pass","ran":"remote","exit_code":0,"handle":"gantry-x7k2p"}"#,
+        )
+        .unwrap();
+        assert_eq!(schema1.failure_class, None);
+    }
+
+    /// A class string a newer producer coined reads as absent, not a parse
+    /// failure — the same leniency contract verdict.json gives the field,
+    /// shared through one deserializer. The core signals survive the read.
+    #[test]
+    fn verdict_record_unknown_failure_class_reads_as_absent_not_an_error() {
+        let line = r#"{"rec":"verdict","schema_version":1,"run_id":"future","ts":2,"verdict":"test_failure","ran":"remote","exit_code":101,"failure_class":"lockfile-drift","handle":"gantry-x7k2p"}"#;
+        let record: VerdictRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(record.failure_class, None);
+        assert_eq!(record.run_id, "future");
+        assert_eq!(record.verdict, Verdict::TestFailure);
+        assert_eq!(record.exit_code, 101);
+    }
+
+    /// End to end through the ledger: only the instrumented remote failure
+    /// carries its class into runs.jsonl — the kebab string lands on exactly
+    /// that entry's line — while pass, infra, cancel, and local-fallback
+    /// exits keep the field off their lines, so reading the ledger back
+    /// never misattributes a class to them.
+    #[test]
+    fn runs_jsonl_carries_the_class_only_on_the_class_bearing_remote_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runlog = RunLog {
+            log_path: temp_dir.path().join("runs.jsonl"),
+        };
+
+        // (verdict, ran, exit_code, threaded class) per run. The first is
+        // the instrumented remote failure; the rest are the no-class exits.
+        let outcomes = [
+            (
+                Verdict::TestFailure,
+                RanLocation::Remote,
+                101,
+                Some(crate::verdict::FailureClass::TestFailure),
+            ),
+            (Verdict::Pass, RanLocation::Remote, 0, None),
+            (Verdict::InfraFailure, RanLocation::Remote, 1, None),
+            (Verdict::Cancelled, RanLocation::Remote, 130, None),
+            (
+                Verdict::TestFailure,
+                RanLocation::LocalAfterInfra,
+                101,
+                None,
+            ),
+        ];
+
+        let mut intents = Vec::with_capacity(outcomes.len());
+        for _ in 0..outcomes.len() {
+            let mut intent = test_intent();
+            while intents
+                .iter()
+                .any(|prior: &IntentRecord| prior.run_id == intent.run_id)
+            {
+                intent = test_intent();
+            }
+            intents.push(intent);
+        }
+
+        for ((verdict, ran, exit_code, class), intent) in outcomes.iter().zip(&intents) {
+            let record = VerdictRecord::new(
+                intent.run_id.clone(),
+                *verdict,
+                *ran,
+                *exit_code,
+                "gantry-x7k2p".to_string(),
+                None,
+            )
+            .with_failure_class(class.clone());
+            runlog.open_intent(intent).unwrap();
+            runlog.close_verdict(&record).unwrap();
+        }
+
+        // Exactly one line in the raw ledger names a class, and it is the
+        // remote failure's kebab string.
+        let raw = std::fs::read_to_string(&runlog.log_path).unwrap();
+        let class_lines: Vec<&str> = raw
+            .lines()
+            .filter(|l| l.contains("failure_class"))
+            .collect();
+        assert_eq!(
+            class_lines.len(),
+            1,
+            "only the class-bearing entry may name a class: {raw}"
+        );
+        assert!(
+            class_lines[0].contains(r#""failure_class":"test-failure""#),
+            "{}",
+            class_lines[0]
+        );
+
+        // Reading the ledger back: the class rides the remote failure;
+        // every other exit reads as None.
+        let ledger = runlog.read_entries().unwrap();
+        assert_eq!(ledger.entries.len(), outcomes.len());
+        for (entry, (_, _, _, expected)) in ledger.entries.iter().zip(outcomes.iter()) {
+            let record = entry.verdict.as_ref().expect("verdict must be paired");
+            assert_eq!(
+                record.failure_class, *expected,
+                "run {}",
+                entry.intent.run_id
+            );
+        }
+    }
+
+    /// The deadline-expiry detail survives the record's serde round trip
+    /// with backend, handle, and reason intact (features.md v1.x
+    /// "timeout/deadline config per backend"): the expiry the deadline path
+    /// stamped reads back as the same expiry, not as absent, and the
+    /// degraded record's own signals ride along. The additive field does
+    /// not bump the schema (the field contract above): the record still
+    /// declares `SCHEMA_VERSION`, and the wire line still reads
+    /// schema_version 1.
+    #[test]
+    fn verdict_record_timeout_round_trips_backend_handle_and_reason() {
+        let expiry = TimeoutExpiry {
+            backend: "argo".to_string(),
+            handle: "gantry-x7k2p".to_string(),
+            reason: "workflow gantry-x7k2p deadline exceeded while polling status.phase"
+                .to_string(),
+        };
+        let verdict = VerdictRecord::new(
+            "timeout-run".to_string(),
+            Verdict::TestFailure,
+            RanLocation::LocalAfterInfra,
+            101,
+            "gantry-x7k2p".to_string(),
+            None,
+        )
+        .with_timeout(Some(expiry.clone()));
+
+        assert_eq!(verdict.schema_version, SCHEMA_VERSION);
+
+        let json = serde_json::to_string(&verdict).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["timeout"]["backend"], "argo");
+        assert_eq!(parsed["timeout"]["handle"], "gantry-x7k2p");
+        assert_eq!(
+            parsed["timeout"]["reason"],
+            "workflow gantry-x7k2p deadline exceeded while polling status.phase"
+        );
+
+        let round: VerdictRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.timeout.as_ref(), Some(&expiry));
+        assert_eq!(round.schema_version, SCHEMA_VERSION);
+        assert_eq!(round.run_id, "timeout-run");
+        assert_eq!(round.verdict, Verdict::TestFailure);
+        assert_eq!(round.ran, RanLocation::LocalAfterInfra);
+        assert_eq!(round.exit_code, 101);
+    }
+
+    /// A None expiry — the `new()` default every non-expiry record writes —
+    /// is additive on write: the key is skipped entirely, so non-expiry
+    /// bytes are unchanged, and a runs.jsonl line from a producer that
+    /// never knew the field reads back as None rather than demanding it.
+    #[test]
+    fn verdict_record_without_timeout_skips_the_field_and_reads_back_none() {
+        let verdict = VerdictRecord::new(
+            "plain-run".to_string(),
+            Verdict::Pass,
+            RanLocation::Remote,
+            0,
+            "gantry-x7k2p".to_string(),
+            None,
+        );
+        assert_eq!(verdict.timeout, None);
+
+        let json = serde_json::to_string(&verdict).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.get("timeout").is_none(),
+            "an absent expiry must not be written: {json}"
+        );
+
+        let round: VerdictRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.timeout, None);
+
+        // The pre-expiry producer shape: no timeout key at all.
+        let schema1: VerdictRecord = serde_json::from_str(
+            r#"{"rec":"verdict","schema_version":1,"run_id":"old","ts":1,"verdict":"pass","ran":"remote","exit_code":0,"handle":"gantry-x7k2p"}"#,
+        )
+        .unwrap();
+        assert_eq!(schema1.timeout, None);
+        assert_eq!(schema1.schema_version, 1);
+    }
+
+    /// End to end through the ledger: only the deadline-expired run carries
+    /// its expiry into runs.jsonl — backend, handle, and reason land on
+    /// exactly that entry's terminal line — while every other exit keeps
+    /// the field off its lines, so reading the ledger back never
+    /// misattributes an expiry to them.
+    #[test]
+    fn runs_jsonl_carries_the_expiry_only_on_the_timeout_bearing_record() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runlog = RunLog {
+            log_path: temp_dir.path().join("runs.jsonl"),
+        };
+
+        // (verdict, ran, exit_code, threaded expiry) per run. The first is
+        // the deadline-expired run's terminal record, closed by the
+        // capped-local ladder with the local rerun's outcome; the rest are
+        // the no-expiry exits.
+        let expiry = TimeoutExpiry {
+            backend: "argo".to_string(),
+            handle: "gantry-x7k2p".to_string(),
+            reason: "workflow gantry-x7k2p deadline exceeded while polling status.phase"
+                .to_string(),
+        };
+        let outcomes = [
+            (
+                Verdict::TestFailure,
+                RanLocation::LocalAfterInfra,
+                101,
+                Some(expiry),
+            ),
+            (Verdict::Pass, RanLocation::Remote, 0, None),
+            (Verdict::InfraFailure, RanLocation::Remote, 1, None),
+            (Verdict::TestFailure, RanLocation::Remote, 101, None),
+        ];
+
+        let mut intents = Vec::with_capacity(outcomes.len());
+        for _ in 0..outcomes.len() {
+            let mut intent = test_intent();
+            while intents
+                .iter()
+                .any(|prior: &IntentRecord| prior.run_id == intent.run_id)
+            {
+                intent = test_intent();
+            }
+            intents.push(intent);
+        }
+
+        for ((verdict, ran, exit_code, timeout), intent) in outcomes.iter().zip(&intents) {
+            let record = VerdictRecord::new(
+                intent.run_id.clone(),
+                *verdict,
+                *ran,
+                *exit_code,
+                "gantry-x7k2p".to_string(),
+                None,
+            )
+            .with_timeout(timeout.clone());
+            runlog.open_intent(intent).unwrap();
+            runlog.close_verdict(&record).unwrap();
+        }
+
+        // Exactly one line in the raw ledger names an expiry, and it is
+        // the degraded run's backend and handle in the wire form.
+        let raw = std::fs::read_to_string(&runlog.log_path).unwrap();
+        let timeout_lines: Vec<&str> = raw
+            .lines()
+            .filter(|l| l.contains(r#""timeout":"#))
+            .collect();
+        assert_eq!(
+            timeout_lines.len(),
+            1,
+            "only the expiry-bearing entry may name a timeout: {raw}"
+        );
+        assert!(
+            timeout_lines[0].contains(r#""timeout":{"backend":"argo","handle":"gantry-x7k2p""#),
+            "{}",
+            timeout_lines[0]
+        );
+
+        // Reading the ledger back: the expiry rides the degraded run;
+        // every other exit reads as None.
+        let ledger = runlog.read_entries().unwrap();
+        assert_eq!(ledger.entries.len(), outcomes.len());
+        for (entry, (_, _, _, expected)) in ledger.entries.iter().zip(outcomes.iter()) {
+            let record = entry.verdict.as_ref().expect("verdict must be paired");
+            assert_eq!(record.timeout, *expected, "run {}", entry.intent.run_id);
+        }
     }
 }

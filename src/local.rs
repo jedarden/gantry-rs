@@ -120,6 +120,17 @@ const POLL_MAX: Duration = Duration::from_millis(1000);
 /// unchanged position. Loud does not mean one line per 100 ms poll.
 const QUEUE_LINE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Bounded retries while locking a freshly minted ticket (`mint_ticket`).
+/// The only legitimate competing holder of that lock is another waiter's
+/// `ahead_count` scan, which holds it for the single marker read it takes
+/// to classify the ticket, so a handful of short retries sits orders of
+/// magnitude above any real hold; exhaustion means genuine breakage and
+/// still fails the mint loudly (EC-08 degrades, it never spins).
+const MINT_LOCK_RETRIES: u32 = 50;
+
+/// Pause between [`MINT_LOCK_RETRIES`] attempts.
+const MINT_LOCK_RETRY_PAUSE: Duration = Duration::from_millis(2);
+
 // ============================================================================
 // Kernel locks
 // ============================================================================
@@ -800,18 +811,25 @@ impl FallbackSemaphore {
         write_counter(&tickets_dir, number)?;
         drop(queue_lock);
 
-        // We just created the file, so the lock cannot already be held —
-        // failure here would mean the world changed underneath us; fail
-        // loudly rather than queue out of order.
-        if !try_lock_exclusive(&file) {
-            return Err(SemaphoreError::Io {
-                path,
-                // `io::Error::other` is 1.74+ and this crate's MSRV is 1.70.
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "freshly minted ticket is already locked",
-                ),
-            });
+        // Created here, so a held lock can only be the transient kind of
+        // racer documented on [`MINT_LOCK_RETRIES`] — another waiter's
+        // `ahead_count` scan, one marker read long. Ride it out with the
+        // bounded retries; exhaustion is genuine breakage and still fails
+        // the mint loudly rather than queue out of order.
+        let mut attempts = 0;
+        while !try_lock_exclusive(&file) {
+            attempts += 1;
+            if attempts >= MINT_LOCK_RETRIES {
+                return Err(SemaphoreError::Io {
+                    path,
+                    // `io::Error::other` is 1.74+ and this crate's MSRV is 1.70.
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "freshly minted ticket is already locked",
+                    ),
+                });
+            }
+            std::thread::sleep(MINT_LOCK_RETRY_PAUSE);
         }
 
         // Mark the ticket with its queue class before any scanner can count
@@ -975,6 +993,11 @@ pub struct FallbackContext<'a> {
     pub gate_ms: u64,
     /// RefPusher duration already spent upstream (ms).
     pub push_ms: u64,
+    /// Deadline-expiry detail ([`crate::runlog::TimeoutExpiry`]) to stamp on
+    /// the terminal record: which backend's watch ran out, on which of its
+    /// runs, and the expiry reason. `Some` only when this fallback follows a
+    /// deadline expiry — every other fallback names no timeout.
+    pub timeout: Option<crate::runlog::TimeoutExpiry>,
 }
 
 /// Run a degraded local invocation through the admission semaphore — the
@@ -1150,7 +1173,11 @@ fn record_fallback_verdict(
                 queue: queue_ms,
                 run: run_ms,
             }),
-        );
+        )
+        // A deadline expiry's timeout detail rides the context so the one
+        // terminal record names the timeout instead of losing it to this
+        // local rerun's outcome; every other fallback carries none.
+        .with_timeout(ctx.timeout.clone());
         if let Err(e) = rl.close_verdict(&record) {
             eprintln!("[gantry] warning: cannot write verdict record: {}", e);
         }
@@ -1188,6 +1215,137 @@ mod tests {
 
     fn semaphore(dir: PathBuf, slots: u32, wait_ms: u64) -> FallbackSemaphore {
         FallbackSemaphore::open_with(dir, slots, Duration::from_millis(wait_ms)).unwrap()
+    }
+
+    /// The fallback ladder's ledger side of the deadline tail (plan
+    /// Component 6, DD-4): the expiry rides the context onto the one
+    /// terminal record, and fallbacks without an expiry keep the field off
+    /// the wire.
+    mod fallback_timeout_stamping {
+        use super::*;
+        use crate::runlog::{Decision, GateInputs, IntentRecord, TimeoutExpiry};
+
+        /// The remote-run intent the ladder closes (the AS-2 shape).
+        fn intent() -> IntentRecord {
+            IntentRecord::new(
+                "cargo".to_string(),
+                vec!["test".to_string()],
+                "https://github.com/example/repo".to_string(),
+                "abc123".to_string(),
+                PathBuf::from("."),
+                GateInputs {
+                    worktree: true,
+                    head: true,
+                    remote: true,
+                    clean: true,
+                },
+                Decision::Remote,
+                String::new(),
+                "argo".to_string(),
+            )
+        }
+
+        fn verdict_lines(raw: &str) -> Vec<&str> {
+            raw.lines()
+                .filter(|line| line.contains(r#""rec":"verdict""#))
+                .collect()
+        }
+
+        #[test]
+        fn expiry_fallback_stamps_the_deadline_expiry_on_the_one_terminal_record() {
+            let dir = TempDir::new().unwrap();
+            let rl = RunLog::open_in(dir.path());
+            let intent = intent();
+            rl.open_intent(&intent).unwrap();
+
+            // The expiry the decision tail builds: the backend in its config
+            // spelling, the abandoned run's handle, the reason verbatim.
+            let expiry = TimeoutExpiry {
+                backend: "argo".to_string(),
+                handle: "gantry-x7k2p".to_string(),
+                reason: "workflow gantry-x7k2p deadline exceeded while polling status.phase"
+                    .to_string(),
+            };
+            let ctx = FallbackContext {
+                runlog: Some(&rl),
+                run_id: &intent.run_id,
+                gate_ms: 5,
+                push_ms: 7,
+                timeout: Some(expiry.clone()),
+            };
+
+            record_fallback_verdict(&ctx, Verdict::Pass, 0, 3, 11);
+
+            // One terminal record: the ladder's, closing the intent. The
+            // remote attempt writes none on this path — its classification
+            // home is the flight recorder.
+            let ledger = rl.read_entries().unwrap();
+            assert_eq!(
+                ledger.entries.len(),
+                1,
+                "the expiry path closes the run with exactly one record"
+            );
+            let record = ledger.entries[0]
+                .verdict
+                .as_ref()
+                .expect("the fallback closes the intent");
+            assert_eq!(record.ran, RanLocation::LocalAfterInfra);
+            assert_eq!(record.verdict, Verdict::Pass);
+            assert_eq!(record.timeout.as_ref(), Some(&expiry));
+
+            // On the wire: `ran: local_after_infra` naming the expiry.
+            let raw = fs::read_to_string(dir.path().join("runs.jsonl")).unwrap();
+            let lines = verdict_lines(&raw);
+            assert_eq!(lines.len(), 1, "one verdict line, not two: {raw}");
+            assert!(
+                lines[0].contains(r#""ran":"local_after_infra""#),
+                "{}",
+                lines[0]
+            );
+            assert!(lines[0].contains(r#""timeout":{"#), "{}", lines[0]);
+            let wire: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(wire["timeout"]["backend"], "argo");
+            assert_eq!(wire["timeout"]["handle"], "gantry-x7k2p");
+            assert_eq!(
+                wire["timeout"]["reason"],
+                "workflow gantry-x7k2p deadline exceeded while polling status.phase"
+            );
+        }
+
+        #[test]
+        fn non_expiry_fallback_writes_no_timeout_detail() {
+            // The local-decision fallback's context names no timeout (its
+            // watch never started), so its record keeps the field absent on
+            // the wire — the additive contract the bare wait-failure exit's
+            // record holds too.
+            let dir = TempDir::new().unwrap();
+            let rl = RunLog::open_in(dir.path());
+            let intent = intent();
+            rl.open_intent(&intent).unwrap();
+
+            let ctx = FallbackContext {
+                runlog: Some(&rl),
+                run_id: &intent.run_id,
+                gate_ms: 5,
+                push_ms: 7,
+                timeout: None,
+            };
+
+            record_fallback_verdict(&ctx, Verdict::TestFailure, 101, 3, 11);
+
+            let raw = fs::read_to_string(dir.path().join("runs.jsonl")).unwrap();
+            let lines = verdict_lines(&raw);
+            assert_eq!(lines.len(), 1, "one verdict line: {raw}");
+            assert!(
+                !lines[0].contains("timeout"),
+                "a fallback with no expiry must not name a timeout: {}",
+                lines[0]
+            );
+            let record: VerdictRecord = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(record.timeout, None);
+            assert_eq!(record.ran, RanLocation::LocalAfterInfra);
+            assert_eq!(record.verdict, Verdict::TestFailure);
+        }
     }
 
     #[test]

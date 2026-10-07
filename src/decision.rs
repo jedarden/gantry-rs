@@ -10,7 +10,7 @@
 // short-circuits to passthrough/local when GANTRY_LOCAL=1 or Tier-0 (no backend).
 
 use crate::backend::command::CommandBackend;
-use crate::backend::{BackendError, RemoteBackend, RunSpec, Verdict};
+use crate::backend::{BackendError, RemoteBackend, RunHandle, RunSpec, Verdict};
 use crate::config::{Backend, Config};
 use crate::refs::RefPusher;
 use crate::runlog::{
@@ -22,6 +22,48 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// The attach branch's dispatch triple: the originator's handle verbatim —
+/// the joiner waits on the run it attached to, never one it forged — with
+/// zero push and queue durations, because the joiner ran neither stage (the
+/// originator's epoch ref already carries the sha and its workflow is
+/// already submitted). Unit-pinned here; the recording-backend proof that no
+/// push or submit reaches the wire lives in
+/// tests/joiner_attach_integration.rs.
+fn joiner_dispatch(handle: &RunHandle) -> (RunHandle, u64, u64) {
+    (handle.clone(), 0, 0)
+}
+
+/// Select the pre-wait dispatch for an invocation. An attached invocation has
+/// already inherited both dispatch stages from its originator, so the
+/// originator closure must not be evaluated. Keeping that short-circuit in a
+/// small seam makes the side-effect boundary testable without weakening the
+/// process-level recording-backend proof.
+fn dispatch_with_join<F>(
+    attached: Option<&crate::jointable::AttachHandle>,
+    originator_dispatch: F,
+) -> Result<(RunHandle, u64, u64), i32>
+where
+    F: FnOnce() -> Result<(RunHandle, u64, u64), i32>,
+{
+    match attached {
+        Some(attach) => Ok(joiner_dispatch(&attach.handle)),
+        None => originator_dispatch(),
+    }
+}
+
+/// Keep an originator's claim guard owned by the run path until that path
+/// returns. Passing the guard as an argument to this boundary makes the
+/// lifetime explicit: the dispatch/wait/fallback closure can only borrow it,
+/// and the guard is dropped after the closure returns on every exit path.
+fn run_with_originator_entry<T, F>(entry: Option<crate::jointable::JoinEntry>, run: F) -> T
+where
+    F: FnOnce(Option<&crate::jointable::JoinEntry>) -> T,
+{
+    let result = run(entry.as_ref());
+    drop(entry);
+    result
+}
+
 /// Run the decision pipeline for an intercepted subcommand.
 ///
 /// This is the core remote execution path (plan §"Architecture"):
@@ -32,6 +74,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// 5. Wait for verdict
 /// 6. Write terminal verdict record to runlog
 /// 7. Return faithful exit code
+///
+/// A deadline expiry in the wait is the one failure that does not end the
+/// run: the attempt is classified and flight-recorded as an `InfraFailure`
+/// (DD-4 — no fabricated verdict), then degrades through the capped-local
+/// fallback ladder ([`crate::local::run_fallback`], plan Component 6:
+/// "deadline-exceeded classify as InfraFailure → fallback") so the caller
+/// still lands a real result. Every other wait failure keeps the bare
+/// `InfraFailure` exit.
 ///
 /// ## Parameters
 ///
@@ -85,50 +135,6 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         }
     };
 
-    // Ledger intelligence (plan Component 10): capture the memo-key parts on
-    // every remote run. The same parts enrich the intent record below, where
-    // supersede and flake flagging consume them, so the capture is
-    // unconditional even though serving a cached verdict is opt-in.
-    let ledger_tree = crate::gate::head_tree_hash().ok();
-    let ledger_toolchain = crate::ledger::rustc_toolchain();
-    let ledger_image = crate::ledger::current_image_digest();
-    let memo_key = crate::ledger::MemoKey::from_parts(
-        ledger_tree.clone(),
-        ledger_toolchain.clone(),
-        ledger_image.clone(),
-        "cargo",
-        args,
-    );
-
-    // Opt-in memoization (plan Component 10, never default): an identical
-    // (tree-hash, args, toolchain, image digest) with a terminal PASS verdict
-    // returns the recorded verdict instantly. `GANTRY_MEMOIZE=1` opts in;
-    // `GANTRY_FRESH=1` is the `--fresh` escape and forces a real execution.
-    // Failures are never memoized, and a hit appends no ledger records — the
-    // PASS record that earned the verdict stays the only evidence.
-    if crate::ledger::memoize_requested() {
-        if crate::ledger::fresh_requested() {
-            eprintln!("[gantry] memoize: GANTRY_FRESH forces a fresh run");
-        } else if let (Some(rl), Some(key)) = (&runlog, &memo_key) {
-            if let Some(hit) = crate::ledger::lookup_cached_pass(rl, key) {
-                let verdict = hit
-                    .verdict
-                    .as_ref()
-                    .map(|v| v.verdict.to_string())
-                    .unwrap_or_else(|| "Pass".to_string());
-                eprintln!(
-                    "[gantry] cached: {} for tree {} (run {}) — GANTRY_FRESH=1 forces execution",
-                    verdict,
-                    crate::ledger::short_sha(&key.tree_hash),
-                    hit.intent.run_id,
-                );
-                return 0;
-            }
-        } else {
-            eprintln!("[gantry] memoize: key or ledger unavailable — running fresh");
-        }
-    }
-
     // Print the decision line to stderr
     eprintln!("[gantry] decision: remote execution eligible");
 
@@ -181,7 +187,6 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
     }
 
     // Step 2: Write OPEN intent record BEFORE dispatch (write-ahead, INV-1)
-    let mut ledger_intent: Option<IntentRecord> = None;
     let run_id = if let Some(rl) = &runlog {
         let cwd_rel = std::env::current_dir()
             .ok()
@@ -192,7 +197,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             })
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        let mut intent = IntentRecord::new(
+        let intent = IntentRecord::new(
             "cargo".to_string(),
             args.to_vec(),
             repo_url.to_string(),
@@ -201,20 +206,10 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
             gate_inputs,
             RunLogDecision::Remote,
             eligibility.reason.clone(),
-            "command".to_string(), // hardcoded backend
+            crate::cli::backend_name(config.remote.backend.clone()).to_string(),
         );
 
-        // Ledger intelligence (plan Component 10): the key parts ride the
-        // intent additively — old readers ignore them, and a record missing
-        // them never matches a memo key, gets superseded, or flags a flake.
-        intent.tree_hash = ledger_tree.clone();
-        intent.pid = Some(std::process::id());
-        intent.toolchain = ledger_toolchain.clone();
-        intent.image_digest = ledger_image.clone();
-
-        let written = rl.open_intent(&intent);
-        ledger_intent = Some(intent);
-        match written {
+        match rl.open_intent(&intent) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!(
@@ -242,230 +237,319 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         )
     };
 
-    // Supersede-on-new-commit (plan Component 10): a different sha submitted
-    // for the same (repo, args) marks older still-running siblings with an
-    // explicit `superseded` terminal record — but only when the sibling has
-    // zero live attachments (originator process gone). A watched run, a
-    // same-sha sibling, or one whose originator liveness cannot be proven is
-    // never yanked; it simply runs alongside.
-    if let (Some(rl), Some(fresh)) = (&runlog, ledger_intent.as_ref()) {
-        crate::ledger::supersede_stale_siblings(rl, fresh);
-    }
-
     let _total_start = Instant::now();
 
-    // Step 3: Push epoch ref via RefPusher
-    let push_start = Instant::now();
-    let push_result = RefPusher::push(config, sha, &run_id);
-    let push_duration_ms = push_start.elapsed().as_millis() as u64;
-
-    if !push_result.success {
-        eprintln!("[gantry] push failed: {}", push_result.reason);
-        eprintln!("[gantry] verdict: PushFailed");
-
-        // Flight recorder (plan Component 7, bf-3mc): the push is where most
-        // infra flakes live (auth, remote reachability), so the bundle gathers
-        // the git state while it is still fresh.
-        // The pusher's reason is the raw response this stage surfaced, so it
-        // rides both the event line and the backend artifact channel.
-        record_infra_failure(
-            config,
+    // Plan Component 9: JoinTable concurrent-run dedup. An identical run —
+    // same remote, sha, tool, and args — already in flight is joined (waited
+    // on) instead of resubmitted, so a fleet of callers verifying one commit
+    // lands one workflow, not one per caller. The claim sits after the intent
+    // record (INV-1: every invocation, joiner included, writes its OPEN
+    // first) and before the push (a joiner pushes nothing: the originator's
+    // epoch ref already carries the sha). The originator's entry guard lives
+    // to the end of the function, so the key clears on every exit path — a
+    // failed dispatch can never wedge it shut. The key's command shape is the
+    // RunSpec's (plan Q-2), so an intercepted `cargo test` and
+    // `gantry run -- cargo test` dedup as one.
+    let (join_subcommand, join_args) = match args.split_first() {
+        Some((first, rest)) => (first.as_str(), rest),
+        None => ("", args),
+    };
+    let join_key =
+        crate::jointable::JoinKey::new(repo_url, sha, "cargo", join_subcommand, join_args);
+    // The dedup kill switch (GANTRY_JOIN=0), checked like the master one: a
+    // caller that must not dedup gets exactly the pre-Component-9 behavior —
+    // no claim, no state touched, submit alongside everything else.
+    let (join_enabled, join_source) = state::check_join_enabled();
+    let (join_entry, joined, attached_dispatch) = if !join_enabled {
+        eprintln!("[gantry] dedup kill switch active: {}", join_source);
+        eprintln!("[gantry] join: submitting without dedup");
+        (None, None, None)
+    } else {
+        match crate::jointable::claim(
+            crate::jointable::default_state_dir().as_deref(),
+            &join_key,
             &run_id,
-            "push",
-            &push_result.reason,
-            None,
-            Some(&push_result.reason),
-            None,
-        );
+            crate::cli::backend_name(config.remote.backend.clone()),
+        ) {
+            crate::jointable::JoinDecision::Originator(entry) => (Some(entry), None, None),
+            crate::jointable::JoinDecision::Attach(attach) => {
+                eprintln!(
+                    "[gantry] joining in-flight run {} (identical run already dispatched as {})",
+                    attach.handle.handle, attach.originator_run_id
+                );
+                // The originator already pushed the epoch ref and submitted
+                // this run. Consume its handle at the claim boundary so the
+                // joiner enters the shared wait with no dispatch-stage time;
+                // the lazy normal path below is never evaluated for Attach.
+                let dispatch = (attach.handle.clone(), 0, 0);
+                (None, Some(attach), Some(dispatch))
+            }
+            crate::jointable::JoinDecision::Unjoined => (None, None, None),
+        }
+    };
 
-        // Write verdict record if runlog is available (infra failure path)
+    run_with_originator_entry(join_entry, |join_entry| {
+        // Steps 3 and 4 (originator and unjoined): push the epoch ref, then
+        // submit; a joiner skips both and meets them in Step 5's shared wait.
+        //
+        // The backend runs the argv templates the config resolved (user layer —
+        // the repo layer cannot set them, trust boundary S-2). Before
+        // gantry-f6c93e5a this site built the default-templated backend
+        // unconditionally, so a
+        // configured `[remote.command]` was silently dead: every submit ran the
+        // `./contrib/gantry-exec.sh` default and failed with "command not found"
+        // no matter what the user configured. `command: None` (backend = command
+        // with no template table) keeps the default templates.
+        let backend = build_backend(config);
+        let (handle, push_duration_ms, queue_duration_ms) = match attached_dispatch {
+            Some(dispatch) => dispatch,
+            None => match dispatch_with_join(None, || {
+                // Step 3: Push epoch ref via RefPusher
+                let push_start = Instant::now();
+                let push_result = RefPusher::push(config, sha, &run_id);
+                let push_duration_ms = push_start.elapsed().as_millis() as u64;
+
+                if !push_result.success {
+                    eprintln!("[gantry] push failed: {}", push_result.reason);
+                    eprintln!("[gantry] verdict: PushFailed");
+
+                    // Flight recorder (plan Component 7, bf-3mc): the push is where most
+                    // infra flakes live (auth, remote reachability), so the bundle gathers
+                    // the git state while it is still fresh.
+                    // The pusher's reason is the raw response this stage surfaced, so it
+                    // rides both the event line and the backend artifact channel.
+                    record_infra_failure(
+                        config,
+                        &run_id,
+                        "push",
+                        &push_result.reason,
+                        None,
+                        Some(&push_result.reason),
+                        None,
+                    );
+
+                    // Write verdict record if runlog is available (infra failure path)
+                    if let Some(rl) = &runlog {
+                        let _ = write_local_verdict(
+                            rl,
+                            run_id.clone(),
+                            crate::runlog::Verdict::InfraFailure,
+                            1,
+                            Some(Durations {
+                                gate: gate_duration_ms,
+                                push: push_duration_ms,
+                                queue: 0,
+                                run: 0,
+                            }),
+                        );
+                    }
+
+                    // Return non-zero to indicate infra failure
+                    return Err(1);
+                }
+
+                // Step 4: Submit to the configured backend.
+
+                // Extract tool, subcommand, and args from the intercepted command
+                // Phase 0.5: tool is always "cargo", cwd_rel is empty (repo root)
+                let tool = "cargo";
+                let cwd_rel = "";
+                let (subcommand, run_args) = match args.split_first() {
+                    Some((first, rest)) => (first.as_str(), rest.to_vec()),
+                    None => {
+                        eprintln!("[gantry] error: no subcommand provided");
+                        return Err(1);
+                    }
+                };
+
+                let spec = RunSpec::new(tool, subcommand, run_args, repo_url, sha, cwd_rel);
+
+                let handle = match backend.submit(&spec) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("[gantry] submit failed: {}", e);
+                        eprintln!("[gantry] verdict: InfraFailure");
+
+                        // Flight recorder (plan Component 7, bf-3mc): the backend's own
+                        // error text is the raw response a post-mortem wants.
+                        record_infra_failure(
+                            config,
+                            &run_id,
+                            "submit",
+                            &e.reason,
+                            None,
+                            Some(&e.reason),
+                            None,
+                        );
+
+                        // Write verdict record if runlog is available (infra failure path)
+                        if let Some(rl) = &runlog {
+                            let _ = write_local_verdict(
+                                rl,
+                                run_id.clone(),
+                                crate::runlog::Verdict::InfraFailure,
+                                1,
+                                Some(Durations {
+                                    gate: gate_duration_ms,
+                                    push: push_duration_ms,
+                                    queue: 0,
+                                    run: 0,
+                                }),
+                            );
+                        }
+
+                        // Return non-zero to indicate infra failure
+                        return Err(1);
+                    }
+                };
+
+                // Open the attach window (plan Component 9): from here until the
+                // entry guard drops, identical invocations join this handle
+                // instead of submitting their own.
+                if let Some(entry) = join_entry {
+                    entry.record_handle(&handle);
+                }
+
+                eprintln!("[gantry] submitted: {}", handle.handle);
+
+                let queue_end = Instant::now();
+                let queue_duration_ms =
+                    (queue_end - push_start - std::time::Duration::from_millis(push_duration_ms))
+                        .as_millis() as u64;
+                Ok((handle, push_duration_ms, queue_duration_ms))
+            }) {
+                Ok(dispatch) => dispatch,
+                Err(code) => return code,
+            },
+        };
+
+        let run_start = Instant::now();
+        let deadline = Instant::now() + backend_wait_deadline(config);
+        let verdict_result = backend.wait(&handle, deadline);
+        let run_duration_ms = run_start.elapsed().as_millis() as u64;
+
+        let verdict = match verdict_result {
+            Ok(v) => {
+                // A joiner owns a waiter registration, not the originator's
+                // entry. Once the shared backend returns a terminal verdict,
+                // reclaim the entry as well: the originator may have died after
+                // recording its handle but before its guard reached Drop.
+                if let Some(attach) = joined.as_ref() {
+                    attach.release();
+                }
+                v
+            }
+            Err(e) => {
+                report_wait_failure(&e, &handle.handle);
+
+                // Flight recorder (plan Component 7, bf-3mc): the failure happened
+                // after submit, so the bundle names the handle the run was watched
+                // under.
+                record_infra_failure(
+                    config,
+                    &run_id,
+                    "wait",
+                    &e.reason,
+                    Some(&handle.handle),
+                    Some(&e.reason),
+                    None,
+                );
+
+                // A deadline expiry is the one wait failure that does not end the
+                // run here (DD-4, plan Component 6: "deadline-exceeded classify
+                // as InfraFailure → fallback"): the attempt above is classified
+                // and flight-recorded as the InfraFailure it is — never a
+                // fabricated verdict — and the run degrades through the capped-
+                // local ladder (AS-3) so the caller still lands a real result
+                // instead of a bare infra exit. The ladder closes the intent with
+                // the local outcome (`ran: local_after_infra`); the flight
+                // recorder is the remote attempt's classification home.
+                //
+                // Every other wait failure keeps this tail's bare InfraFailure
+                // exit: the degrade-to-local is the case the plan names for the
+                // expiry specifically, not a general wait-failure policy.
+                if e.deadline_exceeded {
+                    // The expiry's runs.jsonl home is the terminal record the
+                    // ladder below writes, so the timeout detail rides the
+                    // context: the backend in its config spelling, the abandoned
+                    // run's handle, and the expiry reason. That is what lets the
+                    // ledger's one record identify the deadline timeout instead
+                    // of losing it to the local rerun's outcome.
+                    let expiry = deadline_expiry(config, &handle, &e.reason);
+                    let ctx = crate::local::FallbackContext {
+                        runlog: runlog.as_ref(),
+                        run_id: &run_id,
+                        gate_ms: gate_duration_ms,
+                        push_ms: push_duration_ms + queue_duration_ms,
+                        timeout: Some(expiry),
+                    };
+                    return crate::local::run_fallback(config, args, &e.reason, &ctx);
+                }
+
+                eprintln!("[gantry] verdict: InfraFailure");
+
+                // Write verdict record if runlog is available (infra failure path)
+                if let Some(rl) = runlog {
+                    let _ = write_verdict(
+                        &rl,
+                        run_id.clone(),
+                        Verdict::InfraFailure,
+                        RanLocation::Remote,
+                        1,
+                        handle.handle.clone(),
+                        Some(Durations {
+                            gate: gate_duration_ms,
+                            push: push_duration_ms,
+                            queue: queue_duration_ms,
+                            run: run_duration_ms,
+                        }),
+                    );
+                }
+
+                // Return non-zero to indicate infra failure
+                return 1;
+            }
+        };
+
+        // A terminal InfraFailure verdict is an infra exit like any other (plan
+        // Component 7, bf-3mc): the run produced no usable verdict, so the bundle
+        // is written even though wait() itself returned cleanly. Checked before
+        // the record below because Verdict is Copy but the runlog write moves it.
+        if verdict == Verdict::InfraFailure {
+            record_infra_failure(
+                config,
+                &run_id,
+                "remote-verdict",
+                "remote run ended in InfraFailure",
+                Some(&handle.handle),
+                None,
+                None,
+            );
+        }
+
+        // Step 6: Write terminal verdict record (successful completion path)
         if let Some(rl) = runlog {
-            let _ = write_local_verdict(
+            let exit_code = verdict.to_exit_code();
+            let _ = write_verdict(
                 &rl,
-                run_id,
-                crate::runlog::Verdict::InfraFailure,
-                1,
+                run_id.clone(),
+                verdict,
+                RanLocation::Remote,
+                exit_code,
+                handle.handle.clone(),
                 Some(Durations {
                     gate: gate_duration_ms,
                     push: push_duration_ms,
-                    queue: 0,
-                    run: 0,
+                    queue: queue_duration_ms,
+                    run: run_duration_ms,
                 }),
             );
         }
 
-        // Return non-zero to indicate infra failure
-        return 1;
-    }
-
-    // Step 4: Submit to command backend
-    //
-    // The backend runs the argv templates the config resolved (user layer —
-    // the repo layer cannot set them, trust boundary S-2). Before
-    // gantry-f6c93e5a this site built the default-templated backend
-    // unconditionally, so a
-    // configured `[remote.command]` was silently dead: every submit ran the
-    // `./contrib/gantry-exec.sh` default and failed with "command not found"
-    // no matter what the user configured. `command: None` (backend = command
-    // with no template table) keeps the default templates.
-    let backend = match &config.remote.command {
-        Some(c) => CommandBackend::with_config(crate::backend::command::CommandConfig {
-            submit: c.submit.clone(),
-            logs: c.logs.clone(),
-            wait: c.wait.clone(),
-            status: None, // the config schema carries no status step (RawCommand)
-        }),
-        None => CommandBackend::new(),
-    };
-
-    // Extract tool, subcommand, and args from the intercepted command
-    // Phase 0.5: tool is always "cargo", cwd_rel is empty (repo root)
-    let tool = "cargo";
-    let cwd_rel = "";
-    let (subcommand, run_args) = match args.split_first() {
-        Some((first, rest)) => (first.as_str(), rest.to_vec()),
-        None => {
-            eprintln!("[gantry] error: no subcommand provided");
-            return 1;
-        }
-    };
-
-    let spec = RunSpec::new(tool, subcommand, run_args, repo_url, sha, cwd_rel);
-
-    let handle = match backend.submit(&spec) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("[gantry] submit failed: {}", e);
-            eprintln!("[gantry] verdict: InfraFailure");
-
-            // Flight recorder (plan Component 7, bf-3mc): the backend's own
-            // error text is the raw response a post-mortem wants.
-            record_infra_failure(
-                config,
-                &run_id,
-                "submit",
-                &e.reason,
-                None,
-                Some(&e.reason),
-                None,
-            );
-
-            // Write verdict record if runlog is available (infra failure path)
-            if let Some(rl) = runlog {
-                let _ = write_local_verdict(
-                    &rl,
-                    run_id,
-                    crate::runlog::Verdict::InfraFailure,
-                    1,
-                    Some(Durations {
-                        gate: gate_duration_ms,
-                        push: push_duration_ms,
-                        queue: 0,
-                        run: 0,
-                    }),
-                );
-            }
-
-            // Return non-zero to indicate infra failure
-            return 1;
-        }
-    };
-
-    eprintln!("[gantry] submitted: {}", handle.handle);
-
-    // Step 5: Wait for verdict
-    let queue_end = Instant::now();
-    let queue_duration_ms =
-        (queue_end - push_start - std::time::Duration::from_millis(push_duration_ms)).as_millis()
-            as u64;
-
-    let run_start = Instant::now();
-    let deadline = Instant::now() + backend_wait_deadline(config);
-    let verdict_result = backend.wait(&handle, deadline);
-    let run_duration_ms = run_start.elapsed().as_millis() as u64;
-
-    let verdict = match verdict_result {
-        Ok(v) => v,
-        Err(e) => {
-            report_wait_failure(&e, &handle.handle);
-            eprintln!("[gantry] verdict: InfraFailure");
-
-            // Flight recorder (plan Component 7, bf-3mc): the failure happened
-            // after submit, so the bundle names the handle the run was watched
-            // under.
-            record_infra_failure(
-                config,
-                &run_id,
-                "wait",
-                &e.reason,
-                Some(&handle.handle),
-                Some(&e.reason),
-                None,
-            );
-
-            // Write verdict record if runlog is available (infra failure path)
-            if let Some(rl) = runlog {
-                let _ = write_verdict(
-                    &rl,
-                    ledger_intent.as_ref(),
-                    run_id.clone(),
-                    Verdict::InfraFailure,
-                    RanLocation::Remote,
-                    1,
-                    handle.handle.clone(),
-                    Some(Durations {
-                        gate: gate_duration_ms,
-                        push: push_duration_ms,
-                        queue: queue_duration_ms,
-                        run: run_duration_ms,
-                    }),
-                );
-            }
-
-            // Return non-zero to indicate infra failure
-            return 1;
-        }
-    };
-
-    // A terminal InfraFailure verdict is an infra exit like any other (plan
-    // Component 7, bf-3mc): the run produced no usable verdict, so the bundle
-    // is written even though wait() itself returned cleanly. Checked before
-    // the record below because Verdict is Copy but the runlog write moves it.
-    if verdict == Verdict::InfraFailure {
-        record_infra_failure(
-            config,
-            &run_id,
-            "remote-verdict",
-            "remote run ended in InfraFailure",
-            Some(&handle.handle),
-            None,
-            None,
-        );
-    }
-
-    // Step 6: Write terminal verdict record (successful completion path)
-    if let Some(rl) = runlog {
-        let exit_code = verdict.to_exit_code();
-        let _ = write_verdict(
-            &rl,
-            ledger_intent.as_ref(),
-            run_id.clone(),
-            verdict,
-            RanLocation::Remote,
-            exit_code,
-            handle.handle.clone(),
-            Some(Durations {
-                gate: gate_duration_ms,
-                push: push_duration_ms,
-                queue: queue_duration_ms,
-                run: run_duration_ms,
-            }),
-        );
-    }
-
-    // Step 7: Print verdict trailer and return faithful exit code
-    eprintln!("[gantry] verdict: {}", verdict);
-    verdict.to_exit_code()
+        // Step 7: Print verdict trailer and return faithful exit code
+        eprintln!("[gantry] verdict: {}", verdict);
+        verdict.to_exit_code()
+    })
 }
 
 // ============================================================================
@@ -593,17 +677,8 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
         )
     };
 
-    // Ledger intelligence (plan Component 10): capture the key parts once and
-    // record them on the intent, so the flake flagging at the verdict write
-    // can compare this run against history. Memoize/supersede stay on the
-    // intercepted path.
-    let ledger_tree = crate::gate::head_tree_hash().ok();
-    let ledger_toolchain = crate::ledger::rustc_toolchain();
-    let ledger_image = crate::ledger::current_image_digest();
-
-    let mut ledger_intent: Option<IntentRecord> = None;
     let run_id = if let Some(rl) = &runlog {
-        let mut intent = IntentRecord::new(
+        let intent = IntentRecord::new(
             program.to_string(),
             tail.to_vec(),
             repo_url.to_string(),
@@ -614,13 +689,7 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
             reason,
             backend_name,
         );
-        intent.tree_hash = ledger_tree.clone();
-        intent.pid = Some(std::process::id());
-        intent.toolchain = ledger_toolchain.clone();
-        intent.image_digest = ledger_image.clone();
-        let written = rl.open_intent(&intent);
-        ledger_intent = Some(intent);
-        match written {
+        match rl.open_intent(&intent) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!(
@@ -686,17 +755,10 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
         );
     }
 
-    // Step: submit to the command backend (the same template resolution
-    // run_remote uses — user-configured templates, or the shipped defaults).
-    let backend = match &config.remote.command {
-        Some(c) => CommandBackend::with_config(crate::backend::command::CommandConfig {
-            submit: c.submit.clone(),
-            logs: c.logs.clone(),
-            wait: c.wait.clone(),
-            status: None,
-        }),
-        None => CommandBackend::new(),
-    };
+    // Step: submit to the configured backend (the same dispatch run_remote
+    // uses — user-configured templates, the shipped defaults, or the argo
+    // backend its config names).
+    let backend = build_backend(config);
 
     let (tool, subcommand, run_args) = explicit_run_spec_fields(program, tail);
     let spec = RunSpec::new(tool, &subcommand, run_args, repo_url, sha, "");
@@ -795,7 +857,6 @@ pub fn run_explicit(config: &Config, repo_url: &str, sha: &str, argv: &[String])
     if let Some(rl) = runlog {
         let _ = write_verdict(
             &rl,
-            ledger_intent.as_ref(),
             run_id,
             verdict,
             RanLocation::Remote,
@@ -845,6 +906,9 @@ fn explicit_run_spec_fields<'a>(
 /// internally, while the wrapped program's resolution is the explicit
 /// offload's own contract (plan §1: resolution failures surface, never
 /// re-exec gantry).
+// Each parameter is a distinct fact the ladder needs (config, the wrapped
+// command, why the remote attempt died, the open run's identity, the gate
+// and push splits) — a params struct would only move the count.
 #[allow(clippy::too_many_arguments)]
 fn resolve_and_fall_back(
     config: &Config,
@@ -880,20 +944,33 @@ fn resolve_and_fall_back(
         run_id,
         gate_ms,
         push_ms,
+        // Not a deadline tail: this fallback follows a local-decision run,
+        // whose watch never started, so there is no expiry to identify.
+        timeout: None,
     };
     crate::local::run_fallback_program(config, &real, tail, infra_reason, &ctx)
 }
 
+/// The expiry detail the deadline tail stamps on the fallback's terminal
+/// record: the backend whose wait expired, in its config spelling
+/// ([`crate::cli::backend_name`]), the abandoned run's handle, and the
+/// backend's expiry reason verbatim — the same three facts the
+/// `[gantry] timeout` line printed (DD-4, plan Component 6).
+fn deadline_expiry(
+    config: &Config,
+    handle: &RunHandle,
+    reason: &str,
+) -> crate::runlog::TimeoutExpiry {
+    crate::runlog::TimeoutExpiry {
+        backend: crate::cli::backend_name(config.remote.backend.clone()).to_string(),
+        handle: handle.handle.clone(),
+        reason: reason.to_string(),
+    }
+}
+
 /// Write a verdict record for a remote execution.
-///
-/// `intent` carries the ledger-key parts for flake flagging (plan Component
-/// 10): a terminal Pass/TestFailure that flips a prior outcome at the same
-/// tree+args is marked `flaky-suspect` before the record lands. `None` (no
-/// intent was written) simply skips the check.
-#[allow(clippy::too_many_arguments)]
 fn write_verdict(
     runlog: &RunLog,
-    intent: Option<&IntentRecord>,
     run_id: String,
     verdict: Verdict,
     ran: RanLocation,
@@ -902,11 +979,7 @@ fn write_verdict(
     durations_ms: Option<Durations>,
 ) -> Result<(), crate::runlog::RunLogError> {
     let runlog_verdict = convert_backend_verdict_to_runlog(verdict);
-    let mut record =
-        VerdictRecord::new(run_id, runlog_verdict, ran, exit_code, handle, durations_ms);
-    if let Some(intent) = intent {
-        crate::ledger::mark_flaky_if_flip(runlog, intent, &mut record);
-    }
+    let record = VerdictRecord::new(run_id, runlog_verdict, ran, exit_code, handle, durations_ms);
     runlog.close_verdict(&record)
 }
 
@@ -985,6 +1058,48 @@ fn backend_wait_deadline(config: &Config) -> Duration {
     match config.remote.backend {
         Backend::Argo => config.argo_deadline(),
         Backend::None | Backend::Command => config.command_deadline(),
+    }
+}
+
+/// Build the remote backend the configured `[remote] backend` names.
+///
+/// Both decision pipelines ([`run_remote`], [`run_explicit`]) submit and wait
+/// through the [`RemoteBackend`] trait, but the construction site hardcoded
+/// the command backend — so a configured `backend = "argo"` silently ran the
+/// command templates (or their defaults) instead of the argo backend, and
+/// every `[remote.argo]` key was dead in the pipeline. This is the glue that
+/// makes the argo wait path reachable end to end: the argo backend gets the
+/// config table's kubectl path, namespace, template, and friends; the
+/// command templates keep the shipped defaults or the user's `[remote.command]`
+/// table. Tier-0 never enters a remote pipeline, so its arm here keeps the
+/// command default purely to stay exhaustive.
+fn build_backend(config: &Config) -> Box<dyn RemoteBackend> {
+    match config.remote.backend {
+        Backend::Argo => {
+            let argo = config.remote.argo.clone().unwrap_or_default();
+            Box::new(crate::backend::argo::ArgoBackend::new(
+                crate::backend::argo::ArgoConfig {
+                    kubectl_path: argo.kubectl_path,
+                    kubeconfig: argo.kubeconfig.to_string_lossy().into_owned(),
+                    namespace: argo.namespace,
+                    template: argo.template,
+                    generate_name: argo.generate_name,
+                    builder_image: argo.builder_image,
+                    base_url: argo.base_url,
+                },
+            ))
+        }
+        Backend::None | Backend::Command => match &config.remote.command {
+            Some(c) => Box::new(CommandBackend::with_config(
+                crate::backend::command::CommandConfig {
+                    submit: c.submit.clone(),
+                    logs: c.logs.clone(),
+                    wait: c.wait.clone(),
+                    status: None, // the config schema carries no status step (RawCommand)
+                },
+            )),
+            None => Box::new(CommandBackend::new()),
+        },
     }
 }
 
@@ -1096,6 +1211,10 @@ pub fn run_tier0(config: &Config, repo_url: &str, sha: &str, args: &[String]) ->
 /// which is how the explicit-offload paths run the wrapped command instead.
 ///
 /// Returns the child's exit code, or 1 when nothing could be run.
+// Each parameter is a distinct fact the local tail needs (config, the run's
+// identity, the tool profile, the wrapped program, the argv, why the remote
+// attempt died, the backend that ran it) — a params struct would only move
+// the count.
 #[allow(clippy::too_many_arguments)]
 fn execute_locally(
     config: &Config,
@@ -1356,6 +1475,168 @@ mod tests {
         let _ = (config, repo_url, sha, args);
     }
 
+    #[test]
+    fn joiner_dispatch_returns_the_originators_handle_with_zero_durations() {
+        // The attach branch's whole dispatch contract, pinned at unit grain:
+        // the handle comes back verbatim (the joiner waits on the run it
+        // attached to — minting its own would resubmit under another name)
+        // and both pre-wait durations are zero, because the joiner ran
+        // neither the push nor the submit those durations measure. The
+        // end-to-end proof that the skip holds at the wire — one submit, one
+        // epoch ref, the ledger record carrying this handle and these zeros —
+        // is tests/joiner_attach_integration.rs.
+        let (handle, push_ms, queue_ms) = joiner_dispatch(&RunHandle::new("handle-originator"));
+        assert_eq!(handle.handle, "handle-originator");
+        assert_eq!((push_ms, queue_ms), (0, 0));
+    }
+
+    mod dispatch_selection {
+        use super::*;
+        use crate::jointable::{claim, claim_in, JoinDecision, JoinKey};
+        use crate::testutil::{RecordingDispatch, RECORDING_PUSH_MS, RECORDING_QUEUE_MS};
+
+        fn real_attach() -> (
+            tempfile::TempDir,
+            crate::jointable::JoinEntry,
+            crate::jointable::AttachHandle,
+        ) {
+            let state_dir = tempfile::tempdir().expect("create join state");
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let owner = match claim_in(state_dir.path(), &key, "originator", "recording")
+                .expect("originator claim succeeds")
+            {
+                JoinDecision::Originator(entry) => entry,
+                other => panic!("first claim must originate, got {other:?}"),
+            };
+            owner.record_handle(&RunHandle::new("recorded-originator"));
+
+            let attach = match claim_in(state_dir.path(), &key, "joiner", "recording")
+                .expect("joiner claim succeeds")
+            {
+                JoinDecision::Attach(attach) => attach,
+                other => panic!("handle-bearing claim must attach, got {other:?}"),
+            };
+            (state_dir, owner, attach)
+        }
+
+        /// Exercise the same decision variants that `run_remote` receives
+        /// from the JoinTable. Originators and unjoined invocations both
+        /// retain the normal dispatch closure; only Attach gets the
+        /// short-circuit. Keeping this adapter in the regression tests makes
+        /// it impossible for both normal paths to accidentally collapse into
+        /// an unexamined `None` fixture.
+        fn dispatch_for_decision<F>(
+            decision: JoinDecision,
+            originator_dispatch: F,
+        ) -> Result<(RunHandle, u64, u64), i32>
+        where
+            F: FnOnce() -> Result<(RunHandle, u64, u64), i32>,
+        {
+            match decision {
+                JoinDecision::Attach(attach) => {
+                    dispatch_with_join(Some(&attach), originator_dispatch)
+                }
+                JoinDecision::Originator(entry) => run_with_originator_entry(Some(entry), |_| {
+                    dispatch_with_join(None, originator_dispatch)
+                }),
+                JoinDecision::Unjoined => dispatch_with_join(None, originator_dispatch),
+            }
+        }
+
+        #[test]
+        fn attach_returns_originator_handle_and_skips_recorded_dispatch() {
+            let (_state_dir, _owner, attach) = real_attach();
+            let recorder = RecordingDispatch::default();
+
+            let (handle, push_ms, queue_ms) =
+                dispatch_for_decision(JoinDecision::Attach(attach), || {
+                    recorder.dispatch_originator()
+                })
+                .expect("attach dispatch succeeds");
+
+            assert_eq!(handle, RunHandle::new("recorded-originator"));
+            assert_eq!((push_ms, queue_ms), (0, 0));
+            assert_eq!(
+                recorder.epoch_ref_pushes(),
+                0,
+                "Attach must skip the epoch-ref push"
+            );
+            assert_eq!(
+                recorder.backend.submissions().len(),
+                0,
+                "Attach must skip backend submit"
+            );
+        }
+
+        #[test]
+        fn originator_dispatch_keeps_recorded_stages() {
+            let state_dir = tempfile::tempdir().expect("create join state");
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let decision = claim_in(state_dir.path(), &key, "originator", "recording")
+                .expect("originator claim succeeds");
+            assert!(matches!(&decision, JoinDecision::Originator(_)));
+            let recorder = RecordingDispatch::default();
+            let (handle, push_ms, queue_ms) =
+                dispatch_for_decision(decision, || recorder.dispatch_originator())
+                    .expect("originator dispatch succeeds");
+
+            assert_eq!(handle, RunHandle::new("recorded-originator"));
+            assert_eq!((push_ms, queue_ms), (RECORDING_PUSH_MS, RECORDING_QUEUE_MS));
+            assert_eq!(recorder.epoch_ref_pushes(), 1);
+            let submissions = recorder.backend.submissions();
+            assert_eq!(submissions.len(), 1);
+            assert_eq!(submissions[0].handle, handle);
+            assert_eq!(submissions[0].spec.subcommand, "test");
+        }
+
+        #[test]
+        fn originator_entry_lives_through_run_path_then_releases_claim() {
+            use std::fs;
+
+            let state_dir = tempfile::tempdir().expect("create join state");
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let entry = match claim_in(state_dir.path(), &key, "originator", "recording")
+                .expect("originator claim succeeds")
+            {
+                JoinDecision::Originator(entry) => entry,
+                other => panic!("first claim must originate, got {other:?}"),
+            };
+
+            let saw_claim_during_run = run_with_originator_entry(Some(entry), |_| {
+                fs::read_dir(state_dir.path().join("join"))
+                    .expect("join directory exists while run owns claim")
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.path().extension().is_some_and(|ext| ext == "run"))
+            });
+            assert!(
+                saw_claim_during_run,
+                "the originator run must retain its claim through the run-path body"
+            );
+
+            assert!(matches!(
+                claim_in(state_dir.path(), &key, "next-originator", "recording")
+                    .expect("claim after run path returns succeeds"),
+                JoinDecision::Originator(_)
+            ));
+        }
+
+        #[test]
+        fn unjoined_dispatch_keeps_recorded_stages() {
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let decision = claim(None, &key, "unjoined", "recording");
+            assert!(matches!(&decision, JoinDecision::Unjoined));
+            let recorder = RecordingDispatch::default();
+            let (handle, push_ms, queue_ms) =
+                dispatch_for_decision(decision, || recorder.dispatch_originator())
+                    .expect("unjoined dispatch succeeds");
+
+            assert_eq!(handle, RunHandle::new("recorded-originator"));
+            assert_eq!((push_ms, queue_ms), (RECORDING_PUSH_MS, RECORDING_QUEUE_MS));
+            assert_eq!(recorder.epoch_ref_pushes(), 1);
+            assert_eq!(recorder.backend.submissions().len(), 1);
+        }
+    }
+
     mod wait_failure_reporting {
         use super::*;
 
@@ -1427,6 +1708,67 @@ mod tests {
         }
     }
 
+    /// The deadline tail's stamping side (plan Component 6, DD-4): what the
+    /// expiry arm hands the fallback context, and the record the one tail
+    /// that must stay clean writes.
+    mod deadline_expiry_stamping {
+        use super::*;
+
+        #[test]
+        fn deadline_expiry_names_the_backend_handle_and_reason() {
+            // The expiry the tail rides into the fallback context carries the
+            // three facts the `[gantry] timeout` line printed: the backend in
+            // its config spelling, the abandoned run's handle, and the
+            // backend's expiry reason verbatim.
+            let mut config = Config::hardcoded();
+            config.remote.backend = Backend::Argo;
+            let handle = RunHandle::new("gantry-x7k2p");
+            let reason = "workflow gantry-x7k2p deadline exceeded while polling status.phase";
+
+            let expiry = deadline_expiry(&config, &handle, reason);
+
+            assert_eq!(expiry.backend, "argo");
+            assert_eq!(expiry.handle, "gantry-x7k2p");
+            assert_eq!(expiry.reason, reason);
+        }
+
+        #[test]
+        fn bare_wait_failure_verdict_writes_no_timeout_detail() {
+            // The non-expiry wait-failure tail writes its InfraFailure record
+            // through `write_verdict` and exits: no expiry exists to name, so
+            // the timeout field must be absent on the wire (the additive
+            // field leaves the bare exit's bytes unchanged).
+            let dir = tempfile::TempDir::new().unwrap();
+            let rl = RunLog::open_in(dir.path());
+            write_verdict(
+                &rl,
+                "bare-wait-run".to_string(),
+                Verdict::InfraFailure,
+                RanLocation::Remote,
+                1,
+                "gantry-x7k2p".to_string(),
+                Some(Durations {
+                    gate: 1,
+                    push: 2,
+                    queue: 3,
+                    run: 4,
+                }),
+            )
+            .unwrap();
+
+            let raw = fs::read_to_string(dir.path().join("runs.jsonl")).unwrap();
+            let line = raw.lines().last().unwrap();
+            assert!(
+                !line.contains("timeout"),
+                "a bare wait-failure exit must not name a timeout: {line}"
+            );
+            let record: VerdictRecord = serde_json::from_str(line).unwrap();
+            assert_eq!(record.timeout, None);
+            assert_eq!(record.verdict, crate::runlog::Verdict::InfraFailure);
+            assert_eq!(record.ran, RanLocation::Remote);
+        }
+    }
+
     mod backend_deadline_resolution {
         use super::*;
         use crate::config::ArgoConfig;
@@ -1480,6 +1822,430 @@ mod tests {
                 deadline_minutes: Some(5),
             });
             assert_eq!(backend_wait_deadline(&config), Duration::from_secs(5 * 60));
+        }
+    }
+
+    /// The config→backend construction glue ([`build_backend`]): a config
+    /// selecting the argo backend must yield an ArgoBackend carrying the
+    /// `[remote.argo]` table — before the pipelines dispatched on
+    /// `config.remote.backend`, the construction site hardcoded the command
+    /// backend and every table key was dead in the pipeline. Observed through
+    /// the [`RemoteBackend`] surface the pipelines themselves drive —
+    /// `describe` renders the table's base_url and namespace, `submit` puts
+    /// the kubeconfig, namespace, template, and generate_name on the kubectl
+    /// wire — so the mapping is pinned without reaching into the concrete
+    /// type. The no-behavior-change half is pinned alongside: every other
+    /// selection keeps building a command backend — the user's
+    /// `[remote.command]` table when one is present, the shipped defaults
+    /// when not — whatever the tables happen to hold.
+    mod backend_construction {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+
+        /// An argo table whose values are distinctive enough that each mapped
+        /// field is recognizable on the other side.
+        fn probe_argo_table(kubectl: &Path) -> crate::config::ArgoConfig {
+            crate::config::ArgoConfig {
+                kubectl_path: kubectl.to_string_lossy().into_owned(),
+                kubeconfig: PathBuf::from("/probe/kubeconfig"),
+                namespace: "gantry-probe".to_string(),
+                template: "gantry-verify-probe".to_string(),
+                generate_name: "gantry-probe-".to_string(),
+                base_url: Some("https://argo-ui.example.com/".to_string()),
+                ..Default::default()
+            }
+        }
+
+        /// A config selecting the argo backend with the probe table.
+        fn probe_config(kubectl: &Path) -> Config {
+            let mut config = Config::hardcoded();
+            config.remote.backend = Backend::Argo;
+            config.remote.argo = Some(probe_argo_table(kubectl));
+            config
+        }
+
+        #[test]
+        fn argo_selection_builds_the_backend_from_the_configured_table() {
+            // The constructed backend carries the table's base_url and
+            // namespace: describe() renders exactly the UI URL those two
+            // fields spell (trailing slash trimmed, then the workflow path).
+            let config = probe_config(Path::new("/probe/kubectl"));
+            let backend = build_backend(&config);
+
+            assert_eq!(
+                backend.describe(&RunHandle::new("wf-7q2m")),
+                "https://argo-ui.example.com/workflows/gantry-probe/wf-7q2m"
+            );
+        }
+
+        /// Retry a mock-backed submit a few times when exec fails with
+        /// ETXTBSY ("Text file busy") — same treatment as the argo backend's
+        /// own mock-executable tests: a freshly-written mock can transiently
+        /// race a still-open write handle under the parallel test harness.
+        fn with_exec_retry(
+            mut f: impl FnMut() -> Result<RunHandle, BackendError>,
+        ) -> Result<RunHandle, BackendError> {
+            let mut attempt = 0;
+            loop {
+                match f() {
+                    Err(e) if attempt < 4 && e.reason.contains("Text file busy") => {
+                        attempt += 1;
+                        std::thread::sleep(Duration::from_millis(50 * attempt));
+                    }
+                    other => return other,
+                }
+            }
+        }
+
+        #[test]
+        fn argo_selection_carries_the_table_onto_the_kubectl_wire() {
+            // The constructed backend is a working ArgoBackend: submit()
+            // runs the table's kubectl path with the kubeconfig and namespace
+            // flags, and pipes a manifest carrying the configured
+            // generate_name prefix and template name.
+            let dir = tempfile::TempDir::new().unwrap();
+            let argv_log = dir.path().join("argv.log");
+            let stdin_log = dir.path().join("stdin.json");
+            let kubectl = dir.path().join("mock-kubectl");
+            fs::write(
+                &kubectl,
+                format!(
+                    "#!/usr/bin/env sh\n\
+                     printf '%s\\n' \"$@\" > {}\n\
+                     cat > {}\n\
+                     echo 'workflow.argoproj.io/gantry-probe-abc123 created'\n",
+                    argv_log.display(),
+                    stdin_log.display()
+                ),
+            )
+            .unwrap();
+            let mut perm = fs::metadata(&kubectl).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&kubectl, perm).unwrap();
+
+            let config = probe_config(&kubectl);
+            let backend = build_backend(&config);
+            let spec = RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                "https://github.com/example/repo",
+                "abc123",
+                "",
+            );
+
+            let handle = with_exec_retry(|| backend.submit(&spec))
+                .expect("submit through the built backend must succeed");
+            assert_eq!(handle, RunHandle::new("gantry-probe-abc123"));
+
+            // The argv carries the connection flags from the table
+            // (`--kubeconfig <path>`, `-n <namespace>`) ahead of the
+            // `create -f -` submission — the manifest rides stdin, never
+            // argv.
+            let argv = fs::read_to_string(&argv_log).unwrap();
+            let argv: Vec<&str> = argv.lines().collect();
+            assert_eq!(
+                argv,
+                vec![
+                    "--kubeconfig",
+                    "/probe/kubeconfig",
+                    "-n",
+                    "gantry-probe",
+                    "create",
+                    "-f",
+                    "-"
+                ]
+            );
+
+            // The manifest carries the configured generate_name prefix and
+            // workflow template name.
+            let manifest: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&stdin_log).unwrap()).unwrap();
+            assert_eq!(manifest["metadata"]["generateName"], "gantry-probe-");
+            assert_eq!(
+                manifest["spec"]["workflowTemplateRef"]["name"],
+                "gantry-verify-probe"
+            );
+        }
+
+        // --- the no-behavior-change half: every non-argo selection keeps
+        // --- building a command backend --------------------------------
+
+        /// A `[remote.command]` table whose argv tokens are distinctive
+        /// enough that each template is recognizable on the wire, with the
+        /// placeholders left in for the backend to substitute.
+        fn probe_command_table(executor: &Path) -> crate::config::CommandConfig {
+            crate::config::CommandConfig {
+                submit: vec![
+                    executor.to_string_lossy().into_owned(),
+                    "submit-from-table".to_string(),
+                    "{repo}".to_string(),
+                    "{rev}".to_string(),
+                    "{args_json}".to_string(),
+                ],
+                logs: vec![
+                    executor.to_string_lossy().into_owned(),
+                    "logs-from-table".to_string(),
+                    "{handle}".to_string(),
+                ],
+                wait: vec![
+                    executor.to_string_lossy().into_owned(),
+                    "wait-from-table".to_string(),
+                    "{handle}".to_string(),
+                ],
+                deadline_minutes: None,
+            }
+        }
+
+        /// Write an executable mock executor that appends each invocation's
+        /// argv (one argument per line) to `argv_log` and answers every
+        /// subcommand with `handle` on stdout and exit 0 — enough executor
+        /// for submit's handle parse, logs' stdout copy, and wait's
+        /// exit-code verdict, with every argv observable afterward.
+        fn write_mock_executor(dir: &Path, name: &str, argv_log: &Path, handle: &str) -> PathBuf {
+            let path = dir.join(name);
+            fs::write(
+                &path,
+                format!(
+                    "#!/usr/bin/env sh\n\
+                     printf '%s\\n' \"$@\" >> {}\n\
+                     echo '{}'\n\
+                     exit 0\n",
+                    argv_log.display(),
+                    handle
+                ),
+            )
+            .unwrap();
+            let mut perm = fs::metadata(&path).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&path, perm).unwrap();
+            path
+        }
+
+        #[test]
+        fn command_selection_builds_the_backend_from_the_configured_table() {
+            // The constructed backend is a working CommandBackend driven by
+            // the table: submit runs the table's submit argv with the
+            // placeholders substituted, stream_logs runs its logs argv with
+            // the returned handle, wait maps its exit code to a verdict —
+            // and no status step exists, because the config schema carries
+            // none (the construction passes `status: None` unconditionally).
+            let dir = tempfile::TempDir::new().unwrap();
+            let argv_log = dir.path().join("argv.log");
+            let executor =
+                write_mock_executor(dir.path(), "mock-executor", &argv_log, "table-run-7q2m");
+
+            let mut config = Config::hardcoded();
+            config.remote.backend = Backend::Command;
+            config.remote.command = Some(probe_command_table(&executor));
+            let backend = build_backend(&config);
+
+            let spec = RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                "https://github.com/example/repo",
+                "abc123",
+                "",
+            );
+
+            let handle = with_exec_retry(|| backend.submit(&spec))
+                .expect("submit through the built backend must succeed");
+            assert_eq!(handle, RunHandle::new("table-run-7q2m"));
+
+            // The logs template runs with the handle submit returned, and
+            // its stdout lands in the caller's writer.
+            let mut logs = Vec::new();
+            backend
+                .stream_logs(&handle, &mut logs)
+                .expect("stream_logs through the built backend must succeed");
+            assert_eq!(String::from_utf8_lossy(&logs), "table-run-7q2m\n");
+
+            // The wait template runs with the same handle; its exit code is
+            // the verdict (the mock exits 0 → Pass).
+            let verdict = backend
+                .wait(&handle, Instant::now() + Duration::from_secs(30))
+                .expect("wait through the built backend must succeed");
+            assert_eq!(verdict, Verdict::Pass);
+
+            // The wire shows all three templates came from the table,
+            // placeholders substituted: submit carrying {repo}/{rev}/
+            // {args_json}, logs and wait carrying the handle. (The mock's
+            // `$@` starts past its own path — the program itself is argv[0],
+            // exactly as the argo wire test's kubectl is.)
+            let argv = fs::read_to_string(&argv_log).unwrap();
+            let argv: Vec<&str> = argv.lines().collect();
+            assert_eq!(
+                argv,
+                vec![
+                    "submit-from-table",
+                    "https://github.com/example/repo",
+                    "abc123",
+                    "[]",
+                    "logs-from-table",
+                    "table-run-7q2m",
+                    "wait-from-table",
+                    "table-run-7q2m",
+                ]
+            );
+
+            // The construction never invents a status step the schema
+            // cannot express: status() documents the limitation.
+            let Err(err) = backend.status(&handle) else {
+                panic!("the config schema carries no status step");
+            };
+            assert!(err.reason.contains("no status step"));
+        }
+
+        /// Submit through a default-built backend and prove the shipped
+        /// default submit template ran: the reference executor recorded the
+        /// spec's repo, rev, and args verbatim under its state dir. Only
+        /// meaningful when `GANTRY_EXEC_PATH` is unset — a set value points
+        /// the shipped default at a foreign program this test must not
+        /// execute — and the seam stays read-only here: tests never mutate
+        /// the process environment (the sibling command-backend tests assert
+        /// the unset default executor verbatim).
+        fn submit_through_shipped_default(backend: &dyn RemoteBackend, spec: &RunSpec) {
+            if std::env::var_os("GANTRY_EXEC_PATH").is_some() {
+                eprintln!(
+                    "skipping the shipped-executor wire leg: GANTRY_EXEC_PATH is set in this environment"
+                );
+                return;
+            }
+
+            let handle = backend
+                .submit(spec)
+                .expect("submit through the default-built backend must run the shipped executor");
+            assert!(
+                handle.handle.starts_with("run-"),
+                "the shipped executor's handle shape, got {:?}",
+                handle.handle
+            );
+
+            // The executor recorded the request — the substituted
+            // placeholders, byte-exact (one line per field).
+            let state_dir = std::env::var_os("GANTRY_EXEC_STATE_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp/gantry-runs"));
+            let run_dir = state_dir.join(&handle.handle);
+            assert_eq!(
+                fs::read_to_string(run_dir.join("repo")).unwrap(),
+                format!("{}\n", spec.repo_url)
+            );
+            assert_eq!(
+                fs::read_to_string(run_dir.join("rev")).unwrap(),
+                format!("{}\n", spec.sha)
+            );
+            assert_eq!(fs::read_to_string(run_dir.join("args")).unwrap(), "[]\n");
+            let _ = fs::remove_dir_all(&run_dir);
+        }
+
+        #[test]
+        fn command_and_none_selections_without_a_table_keep_the_shipped_defaults() {
+            // No [remote.command] table: both non-argo selections build the
+            // shipped command defaults (CommandBackend::new) — observable as
+            // the command backend's describe/status surface and, when the
+            // environment leaves the executor seam unset, the shipped
+            // reference executor on the submit wire.
+            let spec = RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                "https://github.com/example/repo",
+                "abc123",
+                "",
+            );
+
+            let mut command_no_table = Config::hardcoded();
+            command_no_table.remote.backend = Backend::Command;
+
+            for config in [Config::hardcoded(), command_no_table] {
+                let backend = build_backend(&config);
+
+                // The command backend describes runs as the bare handle —
+                // never an argo UI URL — and carries no status step.
+                let handle = RunHandle::new("wf-defaults");
+                assert_eq!(backend.describe(&handle), "handle/wf-defaults");
+                let Err(err) = backend.status(&handle) else {
+                    panic!("the shipped default template has no status step");
+                };
+                assert!(err.reason.contains("no status step"));
+
+                // The submit wire runs the shipped reference executor with
+                // the spec substituted in.
+                submit_through_shipped_default(&*backend, &spec);
+            }
+        }
+
+        #[test]
+        fn argo_is_the_only_selection_that_builds_the_argo_backend() {
+            // The construction dispatches on the selection, never on which
+            // tables happen to be populated: with a fully-loaded [remote.argo]
+            // table present, both command selections still build a command
+            // backend — the user's [remote.command] table here — and the
+            // argo table stays inert: describe never renders its base_url,
+            // and submit never execs its kubectl (pointed at /probe/kubectl
+            // so an accidental argo construction fails loudly).
+            let spec = RunSpec::new(
+                "cargo",
+                "test",
+                vec![],
+                "https://github.com/example/repo",
+                "abc123",
+                "",
+            );
+
+            let mut command_with_both_tables = Config::hardcoded();
+            command_with_both_tables.remote.backend = Backend::Command;
+            command_with_both_tables.remote.argo =
+                Some(probe_argo_table(Path::new("/probe/kubectl")));
+
+            let mut none_with_both_tables = Config::hardcoded();
+            none_with_both_tables.remote.argo = Some(probe_argo_table(Path::new("/probe/kubectl")));
+
+            for mut config in [command_with_both_tables, none_with_both_tables] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let argv_log = dir.path().join("argv.log");
+                let executor =
+                    write_mock_executor(dir.path(), "mock-executor", &argv_log, "table-run-7q2m");
+                config.remote.command = Some(probe_command_table(&executor));
+
+                let backend = build_backend(&config);
+                let handle = with_exec_retry(|| backend.submit(&spec))
+                    .expect("submit must run the command table, not the argo table's kubectl");
+                assert_eq!(handle, RunHandle::new("table-run-7q2m"));
+
+                // describe() renders the command backend's bare handle — the
+                // probe argo table's base_url would have rendered the UI URL.
+                assert_eq!(backend.describe(&handle), "handle/table-run-7q2m");
+
+                // And the wire carries the command table's submit argv with
+                // the placeholders substituted — never kubectl (the mock's
+                // `$@` starts past its own path, argv[0] being the program).
+                let argv = fs::read_to_string(&argv_log).unwrap();
+                let argv: Vec<&str> = argv.lines().collect();
+                assert_eq!(
+                    argv,
+                    vec![
+                        "submit-from-table",
+                        "https://github.com/example/repo",
+                        "abc123",
+                        "[]",
+                    ]
+                );
+            }
+
+            // The same inertness with no command table at all: the shipped
+            // defaults keep the run, and the argo table still renders
+            // nothing (describe-only — the wire leg is the seam-default
+            // test's job).
+            let mut command_default_only = Config::hardcoded();
+            command_default_only.remote.backend = Backend::Command;
+            command_default_only.remote.argo = Some(probe_argo_table(Path::new("/probe/kubectl")));
+            let backend = build_backend(&command_default_only);
+            assert_eq!(backend.describe(&RunHandle::new("wf-x")), "handle/wf-x");
         }
     }
 

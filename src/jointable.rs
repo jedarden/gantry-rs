@@ -59,6 +59,23 @@
 //   originator killed in the instant between verdict and guard drop) is
 //   reclaimed by the first identical invocation after it rather than held
 //   forever.
+//
+// - **Attachments** — every live watcher of a run is countable (plan
+//   Component 10's supersede precondition: "zero live attachments —
+//   originator gone, no JoinTable waiters"). The originator's attachment is
+//   its entry, live while its pid is; each joiner registers a waiter file
+//   (`<state>/join/<key>.att/<run_id>`, JSON `{pid, started_epoch_ms}`) at
+//   claim time — under the same flock as the decision, so a concurrent count
+//   never straddles a registration — and detaches by removing it
+//   ([`AttachHandle::drop`]). [`attachment_count`] sums entry-plus-live-
+//   waiters, pruning waiter files whose pid has died: a joiner killed
+//   outright (no Drop runs) stops counting at the next count instead of
+//   pinning the key against supersede forever. The joiner's stream+wait
+//   tail itself lives in the dispatch pipelines ([`crate::decision`]): a
+//   joiner streams the live run's output through the shared handle
+//   (best-effort), then meets the originator in the shared wait — the same
+//   tail, so the joiner's wait lands the exact handling an originator gets
+//   — whose terminal arm reclaims the entry ([`AttachHandle::release`]).
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -299,13 +316,7 @@ impl Drop for JoinEntry {
         // joiner reclaims it (module docs, Cleanup); an entry re-claimed by
         // a fresh invocation after a joiner's release is that claimant's,
         // and this drop must not close their key.
-        let ours = read_entry(&self.entry_path)
-            .ok()
-            .flatten()
-            .is_some_and(|doc| doc.run_id == self.run_id);
-        if ours {
-            let _ = fs::remove_file(&self.entry_path);
-        }
+        let _ = remove_entry_if_owner(&self.entry_path, &self.run_id);
     }
 }
 
@@ -318,6 +329,10 @@ pub struct AttachHandle {
     /// The originator's runlog run id, for the join line's provenance.
     pub originator_run_id: String,
     entry_path: PathBuf,
+    /// This invocation's waiter registration (module docs, Attachments).
+    /// Removed on drop — the detach that stops counting this joiner on every
+    /// exit path, terminal or not.
+    waiter_path: PathBuf,
 }
 
 impl AttachHandle {
@@ -325,9 +340,148 @@ impl AttachHandle {
     /// verdict — the joiner-side reclaim that closes a key whose originator
     /// died before its guard could (module docs, Cleanup). Best-effort: the
     /// originator may have removed it first.
+    ///
+    /// Scoped like the originator's guard: the entry is removed only while
+    /// it still belongs to the run this handle attached through. A release
+    /// that lands after the key moved to a fresh claim epoch (a sibling
+    /// joiner's release let a new invocation originate mid-wait) must leave
+    /// that new claim alone.
     pub fn release(&self) {
-        let _ = fs::remove_file(&self.entry_path);
+        let _ = remove_entry_if_owner(&self.entry_path, &self.originator_run_id);
     }
+}
+
+impl Drop for AttachHandle {
+    fn drop(&mut self) {
+        // The detach: this invocation stops watching, so it stops counting —
+        // terminal (release already reclaimed the entry) or not (an error or
+        // Ctrl-C exit must not pin the key against supersede). Best-effort;
+        // a skipped removal is corrected by the next count's dead-pid prune.
+        let _ = fs::remove_file(&self.waiter_path);
+    }
+}
+
+/// The on-disk waiter registration: one per attached joiner, named by the
+/// joiner's own run id under `<state>/join/<key>.att/` (module docs,
+/// Attachments).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WaiterDoc {
+    /// Joiner pid — the liveness check that makes "live attachments" literal
+    /// and lets a count prune registrations whose process died outright.
+    pid: u32,
+    /// Wall-clock attach time (diagnostics; `gantry why` material).
+    started_epoch_ms: u64,
+}
+
+/// Decide [`JoinDecision::Attach`] for a readable, handle-bearing entry:
+/// register the caller as a live waiter and hand back the attach handle.
+/// Callers run it while still holding the key's claim lock, so a concurrent
+/// [`attachment_count`] never straddles the registration.
+fn attach_decision(
+    entry_path: &Path,
+    run_id: &str,
+    doc: &EntryDoc,
+) -> Result<JoinDecision, JoinError> {
+    let waiter_path = register_waiter(entry_path, run_id)?;
+    Ok(JoinDecision::Attach(AttachHandle {
+        handle: RunHandle::new(&doc.handle),
+        originator_run_id: doc.run_id.clone(),
+        entry_path: entry_path.to_path_buf(),
+        waiter_path,
+    }))
+}
+
+/// Write this invocation's waiter registration: `<key>.att/<run_id>`, JSON
+/// [`WaiterDoc`]. The name is the joiner's own run id (unique per
+/// invocation), so the write needs no synchronization beyond the claim lock
+/// its caller holds.
+fn register_waiter(entry_path: &Path, run_id: &str) -> Result<PathBuf, JoinError> {
+    let att_dir = entry_path.with_extension("att");
+    fs::create_dir_all(&att_dir).map_err(|source| JoinError::Io {
+        path: att_dir.clone(),
+        source,
+    })?;
+    let waiter_path = att_dir.join(run_id);
+    let json = serde_json::to_vec(&WaiterDoc {
+        pid: std::process::id(),
+        started_epoch_ms: now_epoch_ms(),
+    })
+    .map_err(|source| JoinError::Io {
+        path: waiter_path.clone(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })?;
+    fs::write(&waiter_path, json).map_err(|source| JoinError::Io {
+        path: waiter_path.clone(),
+        source,
+    })?;
+    Ok(waiter_path)
+}
+
+/// Count the live attachments on a key (module docs, Attachments): one for
+/// the originator while its entry stands and its pid lives, plus one per
+/// waiter registration whose pid is still alive. Waiter files whose pid has
+/// died are pruned on the way past — a joiner killed outright stops counting
+/// here, and the directory self-heals. No entry means nothing in flight:
+/// zero.
+///
+/// The count takes the key's claim lock, so it is a consistent snapshot
+/// against claim decisions (a joiner mid-registration is never straddled).
+/// Errors are reported, not folded into zero: a caller deciding whether a
+/// run is watched must treat "could not count" as watched (nonzero), never
+/// as the zero that would license a supersede.
+pub fn attachment_count(state_dir: &Path, key: &JoinKey) -> Result<u32, JoinError> {
+    let join_dir = state_dir.join("join");
+    let entry_path = join_dir.join(format!("{}.run", key.name));
+    let lock_path = join_dir.join(format!("{}.lock", key.name));
+
+    let lock = open_lock_file(&lock_path).map_err(|source| JoinError::Io {
+        path: lock_path,
+        source,
+    })?;
+    lock_exclusive_blocking(&lock);
+
+    let mut count = 0u32;
+    if let Some(doc) = read_entry(&entry_path)? {
+        if pid_alive(doc.pid) {
+            count += 1;
+        }
+    }
+
+    let att_dir = entry_path.with_extension("att");
+    let entries = match fs::read_dir(&att_dir) {
+        Ok(entries) => entries,
+        // No registration directory: no joiner has ever attached.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(count),
+        Err(source) => {
+            return Err(JoinError::Io {
+                path: att_dir,
+                source,
+            })
+        }
+    };
+    for entry in entries {
+        let path = match entry {
+            Ok(e) => e.path(),
+            Err(_) => continue,
+        };
+        match fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<WaiterDoc>(&bytes).ok())
+        {
+            // A live registration: one live attachment.
+            Some(waiter) if pid_alive(waiter.pid) => count += 1,
+            // A dead one is pruned — a joiner killed outright (no Drop runs)
+            // stops counting here, and the directory self-heals.
+            Some(_) => {
+                let _ = fs::remove_file(&path);
+            }
+            // An unreadable one is left for diagnosis and simply not counted:
+            // a file this binary cannot parse may be a newer schema's live
+            // registration, and pruning it would uncount a real watcher.
+            None => {}
+        }
+    }
+    Ok(count)
 }
 
 /// Error type for join-table operations (the [`crate::state::StateError`]
@@ -477,11 +631,7 @@ fn claim_in_polling(
                 );
                 return Ok(JoinDecision::Unjoined);
             }
-            return Ok(JoinDecision::Attach(AttachHandle {
-                handle: RunHandle::new(&doc.handle),
-                originator_run_id: doc.run_id,
-                entry_path,
-            }));
+            return attach_decision(&entry_path, run_id, &doc);
         }
         // Handle-less: the owner is between claim and submit. A live owner
         // gets polled (below); a dead one took its claim to the grave, so
@@ -567,11 +717,7 @@ fn poll_for_handle(
                         );
                         return Ok(JoinDecision::Unjoined);
                     }
-                    return Ok(JoinDecision::Attach(AttachHandle {
-                        handle: RunHandle::new(&doc.handle),
-                        originator_run_id: doc.run_id,
-                        entry_path: entry_path.to_path_buf(),
-                    }));
+                    return attach_decision(entry_path, run_id, &doc);
                 }
                 if !pid_alive(doc.pid) {
                     // The owner died wedged between claim and submit: its
@@ -591,6 +737,39 @@ fn poll_for_handle(
 // ============================================================================
 // Entry and lock plumbing
 // ============================================================================
+
+/// Remove an entry only while it still belongs to `run_id`.
+///
+/// The ownership check and removal share the claim lock. Without that
+/// critical section, an old originator guard or joiner release could read its
+/// own document, lose the lock to a fresh claim, and then remove the fresh
+/// epoch's entry. Cleanup is best-effort at its call sites, but it must never
+/// cross an epoch boundary when the filesystem is healthy.
+fn remove_entry_if_owner(entry_path: &Path, run_id: &str) -> Result<(), JoinError> {
+    let lock_path = entry_path.with_extension("lock");
+    let lock = open_lock_file(&lock_path).map_err(|source| JoinError::Io {
+        path: lock_path,
+        source,
+    })?;
+    lock_exclusive_blocking(&lock);
+
+    if read_entry(entry_path)?
+        .as_ref()
+        .is_some_and(|doc| doc.run_id == run_id)
+    {
+        match fs::remove_file(entry_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(JoinError::Io {
+                    path: entry_path.to_path_buf(),
+                    source,
+                })
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Read the entry document at `path`; `None` when there is none. A document
 /// that is not JSON of [`ENTRY_SCHEMA`] — malformed, or well-formed from a
@@ -896,6 +1075,38 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn joiner_release_reclaims_a_handle_bearing_dead_originator() {
+        // A SIGKILLed originator cannot run JoinEntry::drop. Once a joiner
+        // waits out the real handle, its terminal release must close that
+        // orphaned claim so the next identical invocation can originate.
+        let dir = tempfile::tempdir().unwrap();
+        let k = key("file:///r", "sha1", "test", &[]);
+        forge(dir.path(), &k, "run-dead-handle", "run-dead", dead_pid());
+
+        let attach = match claim_in(dir.path(), &k, "run-B", "command").unwrap() {
+            JoinDecision::Attach(attach) => attach,
+            other => panic!("dead handle-bearing originator must attach, got {other:?}"),
+        };
+        assert_eq!(
+            attachment_count(dir.path(), &k).unwrap(),
+            1,
+            "only the live joiner counts after the originator dies"
+        );
+
+        attach.release();
+        drop(attach);
+        assert_eq!(attachment_count(dir.path(), &k).unwrap(), 0);
+        assert!(
+            matches!(
+                claim_in(dir.path(), &k, "run-C", "command").unwrap(),
+                JoinDecision::Originator(_)
+            ),
+            "a terminal joiner release must reopen the key"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn dead_owner_submitting_claim_is_taken_over() {
         let dir = tempfile::tempdir().unwrap();
         let k = key("file:///r", "sha1", "test", &[]);
@@ -1046,6 +1257,163 @@ mod tests {
 
         let err = claim_in(dir.path(), &k, "run-B", "command").unwrap_err();
         assert!(matches!(err, JoinError::Parse { .. }), "got {err:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // Attachments: the handle-bearing claim, waiter lifecycle, live counting
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn claim_against_handle_bearing_entry_yields_originators_run_handle() {
+        // The store contract the joiner skip builds on (gantry-db9df1c6): a
+        // claim against a handle-bearing in-flight entry resolves to Attach
+        // carrying the *originator's* RunHandle — the handle a joiner waits
+        // on instead of submitting — and the claim registers that joiner as
+        // a live watcher while it holds the attach.
+        let dir = tempfile::tempdir().unwrap();
+        let k = key("file:///r", "sha1", "test", &[]);
+        forge(dir.path(), &k, "run-A-handle", "run-A", std::process::id());
+
+        match claim_in(dir.path(), &k, "run-B", "command").unwrap() {
+            JoinDecision::Attach(a) => {
+                assert_eq!(
+                    a.handle.handle, "run-A-handle",
+                    "the originator's RunHandle rides the attach, not a fresh one"
+                );
+                assert_eq!(a.originator_run_id, "run-A");
+                assert_eq!(
+                    attachment_count(dir.path(), &k).unwrap(),
+                    2,
+                    "originator entry + this joiner's live registration"
+                );
+            }
+            other => panic!("handle-bearing entry must attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_with_no_entry_still_originates_fresh() {
+        // The other half of the contract: with nothing in flight, the claim
+        // is a fresh originator — the caller submits its own run — and no
+        // watcher state exists beyond the originator's own entry.
+        let dir = tempfile::tempdir().unwrap();
+        let k = key("file:///r", "sha1", "test", &[]);
+        let att_dir = dir.path().join("join").join(format!("{}.att", k.name));
+
+        let entry = match claim_in(dir.path(), &k, "run-A", "command").unwrap() {
+            JoinDecision::Originator(e) => e,
+            other => panic!("empty key must originate, got {other:?}"),
+        };
+        assert_eq!(
+            attachment_count(dir.path(), &k).unwrap(),
+            1,
+            "only the originator's entry is watching"
+        );
+        assert!(!att_dir.exists(), "an unattached claim creates no waiters");
+
+        drop(entry);
+        assert_eq!(
+            attachment_count(dir.path(), &k).unwrap(),
+            0,
+            "the guard's drop closes the key"
+        );
+    }
+
+    #[test]
+    fn dropped_attach_detaches_its_waiter() {
+        // The detach (Drop): a joiner that exits without a terminal verdict
+        // — an error path, a Ctrl-C — stops counting when its AttachHandle
+        // drops, instead of pinning the key against supersede forever.
+        let dir = tempfile::tempdir().unwrap();
+        let k = key("file:///r", "sha1", "test", &[]);
+        forge(dir.path(), &k, "run-A-handle", "run-A", std::process::id());
+
+        let attach = match claim_in(dir.path(), &k, "run-B", "command").unwrap() {
+            JoinDecision::Attach(a) => a,
+            other => panic!("must attach, got {other:?}"),
+        };
+        assert_eq!(attachment_count(dir.path(), &k).unwrap(), 2);
+
+        drop(attach);
+        assert_eq!(
+            attachment_count(dir.path(), &k).unwrap(),
+            1,
+            "the waiter registration went with the drop; the originator remains"
+        );
+        let att_dir = dir.path().join("join").join(format!("{}.att", k.name));
+        assert!(
+            fs::read_dir(&att_dir).unwrap().next().is_none(),
+            "the registration directory is empty again"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dead_joiners_waiter_is_pruned_not_counted() {
+        // A joiner killed outright runs no Drop, so its registration stays;
+        // the next count prunes it (dead pid) instead of pinning the key.
+        let dir = tempfile::tempdir().unwrap();
+        let k = key("file:///r", "sha1", "test", &[]);
+        forge(dir.path(), &k, "run-A-handle", "run-A", std::process::id());
+        let att_dir = dir.path().join("join").join(format!("{}.att", k.name));
+        fs::create_dir_all(&att_dir).unwrap();
+        fs::write(
+            att_dir.join("run-dead"),
+            serde_json::to_vec(&WaiterDoc {
+                pid: dead_pid(),
+                started_epoch_ms: now_epoch_ms(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            attachment_count(dir.path(), &k).unwrap(),
+            1,
+            "only the originator counts; the dead joiner was pruned"
+        );
+        assert!(
+            !att_dir.join("run-dead").exists(),
+            "the dead registration was removed on the way past"
+        );
+    }
+
+    #[test]
+    fn a_stale_attach_release_never_touches_the_new_epoch() {
+        // release() is scoped like the guards: a joiner's terminal release
+        // that lands after the key moved to a fresh claim epoch (its own
+        // release let a new invocation originate mid-wait) leaves that new
+        // claim exactly as it found it.
+        let dir = tempfile::tempdir().unwrap();
+        let k = key("file:///r", "sha1", "test", &[]);
+        forge(dir.path(), &k, "run-A-handle", "run-A", std::process::id());
+        let attach = match claim_in(dir.path(), &k, "run-B", "command").unwrap() {
+            JoinDecision::Attach(a) => a,
+            other => panic!("must attach, got {other:?}"),
+        };
+
+        // The run ends and the key moves on to a new claim epoch before the
+        // joiner's release fires.
+        fs::remove_file(entry_path(dir.path(), &k)).unwrap();
+        let fresh = match claim_in(dir.path(), &k, "run-C", "command").unwrap() {
+            JoinDecision::Originator(e) => e,
+            other => panic!("the re-claim must originate, got {other:?}"),
+        };
+
+        attach.release();
+        let doc: EntryDoc =
+            serde_json::from_slice(&fs::read(entry_path(dir.path(), &k)).unwrap()).unwrap();
+        assert_eq!(doc.run_id, "run-C", "the new claim's identity is untouched");
+        assert_eq!(doc.handle, "", "the new claim is still handle-less");
+
+        // The stale attach still detaches only itself.
+        drop(attach);
+        assert_eq!(
+            attachment_count(dir.path(), &k).unwrap(),
+            1,
+            "only the new epoch's originator counts"
+        );
+        drop(fresh);
     }
 
     // ------------------------------------------------------------------

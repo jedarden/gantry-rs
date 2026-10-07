@@ -17,7 +17,7 @@
       "type": ["object", "null"],
       "description": "The most recent run: the write-ahead OPEN intent plus its terminal verdict when one landed. null when found is false.",
       "additionalProperties": false,
-      "required": ["run_id", "ts", "tool", "args", "repo", "sha", "cwd_rel", "gate", "decision", "reason", "backend", "verdict", "failure_class", "orphaned"],
+      "required": ["run_id", "ts", "tool", "args", "repo", "sha", "cwd_rel", "gate", "decision", "reason", "backend", "verdict", "orphaned"],
       "properties": {
         "run_id": {
           "type": "string"
@@ -122,11 +122,6 @@
               }
             }
           }
-        },
-        "failure_class": {
-          "type": ["string", "null"],
-          "enum": ["compile-error", "test-failure", "doctest", "harness-panic", "gate-failure", null],
-          "description": "The failure taxonomy class the run died of (plan §Component 5); null when no class was recorded — passes, infra, cancels, superseded, local runs, uninstrumented producers, in-flight and lost runs, and every pre-taxonomy record whose entry lacks the field."
         },
         "orphaned": {
           "type": "boolean",

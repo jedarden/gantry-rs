@@ -11,10 +11,7 @@
 // Exit codes: 0 a last run was found, 1 the ledger is empty or unreadable
 // (nothing to explain), 2 usage error.
 
-use super::{
-    decision_name, failure_class_name, gate_trace_line, iso8601_utc, ran_name, RunJson,
-    SCHEMA_VERSION,
-};
+use super::{decision_name, gate_trace_line, iso8601_utc, ran_name, RunJson, SCHEMA_VERSION};
 use crate::runlog::{Ledger, RunLog};
 use serde::{Deserialize, Serialize};
 
@@ -108,25 +105,13 @@ pub fn render_text(doc: &WhyDoc) -> String {
         lines.push(format!("reason: {}", run.reason));
     }
     match &run.verdict {
-        Some(verdict) => {
-            // The taxonomy class, when the remote pipeline recorded one —
-            // the thing an agent branches on without parsing logs. Absent
-            // for every record that carries no class, so the line stays
-            // exactly as long as it needs to be.
-            let class = run
-                .failure_class
-                .as_ref()
-                .map(|class| format!(" · class {}", failure_class_name(class)))
-                .unwrap_or_default();
-            lines.push(format!(
-                "verdict: {} · ran {} · exit {} · handle {}{}",
-                verdict.verdict,
-                ran_name(verdict.ran),
-                verdict.exit_code,
-                verdict.handle,
-                class
-            ))
-        }
+        Some(verdict) => lines.push(format!(
+            "verdict: {} · ran {} · exit {} · handle {}",
+            verdict.verdict,
+            ran_name(verdict.ran),
+            verdict.exit_code,
+            verdict.handle
+        )),
         None => lines.push(
             "verdict: none recorded — in flight, or a lost run (gantry doctor reports those)"
                 .to_string(),
@@ -252,20 +237,6 @@ mod tests {
         }
     }
 
-    /// The same entry with the remote pipeline's taxonomy class stamped on
-    /// its verdict record — the shape an instrumented failing remote run
-    /// writes (verdict.json v2, plan §Component 5).
-    fn classified(entry: RunEntry, class: crate::verdict::FailureClass) -> RunEntry {
-        let mut verdict = entry.verdict;
-        if let Some(record) = verdict.as_mut() {
-            record.failure_class = Some(class);
-        }
-        RunEntry {
-            intent: entry.intent,
-            verdict,
-        }
-    }
-
     /// Validate a serializable document against its published schema.
     fn assert_valid(schema_text: &str, doc: &impl Serialize) {
         let schema: serde_json::Value =
@@ -301,24 +272,16 @@ mod tests {
     #[test]
     fn why_json_validates_against_its_published_schema() {
         // The acceptance for bf-1n4, over the document shapes the command can
-        // actually emit: a completed failing run (the AS-2 shape), the same
-        // run with a taxonomy class on its verdict record, an in-flight
-        // orphan, and an empty ledger.
+        // actually emit: a completed failing run (the AS-2 shape), an
+        // in-flight orphan, and an empty ledger.
         let completed = build(
             ledger(vec![entry(false, Some(Verdict::TestFailure))]),
-            FAKE_LEDGER.to_string(),
-        );
-        let classified = build(
-            ledger(vec![classified(
-                entry(false, Some(Verdict::TestFailure)),
-                crate::verdict::FailureClass::TestFailure,
-            )]),
             FAKE_LEDGER.to_string(),
         );
         let orphan = build(ledger(vec![entry(true, None)]), FAKE_LEDGER.to_string());
         let empty = build(ledger(vec![]), FAKE_LEDGER.to_string());
 
-        for doc in [&completed, &classified, &orphan, &empty] {
+        for doc in [&completed, &orphan, &empty] {
             assert_valid(WHY_SCHEMA, doc);
         }
 
@@ -328,63 +291,6 @@ mod tests {
         assert_eq!(doc["run"]["verdict"]["verdict"], "test_failure");
         assert_eq!(doc["run"]["verdict"]["ran"], "remote");
         assert_eq!(doc["run"]["orphaned"], false);
-        // No class on the record reads as null, never an absent field.
-        assert_eq!(doc["run"]["failure_class"], serde_json::Value::Null);
-        let doc = serde_json::to_value(&classified).unwrap();
-        assert_eq!(doc["run"]["failure_class"], "test-failure");
-    }
-
-    #[test]
-    fn human_text_names_the_failure_class_of_a_failed_remote_run() {
-        let doc = build(
-            ledger(vec![classified(
-                entry(false, Some(Verdict::TestFailure)),
-                crate::verdict::FailureClass::TestFailure,
-            )]),
-            FAKE_LEDGER.to_string(),
-        );
-        let text = render_text(&doc);
-        assert!(text.contains(" · class test-failure"), "{text}");
-        assert!(text.contains("verdict: TestFailure"), "{text}");
-    }
-
-    #[test]
-    fn human_text_omits_the_class_when_none_was_recorded() {
-        // Passes, infra, cancels, local runs, uninstrumented producers: no
-        // class on the record, no name in the line.
-        let doc = build(
-            ledger(vec![entry(false, Some(Verdict::TestFailure))]),
-            FAKE_LEDGER.to_string(),
-        );
-        let text = render_text(&doc);
-        assert!(!text.contains("class"), "{text}");
-    }
-
-    #[test]
-    fn a_pre_taxonomy_record_reads_as_a_null_class_not_an_error() {
-        // The pre-taxonomy producer shape: schema 1, no `failure_class` key
-        // on disk. The ledger parse is lenient upstream; the projection must
-        // read it as null and still explain the run.
-        let legacy: VerdictRecord = serde_json::from_str(
-            r#"{"rec":"verdict","schema_version":1,"run_id":"legacy","ts":2,"verdict":"test_failure","ran":"remote","exit_code":101,"handle":"gantry-x7k2p"}"#,
-        )
-        .expect("legacy record parses");
-        assert!(legacy.failure_class.is_none());
-
-        let doc = build(
-            ledger(vec![RunEntry {
-                intent: intent(true, Decision::Remote),
-                verdict: Some(legacy),
-            }]),
-            FAKE_LEDGER.to_string(),
-        );
-        assert!(doc.found);
-        let run = doc.run.as_ref().expect("found implies a run");
-        assert!(run.failure_class.is_none());
-        assert!(run.verdict.is_some(), "everything but the class survives");
-
-        let text = render_text(&doc);
-        assert!(!text.contains("class"), "{text}");
     }
 
     #[test]

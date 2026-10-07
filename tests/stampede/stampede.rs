@@ -140,6 +140,8 @@ fn worker_main() {
         run_id: &id,
         gate_ms: 0,
         push_ms: 0,
+        // A slot-contended fallback, not a deadline expiry: no timeout to name.
+        timeout: None,
     };
     let code =
         gantry::local::run_fallback(&config, &[], "stampede drill: backend unreachable", &ctx);

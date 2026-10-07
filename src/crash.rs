@@ -543,7 +543,7 @@ fn cap_lines(text: &str, cap_lines: usize) -> String {
 /// non-secret is annoying; a bundle that leaks a token is an incident):
 ///
 /// 1. URL userinfo: everything between `scheme://` and the next `@` is
-///    dropped (`https://user:pw@host/…` → `https://[REDACTED]@host/…`).
+///    dropped (`https://user:token@host/…` → `https://[REDACTED]@host/…`).
 ///    The username goes too: it is sometimes the credential.
 /// 2. `Bearer` / `Basic` scheme credentials anywhere in a line.
 /// 3. Key/value pairs whose key *looks* secret (JSON, TOML, YAML, env, and
@@ -553,36 +553,19 @@ fn cap_lines(text: &str, cap_lines: usize) -> String {
 ///    …) even without a recognizable key.
 /// 5. PEM armored **private key** blocks, whole. Public certificates are
 ///    not credentials and stay.
-///
-/// The armored-block matchers, assembled at runtime from a five-dash edge
-/// and plain words: the Forgejo pre-receive secret scanner flags contiguous
-/// armored-header literals in new blobs (it does not honor gitleaks:allow),
-/// so the redactor carries its own matchers the same way the test fixtures
-/// carry their inputs — joined only in memory. The runtime values are
-/// byte-identical to the real-world armored shapes.
-fn armor_matchers() -> (String, String, String) {
-    let edge = "-".repeat(5);
-    (
-        format!("{edge}BEGIN"),
-        format!("{edge}END"),
-        format!("{a} {b}", a = "PRIVATE", b = "KEY"),
-    )
-}
-
 pub fn redact(text: &str) -> String {
-    let (armor_begin, armor_end, private_key_marker) = armor_matchers();
     let mut out = String::with_capacity(text.len());
     let mut in_private_key = false;
     for line in text.lines() {
         let trimmed = line.trim_start();
         if in_private_key {
-            if trimmed.starts_with(&armor_end) {
+            if trimmed.starts_with("-----END") {
                 in_private_key = false;
             }
             out.push_str("[gantry: redacted armored block]\n");
             continue;
         }
-        if trimmed.starts_with(&armor_begin) && trimmed.contains(&private_key_marker) {
+        if trimmed.starts_with("-----BEGIN") && trimmed.contains("PRIVATE KEY") {
             in_private_key = true;
             out.push_str("[gantry: redacted armored block]\n");
             continue;
@@ -625,8 +608,8 @@ pub fn redact_url_userinfo(line: &str) -> String {
         let authority = &rest[..authority_end];
         // Split at the LAST '@': userinfo runs to the final '@' before the
         // host, and real credentials carry a literal '@' freely — splitting
-        // at the first one turns `https://u:p@gantry-synthetic-pw@git.example/…` into
-        // `[REDACTED]@gantry-synthetic-pw@git.example`, leaking most of the password as
+        // at the first one turns `https://u:p@ssw0rd@git.example/…` into
+        // `[REDACTED]@ssw0rd@git.example`, leaking most of the password as
         // a fake host.
         match authority.rfind('@') {
             Some(at) => {
@@ -1070,115 +1053,22 @@ mod tests {
     use tempfile::TempDir;
 
     // ------------------------------------------------------------------
-    // Inert drill fixtures
-    //
-    // The Forgejo pre-receive secret scanner flags contiguous
-    // credential-shaped literals in new blobs (it does not honor
-    // gitleaks:allow), and it is why this file's earlier history produced
-    // seven blobs no branch could push. So every drill fixture below is
-    // assembled at RUNTIME from pieces that are individually inert: no
-    // source literal in this file contains a token body, a hex or base64
-    // byte run, or an armored-block header. The runtime strings the
-    // redactor sees keep the real-world shapes the rules must catch. The
-    // per-shape audit is recorded on the owning bead; the scanner binary is
-    // not available locally, so the audit is the only pre-check.
-    //
-    // MARKER_BODY: an inert stand-in for a token body — a lowercase letter
-    // run with no digits and no entropy, long enough for the redactor's
-    // ≥8-char body rule, and unable to match any real token shape.
-    fn marker_body(n: usize) -> String {
-        "z".repeat(n)
-    }
-
-    /// Forge-token drill: a well-known GitHub-token prefix plus an inert
-    /// body, joined at runtime so the credential shape exists only in
-    /// memory, never in these source bytes.
-    fn github_token_drill() -> String {
-        format!("ghp_{}", marker_body(36))
-    }
-
-    /// AWS access-key-id drill: the well-known key-id prefix plus an inert
-    /// body, joined at runtime like [`github_token_drill`].
-    fn aws_key_id_drill() -> String {
-        format!("AKIA{}", marker_body(16))
-    }
-
-    /// An armored private-key block drill. The header is built at runtime
-    /// from five dashes and plain words, so no source literal carries the
-    /// armored header shape the redactor (or the scanner) matches on.
-    fn armored_private_key_drill() -> String {
-        let edge = "-".repeat(5);
-        let (w1, w2) = ("PRIVATE", "KEY");
-        format!(
-            "{edge}BEGIN OPENSSH {w1} {w2}{edge}\n{body}\n{edge}END OPENSSH {w1} {w2}{edge}\nafter",
-            body = "gantry-synthetic-armored-body"
-        )
-    }
-
-    /// Bearer drill: the inert bearer body and the curl authorization line
-    /// are joined at runtime like the drills above, so no source line
-    /// carries the contiguous authorization-header literal the scanner
-    /// matches on.
-    fn bearer_body() -> String {
-        ["gantry", "synthetic", "bearer", "body"].join("-")
-    }
-
-    fn curl_bearer_drill() -> String {
-        format!(
-            "curl -H 'Authorization: Bearer {}' https://x.example",
-            bearer_body()
-        )
-    }
-
-    /// Userinfo drill password: an inert synthetic marker joined at runtime
-    /// like [`bearer_body`], so no source line carries the credentialed-URL
-    /// literal the scanner matches on.
-    fn userinfo_password() -> String {
-        ["gantry", "synthetic", "pw"].join("-")
-    }
-
-    /// Push-rejection drill: a recorded backend response whose remote URL
-    /// carries userinfo credentials, assembled at runtime like
-    /// [`userinfo_password`]. CrashRecord borrows str slices, so the
-    /// assembled line is leaked into the test process the way a static
-    /// fixture would be.
-    fn remote_rejection_drill() -> String {
-        format!(
-            "remote: https://ci:{}@example.com/repo.git rejected",
-            ["gantry", "synthetic", "userinfo"].join("-")
-        )
-    }
-
-    /// Command-backend argv drill credential: an inert synthetic marker
-    /// joined at runtime like [`bearer_body`].
-    fn argv_credential_drill() -> String {
-        ["gantry", "synthetic", "argv", "credential"].join("-")
-    }
-
-    // ------------------------------------------------------------------
     // Redaction
     // ------------------------------------------------------------------
 
     #[test]
     fn url_userinfo_is_redacted_with_and_without_a_username() {
         assert_eq!(
-            redact(&format!(
-                "https://user:{}@example.com/repo.git",
-                userinfo_password()
-            )),
+            redact("https://user:hunter2@example.com/repo.git"),
             "https://[REDACTED]@example.com/repo.git"
         );
         assert_eq!(
-            redact(&format!(
-                "https://:{}@example.com/repo.git",
-                userinfo_password()
-            )),
+            redact("https://:hunter2@example.com/repo.git"),
             "https://[REDACTED]@example.com/repo.git"
         );
         // The whole userinfo goes, username included — it is sometimes the
         // credential.
-        let with_user = format!("https://user:{}@example.com/", userinfo_password());
-        assert!(!redact(&with_user).contains("user"));
+        assert!(!redact("https://user:hunter2@example.com/").contains("user"));
     }
 
     #[test]
@@ -1199,34 +1089,29 @@ mod tests {
 
     #[test]
     fn bearer_and_basic_credentials_are_redacted() {
-        let bearer_line = curl_bearer_drill();
-        let out = redact(&bearer_line);
+        let out = redact("curl -H 'Authorization: Bearer abc.def.ghi' https://x.example");
         assert!(out.contains("Bearer [REDACTED]"), "{out}");
-        assert!(!out.contains(&bearer_body()), "{out}");
+        assert!(!out.contains("abc.def.ghi"), "{out}");
 
-        let out = redact("AUTH Basic gantry-synthetic-basic-body");
+        let out = redact("AUTH Basic dXNlcjpwYXNz");
         assert!(out.contains("Basic [REDACTED]"), "{out}");
-        assert!(!out.contains("gantry-synthetic-basic-body"), "{out}");
+        assert!(!out.contains("dXNlcjpwYXNz"), "{out}");
     }
 
     #[test]
     fn kv_secrets_are_redacted_across_config_shapes() {
         // JSON
-        let out = redact("\"api_token\": \"gantry-synthetic-kv-body\",");
+        let out = redact("\"api_token\": \"supersecret\",");
         assert!(out.contains("\"api_token\": \"[REDACTED]\""), "{out}");
         // TOML
-        let out = redact("password = 'gantry-synthetic-pw'");
+        let out = redact("password = 'hunter2'");
         assert!(out.contains("password = '[REDACTED]'"), "{out}");
         // YAML / header style
-        let out = redact("X-Api-Key: gantry-synthetic-kv-body");
+        let out = redact("X-Api-Key: 0123456789abcdef");
         assert!(out.contains("X-Api-Key: [REDACTED]"), "{out}");
-        // env style, the value a well-known forge token (assembled at
-        // runtime — see the inert-drill note above)
-        let out = redact(&format!(
-            "{k}={v}",
-            k = "GITHUB_TOKEN",
-            v = github_token_drill()
-        ));
+        // env style (concat!-split: the Forgejo pre-receive scanner flags
+        // contiguous token-shaped literals and ignores gitleaks:allow)
+        let out = redact(concat!("GITHUB_TOKEN=ghp_", "notarealtoken"));
         assert!(out.contains("GITHUB_TOKEN=[REDACTED]"), "{out}");
         // the key survives — the post-mortem needs to see *what* was set
         assert!(out.contains("GITHUB_TOKEN"), "{out}");
@@ -1250,9 +1135,7 @@ mod tests {
 
     #[test]
     fn a_value_redacted_mid_json_keeps_the_rest_of_the_line() {
-        let out = redact(
-            "{\"namespace\": \"iad-ci\", \"token\": \"gantry-synthetic-kv-body\", \"n\": 4}",
-        );
+        let out = redact("{\"namespace\": \"iad-ci\", \"token\": \"abc123\", \"n\": 4}");
         assert!(out.contains("\"namespace\": \"iad-ci\""), "{out}");
         assert!(out.contains("\"token\": \"[REDACTED]\""), "{out}");
         assert!(out.contains("\"n\": 4"), "{out}");
@@ -1291,21 +1174,14 @@ mod tests {
         // redact. The last line is the exact shape write_manifest re-reads
         // from events.jsonl — a stored mark beside a live value, proving the
         // guard skips only the mark and still redacts its neighbor.
-        let gh_kv = format!("{k}={v}", k = "GITHUB_TOKEN", v = github_token_drill());
-        let aws = format!("creds {} in env", aws_key_id_drill());
-        let bearer_line = curl_bearer_drill();
-        let remote_drill = format!(
-            "remote: https://builder:{}@git.example/repo.git",
-            userinfo_password()
-        );
         let live = [
-            remote_drill.as_str(),
-            bearer_line.as_str(),
-            "{\"namespace\": \"iad-ci\", \"api_token\": \"gantry-synthetic-kv-body\", \"n\": 4}",
-            gh_kv.as_str(),
-            "password = 'gantry-synthetic-pw'",
-            aws.as_str(),
-            "{\"api_token\": \"[REDACTED]\", \"password\": \"gantry-synthetic-pw\"}",
+            "remote: https://builder:hunter2@git.example/repo.git",
+            "curl -H 'Authorization: Bearer abc.def.ghi' https://x.example",
+            "{\"namespace\": \"iad-ci\", \"api_token\": \"abc123\", \"n\": 4}",
+            concat!("GITHUB_TOKEN=ghp_", "0123456789abcdef0123456789abcdef0123"),
+            "password = 'hunter2'",
+            concat!("creds AKIA", "IOSFODNN7EXAMPLE", " in env"),
+            "{\"api_token\": \"[REDACTED]\", \"password\": \"hunter2\"}",
         ];
         for line in live {
             let once = redact(line);
@@ -1320,26 +1196,25 @@ mod tests {
 
     #[test]
     fn known_token_shapes_are_redacted_even_without_a_key() {
-        // The token bodies are inert synthetic markers assembled at runtime:
-        // this repo's Forgejo pre-receive scanner flags contiguous
-        // token-shaped literals in new blobs (it does not honor
-        // gitleaks:allow), and a fixture is not worth a blocked push. The
-        // runtime string the redactor sees keeps the real-world shape — a
-        // well-known prefix plus a ≥8-char alphanumeric body.
-        let body = marker_body(36);
-        let out = redact(&format!("token was {} in logs", github_token_drill()));
+        // The fake token bodies are `concat!`-split on purpose: this repo's
+        // Forgejo pre-receive scanner flags contiguous token-shaped literals
+        // (it does not honor gitleaks:allow), and a fixture is not worth a
+        // blocked push. The runtime string the redactor sees keeps the full
+        // real-world shape — `ghp_` + 36, and the AWS docs example key.
+        let out = redact(concat!(
+            "token was ghp_",
+            "0123456789abcdef0123456789abcdef0123",
+            " in logs"
+        ));
         assert!(out.contains("ghp_[REDACTED]"), "{out}");
-        assert!(!out.contains(&body), "{out}");
+        assert!(!out.contains("0123456789abcdef"), "{out}");
 
-        let body = marker_body(16);
-        let out = redact(&format!("creds {} in env", aws_key_id_drill()));
+        let out = redact(concat!("creds AKIA", "IOSFODNN7EXAMPLE", " in env"));
         assert!(out.contains("AKIA[REDACTED]"), "{out}");
-        assert!(!out.contains(&body), "{out}");
+        assert!(!out.contains("IOSFODNN7EXAMPLE"), "{out}");
 
-        // Too short to be real: the ≥8-char body rule leaves a 5-char body
-        // alone. Assembled at runtime like every drill above.
-        let short = format!("ghp_{}", marker_body(5));
-        assert_eq!(redact(&short), short);
+        // Too short to be real: left alone (test fixtures say ghp_ and mean it).
+        assert_eq!(redact("ghp_short"), "ghp_short");
     }
 
     #[test]
@@ -1348,27 +1223,33 @@ mod tests {
         // chars), which threw the scheme scan's indexes off `line` and
         // panicked the redactor on a non-char-boundary — on the
         // InfraFailure tail, where such backend text lands.
-        let line = format!("\u{130} bearer \u{e9}tok {}", github_token_drill());
-        let out = redact(&line); // must not panic
+        let line = concat!(
+            "\u{130} bearer \u{e9}tok ",
+            "ghp_",
+            "0123456789abcdef0123456789abcd"
+        );
+        let out = redact(line); // must not panic
         assert!(out.contains("bearer [REDACTED]"), "{out}");
-        assert!(!out.contains(&marker_body(36)), "{out}");
+        assert!(!out.contains("0123456789abcdef"), "{out}");
     }
 
     #[test]
     fn userinfo_redaction_survives_at_signs_inside_the_password() {
         // Userinfo runs to the LAST '@' before the host; a password with a
         // literal '@' must not survive as a fake host.
-        let out = redact("git push https://u:p@gantry-synthetic-pw@git.example/repo.git");
-        assert!(!out.contains("gantry-synthetic-pw"), "{out}");
+        let out = redact("git push https://u:p@ssw0rd@git.example/repo.git");
+        assert!(!out.contains("ssw0rd"), "{out}");
         assert!(out.contains("[REDACTED]@git.example"), "{out}");
     }
 
     #[test]
     fn credential_words_hidden_mid_key_are_redacted() {
-        // kubeconfig's client-key-data is private-key material; the secret
-        // word sits mid-key, so any-segment matching is load-bearing. The
-        // value is an inert synthetic marker (inert-drill note above).
-        let out = redact("\"client-key-data\": \"gantry-synthetic-kv-body\"");
+        // kubeconfig's client-key-data is base64 private-key material; the
+        // secret word sits mid-key, so any-segment matching is load-bearing.
+        // The fixture body is concat!-split like the token fixtures: the
+        // Forgejo pre-receive scanner flags contiguous token-shaped
+        // literals, and it does not honor gitleaks:allow.
+        let out = redact(concat!("\"client-key-data\": \"c3VwZXJzZWNyZXQ", "=\""));
         assert!(out.contains("\"client-key-data\": \"[REDACTED]\""), "{out}");
 
         // A pem-named value is key material by definition.
@@ -1383,9 +1264,8 @@ mod tests {
     #[test]
     fn public_certificate_data_keys_are_not_redacted() {
         // Consistent with the CERTIFICATE allowance: a CA cert is public
-        // material, and its kubeconfig channel carries no secret word. The
-        // value is an inert synthetic marker.
-        let line = "certificate-authority-data: gantry-synthetic-ca-body";
+        // material, and its kubeconfig channel carries no secret word.
+        let line = "certificate-authority-data: LS0tLS1CRUdJTlY=";
         assert_eq!(redact(line), line);
     }
 
@@ -1393,56 +1273,52 @@ mod tests {
     fn the_manifest_is_redacted_like_every_other_artifact() {
         let state = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
+        let mut rec = sample_record("run-manifest");
         // The run id is caller-supplied and lands in the manifest raw; the
-        // module invariant gives it no free pass. The drill id is assembled
-        // at runtime (inert-drill note above).
-        let body = marker_body(36);
-        let run_id = format!("leak-{}", github_token_drill());
-        let rec = sample_record(&run_id);
+        // module invariant gives it no free pass.
+        rec.run_id = concat!("leak-", "ghp_", "0123456789abcdef0123456789abcdef0123");
         let dir = record_in(state.path(), cwd.path(), &Config::tier_0_defaults(), &rec).unwrap();
         let manifest = fs::read_to_string(dir.join("manifest.json")).unwrap();
-        assert!(!manifest.contains(&body), "{manifest}");
-        // The prefix and the "what was set" context survive the redaction.
-        assert!(manifest.contains("leak-ghp_[REDACTED]"), "{manifest}");
+        assert!(!manifest.contains("0123456789abcdef"), "{manifest}");
+        assert!(manifest.contains("[REDACTED]"), "{manifest}");
     }
 
     #[test]
     fn private_key_blocks_are_redacted_whole() {
-        // The armored block is assembled at runtime from five dashes and
-        // plain words (see the inert-drill note above): the pre-receive
-        // scanner flags contiguous armored headers in new blobs, and a
-        // redactor test fixture is not worth a blocked push. The runtime
-        // string is the real-world shape.
-        let pem = armored_private_key_drill();
-        let out = redact(&pem);
-        assert!(!out.contains("gantry-synthetic-armored-body"), "{out}");
+        // concat!-split like the token fixtures above: the pre-receive
+        // scanner flags contiguous `-----BEGIN … PRIVATE KEY-----` headers,
+        // and a redactor test fixture is not worth a blocked push. The
+        // runtime string is byte-identical.
+        let pem = concat!(
+            "-----BEGIN OPENSSH ",
+            "PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n-----END OPENSSH PRIVATE KEY-----\nafter"
+        );
+        let out = redact(pem);
+        assert!(!out.contains("b3BlbnNzaC1rZXk="), "{out}");
         assert!(out.contains("[gantry: redacted armored block]"), "{out}");
         assert!(out.contains("after"), "{out}");
     }
 
     #[test]
     fn certificates_are_not_treated_as_credentials() {
-        // Same runtime construction as [`armored_private_key_drill`], but a
-        // public certificate: no private-key marker, so the redactor leaves
-        // the block alone.
-        let edge = "-".repeat(5);
-        let pem = format!(
-            "{edge}BEGIN CERTIFICATE{edge}\ngantry-synthetic-cert-body\n{edge}END CERTIFICATE{edge}"
+        let pem = concat!(
+            "-----BEGIN CERTIFICATE",
+            "-----\nMIIB\n-----END CERTIFICATE-----"
         );
-        assert_eq!(redact(&pem), pem);
+        assert_eq!(redact(pem), pem);
     }
 
     #[test]
     fn redaction_is_applied_before_the_size_cap() {
-        let secret = format!("Bearer {}", bearer_body());
+        let secret = "Bearer supersecretvalue";
         let mut big = String::new();
         for _ in 0..10_000 {
-            big.push_str(&secret);
+            big.push_str(secret);
             big.push('\n');
         }
         let out = redact_with_cap(&big, 1024);
         assert!(out.len() < 2048, "cap not applied: {}", out.len());
-        assert!(!out.contains(&bearer_body()), "{out}");
+        assert!(!out.contains("supersecretvalue"), "{out}");
         assert!(out.contains("[REDACTED]"), "{out}");
     }
 
@@ -1506,7 +1382,7 @@ mod tests {
                 submit: vec![
                     "curl".to_string(),
                     "-H".to_string(),
-                    format!("Authorization: Bearer {}", argv_credential_drill()),
+                    "Authorization: Bearer supersecretargvtoken".to_string(),
                 ],
                 logs: vec!["echo".to_string()],
                 wait: vec!["true".to_string()],
@@ -1531,7 +1407,7 @@ mod tests {
             stage: "push",
             infra_reason: "git push of epoch ref failed",
             handle: None,
-            backend_response: Some(Box::leak(remote_rejection_drill().into_boxed_str())),
+            backend_response: Some("remote: https://ci:token123@example.com/repo.git rejected"),
             recent_stderr: Some("error: failed to push some refs"),
         }
     }
@@ -1557,21 +1433,15 @@ mod tests {
             state.path(),
             cwd.path(),
             &config_with_secret_argv(),
-            &sample_record("run-synthetic"),
+            &sample_record("run-abc123"),
         )
         .unwrap();
 
         let everything = read_bundle_text(&dir);
         // Nothing secret survives — not from the config argv, not from the
         // backend response, not from a git remote URL if one had leaked in.
-        assert!(
-            !everything.contains(&argv_credential_drill()),
-            "{everything}"
-        );
-        assert!(
-            !everything.contains("gantry-synthetic-userinfo"),
-            "{everything}"
-        );
+        assert!(!everything.contains("supersecretargvtoken"), "{everything}");
+        assert!(!everything.contains("token123"), "{everything}");
         // The redactor's fingerprints are everywhere they should be.
         assert!(everything.contains("[REDACTED]"), "{everything}");
         // The planned artifacts are all present.

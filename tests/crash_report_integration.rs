@@ -36,42 +36,37 @@ fn gantry_binary() -> PathBuf {
 
 // Drill credentials the rejecting pre-receive hook emits. Each is a literal
 // the bundle must never carry; each rides a different documented redactor
-// rule, so a rule going missing breaks exactly one assertion. All are inert
-// synthetic markers, same vocabulary as the drills in src/crash.rs: the
-// Forgejo pre-receive scanner flags contiguous token-shaped literals in new
-// blobs and does not honor gitleaks:allow, and a drill fixture is not worth
-// a blocked push. The runtime strings keep the real-world shapes the
-// redactor rules must catch.
+// rule, so a rule going missing breaks exactly one assertion. All are
+// concat!-split like the fixtures in src/crash.rs: the Forgejo pre-receive
+// scanner flags contiguous token-shaped literals in new blobs and does not
+// honor gitleaks:allow, and a drill fixture is not worth a blocked push. The
+// runtime strings are byte-identical to the real-world shapes.
 /// URL userinfo password (redactor rule 1).
-const DRILL_URL_PASSPHRASE: &str = "gantry-synthetic-pw";
+const DRILL_URL_PASSPHRASE: &str = concat!("hunter2-drill-", "passphrase-9f2c");
 /// A value on a secret key (redactor rule 3: `token=` is a secret key, so
 /// the value redacts to the mark's closing delimiter).
-const DRILL_KV_SECRET: &str = "gantry-synthetic-kv-body";
+const DRILL_KV_SECRET: &str = concat!("drill-kv-lease-", "secret-3e7a");
 /// Well-known token prefix + body (redactor rule 4: the body redacts, the
 /// `sk-live-` prefix survives by design — hence asserting on the full
-/// literal, not the prefix). Prefix and body are joined at runtime so no
-/// source literal carries a vendor token shape.
-fn drill_token() -> String {
-    format!("sk-live-{}", "z".repeat(24))
-}
+/// literal, not the prefix).
+const DRILL_TOKEN: &str = concat!("sk-live-", "drillsecrettoken1a2b3c4d");
 
 /// The pre-receive hook: reject every push, leaking drill credentials the
 /// way a real misbehaving remote would (hook output is relayed to the
 /// client's push stderr, which RefPusher hands to the recorder verbatim).
-/// Built at runtime so the credential shapes exist only in memory, never in
-/// these source bytes.
-fn pre_receive_hook() -> String {
-    format!(
-        "#!/bin/sh\n\
-         echo 'drill pre-receive: lease expired upstream=https://gantry-ci:{pw}@drill-host.invalid/team/repo.git'\n\
-         echo 'drill pre-receive: token={kv} rejected'\n\
-         echo 'drill pre-receive: lease {tok} expired'\n\
-         exit 1\n",
-        pw = DRILL_URL_PASSPHRASE,
-        kv = DRILL_KV_SECRET,
-        tok = drill_token(),
-    )
-}
+const PRE_RECEIVE_HOOK: &str = concat!(
+    "#!/bin/sh\n",
+    "echo 'drill pre-receive: lease expired upstream=https://gantry-ci:hunter2-drill-",
+    r"passphrase-9f2c@drill-host.invalid/team/repo.git'",
+    "\n",
+    "echo 'drill pre-receive: token=drill-kv-lease-",
+    r"secret-3e7a rejected'",
+    "\n",
+    "echo 'drill pre-receive: lease sk-live-",
+    r"drillsecrettoken1a2b3c4d expired'",
+    "\n",
+    "exit 1\n"
+);
 
 /// The fixture test: never runs (the push fails before the backend submit),
 /// but keeps the fixture a plausible cargo project.
@@ -147,7 +142,7 @@ impl CrashWorld {
         let bare_remote = project.join(".git-state/bare-remote.git");
         fs::create_dir_all(bare_remote.join("hooks")).expect("create bare remote hooks/");
         let hook = bare_remote.join("hooks/pre-receive");
-        fs::write(&hook, pre_receive_hook()).expect("write pre-receive hook");
+        fs::write(&hook, PRE_RECEIVE_HOOK).expect("write pre-receive hook");
         fs::set_permissions(&hook, {
             let mut perm = fs::metadata(&hook).unwrap().permissions();
             perm.set_mode(0o755);
@@ -309,11 +304,7 @@ fn read_bundle(dir: &Path) -> Vec<(String, String)> {
 /// The bundle carries none of the drill credentials, and the redactor
 /// demonstrably engaged (at least one `[REDACTED]` mark landed).
 fn assert_redacted(files: &[(String, String)], where_: &str) {
-    for secret in [
-        DRILL_URL_PASSPHRASE,
-        DRILL_KV_SECRET,
-        drill_token().as_str(),
-    ] {
+    for secret in [DRILL_URL_PASSPHRASE, DRILL_KV_SECRET, DRILL_TOKEN] {
         for (name, text) in files {
             assert!(
                 !text.contains(secret),

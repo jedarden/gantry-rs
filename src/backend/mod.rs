@@ -269,6 +269,32 @@ pub trait RemoteBackend {
     /// the exit code to a Verdict using the minimal ladder.
     fn wait(&self, h: &RunHandle, deadline: std::time::Instant) -> BackendResult<Verdict>;
 
+    /// Wait for the remote run to complete and return its outcome: the
+    /// verdict plus the failure class the remote attributed to it (plan
+    /// §Component 5 failure taxonomy, verdict.json v2).
+    ///
+    /// This is what the client half of the taxonomy records into runs.jsonl
+    /// ([`crate::runlog::VerdictRecord::failure_class`]): a remote run that
+    /// died carries *what it died of* alongside *that it died*. The class is
+    /// `None` for every shape of "not known from a parsed document" — no
+    /// usable verdict.json (absent, malformed, newer schema), a backend that
+    /// never reads documents at all — so the runlog's field contract (null
+    /// for uninstrumented producers) falls out of the plumbing instead of
+    /// being enforced per call site. Whether a threaded class belongs on the
+    /// record for the verdict it arrived with is the runlog contract's call,
+    /// applied where the record is built.
+    ///
+    /// Default: [`Self::wait`]'s verdict with no class. Backends that parse
+    /// verdict.json override this; every other implementation — and every
+    /// consumer written against the plain ladder — keeps compiling unchanged.
+    fn wait_outcome(
+        &self,
+        h: &RunHandle,
+        deadline: std::time::Instant,
+    ) -> BackendResult<(Verdict, Option<FailureClass>)> {
+        self.wait(h, deadline).map(|verdict| (verdict, None))
+    }
+
     /// Describe a run for human consumption (e.g., a URL to view logs).
     ///
     /// Phase 0.5: may panic — this is not implemented in the skeleton.

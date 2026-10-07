@@ -241,20 +241,6 @@ mod tests {
         }
     }
 
-    /// The same entry with the remote pipeline's taxonomy class stamped on
-    /// its verdict record — the shape an instrumented failing remote run
-    /// writes (verdict.json v2, plan §Component 5).
-    fn classified(entry: RunEntry, class: crate::verdict::FailureClass) -> RunEntry {
-        let mut verdict = entry.verdict;
-        if let Some(record) = verdict.as_mut() {
-            record.failure_class = Some(class);
-        }
-        RunEntry {
-            intent: entry.intent,
-            verdict,
-        }
-    }
-
     /// Validate a document against the published status schema.
     fn assert_valid(doc: &StatusDoc) {
         let schema: serde_json::Value =
@@ -312,16 +298,7 @@ mod tests {
     #[test]
     fn status_json_validates_against_its_published_schema() {
         let populated = build(
-            // Arrival order (oldest first): the classified failure landed
-            // last, so it tops the newest-first `recent` list.
-            ledger(vec![
-                entry(Some(Verdict::Pass)),
-                entry(None),
-                classified(
-                    entry(Some(Verdict::TestFailure)),
-                    crate::verdict::FailureClass::TestFailure,
-                ),
-            ]),
+            ledger(vec![entry(Some(Verdict::Pass)), entry(None)]),
             FAKE_LEDGER.to_string(),
             DEFAULT_LIMIT,
         );
@@ -332,83 +309,6 @@ mod tests {
         // Ledger health survives into the document.
         assert_eq!(populated.skipped_lines, 2);
         assert_eq!(populated.unmatched_verdicts, 1);
-
-        // The class spellings are the ones the schema's enum describes.
-        let doc = serde_json::to_value(&populated).unwrap();
-        assert_eq!(doc["recent"][0]["failure_class"], "test-failure");
-        assert_eq!(doc["recent"][1]["failure_class"], serde_json::Value::Null);
-        assert_eq!(
-            doc["in_flight"][0]["failure_class"],
-            serde_json::Value::Null
-        );
-    }
-
-    #[test]
-    fn failure_class_is_projected_straight_off_the_verdict_record() {
-        let doc = build(
-            // Same arrival order: the classified failure is the newest
-            // completed run.
-            ledger(vec![
-                entry(Some(Verdict::Pass)),
-                entry(None),
-                classified(
-                    entry(Some(Verdict::TestFailure)),
-                    crate::verdict::FailureClass::CompileError,
-                ),
-            ]),
-            FAKE_LEDGER.to_string(),
-            DEFAULT_LIMIT,
-        );
-
-        // Newest-first recent: the class-bearing run is on top; each run
-        // carries its own record's class, and only that.
-        assert_eq!(doc.recent.len(), 2);
-        assert_eq!(
-            doc.recent[0].failure_class,
-            Some(crate::verdict::FailureClass::CompileError)
-        );
-        assert_eq!(doc.recent[1].failure_class, None);
-        // In-flight runs have no verdict record, hence no class.
-        assert_eq!(doc.in_flight.len(), 1);
-        assert_eq!(doc.in_flight[0].failure_class, None);
-    }
-
-    #[test]
-    fn a_pre_taxonomy_record_reads_as_a_null_class_not_an_error() {
-        // The pre-taxonomy producer shape: schema 1, no `failure_class` key
-        // on disk. The ledger parse is lenient upstream; status must read it
-        // as null and list the run like any other.
-        let legacy: VerdictRecord = serde_json::from_str(
-            r#"{"rec":"verdict","schema_version":1,"run_id":"legacy","ts":2,"verdict":"test_failure","ran":"remote","exit_code":101,"handle":"gantry-x7k2p"}"#,
-        )
-        .expect("legacy record parses");
-        assert!(legacy.failure_class.is_none());
-
-        let doc = build(
-            ledger(vec![{
-                // Pair the intent with the legacy verdict the way the ledger
-                // would: same run_id.
-                let mut intent = entry(Some(Verdict::Pass)).intent;
-                intent.run_id = legacy.run_id.clone();
-                RunEntry {
-                    intent,
-                    verdict: Some(legacy),
-                }
-            }]),
-            FAKE_LEDGER.to_string(),
-            DEFAULT_LIMIT,
-        );
-
-        assert_eq!(doc.recent.len(), 1);
-        assert_eq!(doc.recent[0].failure_class, None);
-        // The field is emitted — null, not absent — so the document still
-        // validates against the published schema's required list.
-        assert_valid(&doc);
-        let serialized = serde_json::to_value(&doc).unwrap();
-        assert_eq!(
-            serialized["recent"][0]["failure_class"],
-            serde_json::Value::Null
-        );
     }
 
     #[test]

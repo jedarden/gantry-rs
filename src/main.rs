@@ -255,6 +255,18 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
             }
         }
 
+        // quickcheck: the 30-second no-backend sanity check (plan §"CLI
+        // surface", bf-139) — shim resolves, cap works, git ok. The Tier-0
+        // proof: it passes with no backend configured by construction, and
+        // exits 0 iff every required check passed.
+        "quickcheck" => gantry::quickcheck::run(),
+
+        // report: print or package the REDACTED crash bundle a recorded
+        // InfraFailure wrote under the state dir (plan Component 7, bf-3mc).
+        // Exit codes are cli_report's: 0 found, 1 missing bundle/state dir,
+        // 2 usage error — same convention as the unknown-command arm below.
+        "report" => ExitCode::from(gantry::crash::cli_report(&argv[2..]) as u8),
+
         // why: replay the last run's gate/decision trace from the write-ahead
         // ledger (plan §"CLI surface", bf-1n4). Exit codes are why::cli's:
         // 0 a last run was found, 1 nothing recorded, 2 usage error.
@@ -268,17 +280,26 @@ fn run_management_cli(argv: &[String]) -> ExitCode {
         // surface", bf-1n4). 0 once arguments parse (an empty ledger is a
         // valid status), 2 usage error.
         "status" => ExitCode::from(gantry::cli::status::cli(&argv[2..]) as u8),
-        // quickcheck: the 30-second no-backend sanity check (plan §"CLI
-        // surface", bf-139) — shim resolves, cap works, git ok. The Tier-0
-        // proof: it passes with no backend configured by construction, and
-        // exits 0 iff every required check passed.
-        "quickcheck" => gantry::quickcheck::run(),
 
-        // report: print or package the REDACTED crash bundle a recorded
-        // InfraFailure wrote under the state dir (plan Component 7, bf-3mc).
-        // Exit codes are cli_report's: 0 found, 1 missing bundle/state dir,
-        // 2 usage error — same convention as the unknown-command arm below.
-        "report" => ExitCode::from(gantry::crash::cli_report(&argv[2..]) as u8),
+        // run: explicit offload — `gantry run [--backend B] -- <cmd…>`
+        // routes the wrapped command through the same GitGate → RefPusher →
+        // backend pipeline as an intercepted invocation (plan §"CLI
+        // surface"), with the same capped-local fallback ladder. The exit
+        // code is the wrapped command's (local arms) or the verdict
+        // ladder's (remote success) — fidelity the caller can branch on.
+        "run" => {
+            let repo_url = get_repo_url();
+            let sha = get_current_sha();
+            ExitCode::from(gantry::cli::run::cli(&argv[2..], &repo_url, &sha))
+        }
+
+        // init: SSH-first onboarding (plan §8: "`gantry init --ssh user@host`
+        // performs the whole SSH-first setup — verifies git+cargo on the
+        // target, writes the command-template preset config, and finishes
+        // with `doctor --e2e`"). Exit codes are init::cli's: 0 onboarded
+        // with the canary green, 1 a leg failed (the message names the leg),
+        // 2 usage error.
+        "init" => ExitCode::from(gantry::cli::init::cli(&argv[2..]) as u8),
 
         // uninstall: reverse an install — shims, binary, state, config,
         // slice unit (plan §8: "`gantry uninstall` reverses it"). Exit codes
@@ -326,14 +347,19 @@ fn print_usage() {
     println!("  gantry doctor       Run health checks");
     println!("  gantry doctor --e2e Run end-to-end canary test");
     println!("  gantry doctor --drill Run fault-injection fire drill");
+    println!("  gantry quickcheck   30s no-backend sanity: shim, cap, git");
+    println!("  gantry report <id>  Print a run's REDACTED crash bundle");
+    println!("                      (--package <dir> copies it out)");
     println!("  gantry why          Replay the last run's gate/decision trace");
     println!("                      (--json for the machine contract)");
     println!("  gantry explain      Dry run: gates, backend, exact ref — no network");
     println!("                      (explain -- cargo test; add --json)");
     println!("  gantry status       Recent and in-flight runs (--json, --limit N)");
-    println!("  gantry quickcheck   30s no-backend sanity: shim, cap, git");
-    println!("  gantry report <id>  Print a run's REDACTED crash bundle");
-    println!("                      (--package <dir> copies it out)");
+    println!("  gantry run          Offload an arbitrary command without shimming:");
+    println!("                      gantry run [--backend B] -- <cmd> [args…]");
+    println!("  gantry init --ssh <target>");
+    println!("                      Onboard a host: verify git+cargo, install the");
+    println!("                      executor, write the preset, end with doctor --e2e");
     println!("  gantry uninstall    Remove shims, binary, state, and config");
     println!("                      (--dry-run to preview, --keep-config to keep settings)");
     println!();
@@ -403,6 +429,31 @@ mod tests {
     #[test]
     fn test_management_cli_unknown_command() {
         let argv = vec!["gantry".to_string(), "unknown".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn test_management_cli_run_arm_reaches_the_run_cli() {
+        // The `run` arm: the management dispatch resolves the repo identity
+        // and hands the tail to cli::run::cli. A bare `gantry run` carries no
+        // `-- <cmd…>` separator, so parse rejects it with the usage exit 2
+        // before any gate, backend, or ledger touch — the cheapest proof the
+        // arm is wired and reachable end to end.
+        let argv = vec!["gantry".to_string(), "run".to_string()];
+        let exit_code = run_management_cli(&argv);
+        assert_eq!(exit_code, ExitCode::from(2));
+
+        // A usage error from the parser itself (unknown backend value) takes
+        // the same arm and the same exit code.
+        let argv = vec![
+            "gantry".to_string(),
+            "run".to_string(),
+            "--backend".to_string(),
+            "bogus".to_string(),
+            "--".to_string(),
+            "true".to_string(),
+        ];
         let exit_code = run_management_cli(&argv);
         assert_eq!(exit_code, ExitCode::from(2));
     }

@@ -2,12 +2,11 @@ pub mod backend;
 pub mod cap; // plan Component 6: the per-run cgroup cap (probe once per process, degrade loudly)
 pub mod cli; // plan module layout: management-CLI diagnostics — why / explain / status, --json with schema_version
 pub mod config;
-pub mod crash; // plan Component 7: the crash flight recorder — redacted InfraFailure bundles + `gantry report`
+pub mod crash; // plan Component 7: flight recorder — REDACTED InfraFailure bundles + `gantry report`
 pub mod decision;
 pub mod doctor;
 pub mod gate;
 pub mod jointable; // plan Component 9: JoinTable — flock'd in-flight map, concurrent-run dedup
-pub mod ledger; // plan Component 10: memoization, supersede-on-new-commit, flake flagging — one verdict-history module over runs.jsonl
 pub mod local; // plan Component 6: LocalExecutor — scope, slice, fallback semaphore
 pub mod quickcheck; // plan CLI surface: `gantry quickcheck` — shim, cap, git (Tier-0 proof)
 pub mod refs;
