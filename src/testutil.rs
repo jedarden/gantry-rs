@@ -106,27 +106,39 @@ impl RecordingDispatch {
         }
     }
 
-    pub(crate) fn dispatch_originator(&self) -> Result<(RunHandle, u64, u64), i32> {
-        self.record_ref_push("abc123", "recorded-run");
-        let submitted = self
-            .backend
-            .submit(&RunSpec::new(
-                "cargo",
-                "test",
-                Vec::new(),
-                "file:///repo",
-                "abc123",
-                "",
-            ))
-            .map_err(|_| 1)?;
-        Ok((submitted, self.push_duration_ms, self.queue_duration_ms))
-    }
-
-    pub(crate) fn record_ref_push(&self, sha: &str, run_id: &str) {
+    /// Record the inputs that a real [`crate::refs::RefPusher::push`] call
+    /// receives. Keeping this operation separate from `dispatch_originator`
+    /// lets decision tests use the same seam when they grow beyond the
+    /// canned originator fixture.
+    pub(crate) fn push(&self, sha: &str, run_id: &str) {
         self.epoch_ref_pushes.borrow_mut().push(RecordedPush {
             sha: sha.to_string(),
             run_id: run_id.to_string(),
         });
+    }
+
+    /// Record a backend submit while preserving the error shape returned by
+    /// the decision pipeline.
+    pub(crate) fn submit(&self, spec: &RunSpec) -> Result<RunHandle, i32> {
+        self.backend.submit(spec).map_err(|_| 1)
+    }
+
+    pub(crate) fn dispatch_originator(&self) -> Result<(RunHandle, u64, u64), i32> {
+        self.push("abc123", "recorded-run");
+        let submitted = self.submit(&RunSpec::new(
+            "cargo",
+            "test",
+            Vec::new(),
+            "file:///repo",
+            "abc123",
+            "",
+        ))?;
+        Ok((submitted, self.push_duration_ms, self.queue_duration_ms))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_ref_push(&self, sha: &str, run_id: &str) {
+        self.push(sha, run_id);
     }
 
     pub(crate) fn ref_pushes(&self) -> Vec<RecordedPush> {
