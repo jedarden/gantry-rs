@@ -51,6 +51,26 @@ where
     }
 }
 
+/// Finish an originator dispatch by opening the attach window with the
+/// backend's returned handle. Dispatch failures pass through unchanged and
+/// never attempt to record a handle; recording itself is best effort, so a
+/// filesystem failure must not turn an already-submitted run into a failed
+/// dispatch.
+fn record_originator_dispatch<F>(
+    entry: Option<&crate::jointable::JoinEntry>,
+    originator_dispatch: F,
+) -> Result<(RunHandle, u64, u64), i32>
+where
+    F: FnOnce() -> Result<(RunHandle, u64, u64), i32>,
+{
+    let (handle, push_duration_ms, queue_duration_ms) =
+        dispatch_with_join(None, originator_dispatch)?;
+    if let Some(entry) = entry {
+        entry.record_handle(&handle);
+    }
+    Ok((handle, push_duration_ms, queue_duration_ms))
+}
+
 /// Keep an originator's claim guard owned by the run path until that path
 /// returns. Passing the guard as an argument to this boundary makes the
 /// lifetime explicit: the dispatch/wait/fallback closure can only borrow it,
@@ -303,7 +323,7 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
         let backend = build_backend(config);
         let (handle, push_duration_ms, queue_duration_ms) = match attached_dispatch {
             Some(dispatch) => dispatch,
-            None => match dispatch_with_join(None, || {
+            None => match record_originator_dispatch(join_entry, || {
                 // Step 3: Push epoch ref via RefPusher
                 let push_start = Instant::now();
                 let push_result = RefPusher::push(config, sha, &run_id);
@@ -402,13 +422,6 @@ pub fn run_remote(config: &Config, repo_url: &str, sha: &str, args: &[String]) -
                         return Err(1);
                     }
                 };
-
-                // Open the attach window (plan Component 9): from here until the
-                // entry guard drops, identical invocations join this handle
-                // instead of submitting their own.
-                if let Some(entry) = join_entry {
-                    entry.record_handle(&handle);
-                }
 
                 eprintln!("[gantry] submitted: {}", handle.handle);
 
@@ -1587,6 +1600,65 @@ mod tests {
             assert_eq!(submissions.len(), 1);
             assert_eq!(submissions[0].handle, handle);
             assert_eq!(submissions[0].spec.subcommand, "test");
+        }
+
+        #[test]
+        fn successful_originator_dispatch_records_handle_for_waiter() {
+            let state_dir = tempfile::tempdir().expect("create join state");
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let owner = match claim_in(state_dir.path(), &key, "originator", "recording")
+                .expect("originator claim succeeds")
+            {
+                JoinDecision::Originator(entry) => entry,
+                other => panic!("first claim must originate, got {other:?}"),
+            };
+            let recorder = RecordingDispatch::with_handle(
+                "submitted-originator",
+                RECORDING_PUSH_MS,
+                RECORDING_QUEUE_MS,
+            );
+
+            let dispatch =
+                record_originator_dispatch(Some(&owner), || recorder.dispatch_originator())
+                    .expect("originator dispatch succeeds");
+            assert_eq!(dispatch.0, RunHandle::new("submitted-originator"));
+
+            match claim_in(state_dir.path(), &key, "joiner", "recording")
+                .expect("waiter claim succeeds")
+            {
+                JoinDecision::Attach(attach) => {
+                    assert_eq!(
+                        attach.handle,
+                        RunHandle::new("submitted-originator"),
+                        "waiter observes the handle returned by originator dispatch"
+                    );
+                }
+                other => panic!("recorded originator must be attachable, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn failed_originator_dispatch_is_returned_without_recording() {
+            let state_dir = tempfile::tempdir().expect("create join state");
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let owner = match claim_in(state_dir.path(), &key, "originator", "recording")
+                .expect("originator claim succeeds")
+            {
+                JoinDecision::Originator(entry) => entry,
+                other => panic!("first claim must originate, got {other:?}"),
+            };
+
+            let result = record_originator_dispatch(Some(&owner), || Err(17));
+            assert_eq!(result, Err(17));
+
+            // A failed submit leaves the claim handle-less; the guard can
+            // then close it normally, allowing a fresh originator to claim.
+            drop(owner);
+            assert!(matches!(
+                claim_in(state_dir.path(), &key, "next-originator", "recording")
+                    .expect("claim after failed dispatch succeeds"),
+                JoinDecision::Originator(_)
+            ));
         }
 
         #[test]
