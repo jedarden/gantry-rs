@@ -1602,7 +1602,9 @@ mod tests {
                 other => panic!("first claim must originate, got {other:?}"),
             };
 
-            let saw_claim_during_run = run_with_originator_entry(Some(entry), |_| {
+            let saw_claim_during_run = run_with_originator_entry(Some(entry), |entry| {
+                let entry = entry.expect("originator run receives its claim guard");
+                entry.record_handle(&RunHandle::new("recorded-during-run"));
                 fs::read_dir(state_dir.path().join("join"))
                     .expect("join directory exists while run owns claim")
                     .filter_map(Result::ok)
@@ -1616,6 +1618,33 @@ mod tests {
             assert!(matches!(
                 claim_in(state_dir.path(), &key, "next-originator", "recording")
                     .expect("claim after run path returns succeeds"),
+                JoinDecision::Originator(_)
+            ));
+        }
+
+        #[test]
+        fn originator_entry_releases_at_run_boundary_on_early_return() {
+            let state_dir = tempfile::tempdir().expect("create join state");
+            let key = JoinKey::new("file:///repo", "abc123", "cargo", "test", &[]);
+            let entry = match claim_in(state_dir.path(), &key, "originator", "recording")
+                .expect("originator claim succeeds")
+            {
+                JoinDecision::Originator(entry) => entry,
+                other => panic!("first claim must originate, got {other:?}"),
+            };
+
+            let result = run_with_originator_entry(Some(entry), |entry| {
+                assert!(
+                    entry.is_some(),
+                    "the early-return path must start with the originator guard"
+                );
+                Err::<(), _>(1)
+            });
+
+            assert_eq!(result, Err(1));
+            assert!(matches!(
+                claim_in(state_dir.path(), &key, "next-originator", "recording")
+                    .expect("claim after early return succeeds"),
                 JoinDecision::Originator(_)
             ));
         }
