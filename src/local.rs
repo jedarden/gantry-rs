@@ -780,6 +780,8 @@ impl FallbackSemaphore {
     /// degraded), hold its exclusive lock from this instant, and mark it with
     /// the waiter's [`QueueClass`] — the only record of the class another
     /// waiter (which cannot see this process's environment) can read.
+    // `Error::other` is newer than this crate's Rust 1.70 MSRV.
+    #[allow(clippy::io_other_error)]
     fn mint_ticket(&self, class: QueueClass) -> Result<Ticket, SemaphoreError> {
         let tickets_dir = self.dir.join("tickets");
         io_map(fs::create_dir_all(&tickets_dir), &tickets_dir)?;

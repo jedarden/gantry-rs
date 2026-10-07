@@ -469,6 +469,8 @@ pub fn execute(targets: &UninstallTargets, path_var: &str, opts: &Options) -> Ou
 /// line or an early exit 1 with the reason (an uninstall that cannot locate
 /// its own binary reverses nothing: there is no trustworthy binary path to
 /// classify shims against, and guessing would risk the real toolchain).
+// `Error::other` is newer than this crate's Rust 1.70 MSRV.
+#[allow(clippy::io_other_error)]
 pub fn cli(args: &[String]) -> i32 {
     let mut opts = Options::default();
     for flag in args {
